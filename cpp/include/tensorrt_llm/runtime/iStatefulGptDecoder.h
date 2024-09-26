@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,18 +16,23 @@
 
 #pragma once
 
+#include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/generationInput.h"
 #include "tensorrt_llm/runtime/generationOutput.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
 
-#include <cstdint>
 #include <memory>
 #include <utility>
-#include <vector>
 
 #include <NvInferRuntime.h>
+
+namespace tensorrt_llm::batch_manager
+{
+struct DecoderBuffers;
+}
 
 namespace tensorrt_llm::runtime
 {
@@ -38,7 +43,7 @@ namespace decoder
 class Input
 {
 public:
-    using TensorPtr = std::shared_ptr<ITensor const>;
+    using TensorPtr = ITensor::SharedPtr;
 
     explicit Input(TensorPtr logits)
         : logits{std::move(logits)}
@@ -74,8 +79,9 @@ public:
     using TensorPtr = std::shared_ptr<ITensor>;
 
     //! Setup the decoder before calling `forward()`, also calls reshapeBuffers
-    virtual void setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxAttentionWindow,
-        SizeType maxSequenceLength, SizeType maxTokensPerStep, nvinfer1::DataType dtype)
+    virtual void setup(executor::DecodingMode const& mode, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
+        SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength,
+        SizeType32 maxTokensPerStep, nvinfer1::DataType dtype, ModelConfig const& modelConfig)
         = 0;
 
     //! @brief Initialize the decoder with new batch of inputs.
@@ -97,28 +103,31 @@ public:
     }
 
     //! @brief Gather final beam search results for all requests.
-    virtual void finalize() const = 0;
+    virtual void finalize(SamplingConfig const& samplingConfig) const = 0;
 
     //! @returns [batchSize, beamWidth, maxSequenceLength], all token ids, on gpu
-    virtual TensorPtr getOutputIds() const = 0;
+    [[nodiscard]] virtual TensorPtr getIds() const = 0;
+
+    //! @returns [batchSize, beamWidth, maxSequenceLength] token ids after gatherTree
+    [[nodiscard]] virtual TensorPtr getGatheredIds() const = 0;
 
     //! @returns [batchSize, maxBeamWidth], cumulative log probabilities (per beam), on gpu
-    virtual TensorPtr getCumLogProbs() const = 0;
+    [[nodiscard]] virtual TensorPtr getCumLogProbs() const = 0;
 
     //! @returns [batchSize, maxBeamWidth, maxSequenceLength], log probabilities (per beam), on gpu
-    virtual TensorPtr getLogProbs() const = 0;
+    [[nodiscard]] virtual TensorPtr getLogProbs() const = 0;
 
     //! @brief Get tokens generated in one step of last forward pass
     //! @param iter The iteration within [0; maxTokensPerStep) for which to get the tokens
     //! @returns [batchSize, beamWidth], tokens generated in `iter` (per beam), on gpu
-    virtual TensorPtr getNewTokens(SizeType iter = 0) const = 0;
+    [[nodiscard]] virtual TensorPtr getNewTokens(SizeType32 iter = 0) const = 0;
 
     //! @brief Get maxTokensPerStep tokens generated in the last forward pass
     //! @returns [maxTokensPerStep, batchSize, maxBeamWidth], tokens generated in last forward pass, on gpu
-    virtual TensorPtr getAllNewTokens() const = 0;
+    [[nodiscard]] virtual TensorPtr getAllNewTokens() const = 0;
 
     //! @returns [1], number of finished sequences, in pinned host memory
-    virtual TensorPtr getNbFinished() const = 0;
+    [[nodiscard]] virtual TensorPtr getNbFinished() const = 0;
 
     virtual ~IStatefulGptDecoder() = default;
 

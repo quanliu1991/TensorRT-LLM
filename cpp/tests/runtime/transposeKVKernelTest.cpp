@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,17 +14,18 @@
  * limitations under the License.
  */
 
-#include <cstdlib>
 #include <gtest/gtest.h>
 
 #include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/kernels/kvCacheIndex.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 
+#include <cstdint>
+#include <cstdlib>
+
 using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::kernels;
-
-namespace tc = tensorrt_llm::common;
 
 namespace
 {
@@ -50,23 +51,22 @@ void randomInitVector(std::vector<T>& vec, float range)
 template void randomInitVector(std::vector<float>& vec, float scale);
 template void randomInitVector(std::vector<half>& vec, float scale);
 
-std::vector<void*> pointerArrayFromPageTable(const std::unordered_map<int, int>& pageTable, void* memoryPool,
-    int32_t batchSize, int32_t blocksPerSeq, int32_t blockSizeInBytes, int32_t blocksPerPool)
+std::vector<KVCacheIndex> offsetsArrayFromPageTable(
+    std::unordered_map<int, int> const& pageTable, int32_t batchSize, int32_t blocksPerSeq, int32_t blocksPerPool)
 {
-    const auto pointerArrayElts = pageTable.size();
-    std::vector<void*> pointers(2 * pointerArrayElts);
-    for (int i = 0; i < pointerArrayElts; ++i)
+    auto const offsetsArrayElts = pageTable.size();
+    std::vector<KVCacheIndex> offsets(2 * offsetsArrayElts, KVCacheIndex{0});
+    for (int i = 0; i < offsetsArrayElts; ++i)
     {
-        const int pageIdx = pageTable.find(i)->second;
-        auto kPtr = reinterpret_cast<void*>(reinterpret_cast<int8_t*>(memoryPool) + pageIdx * blockSizeInBytes);
-        auto vPtr = reinterpret_cast<void*>(
-            reinterpret_cast<int8_t*>(memoryPool) + pageIdx * blockSizeInBytes + blocksPerPool * blockSizeInBytes);
-        const int batchIdx = i / batchSize;
-        const int seqIdx = i % blocksPerSeq;
-        pointers[batchIdx * blocksPerSeq * 2 + 0 * blocksPerSeq + seqIdx] = kPtr;
-        pointers[batchIdx * blocksPerSeq * 2 + 1 * blocksPerSeq + seqIdx] = vPtr;
+        int const pageIdx = pageTable.find(i)->second;
+        auto const kOffset = KVCacheIndex{pageIdx};
+        auto const vOffset = KVCacheIndex{pageIdx + blocksPerPool};
+        int const batchIdx = i / batchSize;
+        int const seqIdx = i % blocksPerSeq;
+        offsets[batchIdx * blocksPerSeq * 2 + 0 * blocksPerSeq + seqIdx] = kOffset;
+        offsets[batchIdx * blocksPerSeq * 2 + 1 * blocksPerSeq + seqIdx] = vOffset;
     }
-    return pointers;
+    return offsets;
 }
 
 template <typename T, typename T_DST>
@@ -78,8 +78,8 @@ T_DST castTo(T value)
 template <>
 int8_t castTo(float value)
 {
-    const auto clipped = std::min(127.f, std::max(value, -128.f));
-    const auto rounded = std::round(clipped);
+    auto const clipped = std::min(127.f, std::max(value, -128.f));
+    auto const rounded = std::round(clipped);
     return static_cast<int8_t>(rounded);
 }
 
@@ -97,7 +97,7 @@ float castTo(__nv_fp8_e4m3 value)
 
 template <typename T, typename T_DST, typename KVCacheBuffer>
 void verifyKVTransposed(int batchSize, int headsNum, int dimsPerHead, int seqLen, int maxSeqLen, KVCacheBuffer& buffer,
-    const std::vector<T>& refKCacheVec, const std::vector<T>& vTransposedCacheVec, bool b8bitKVCache,
+    std::vector<T> const& refKCacheVec, std::vector<T> const& vTransposedCacheVec, bool b8bitKVCache,
     float kvScaleOrigQuant)
 {
     for (int bi = 0; bi < batchSize; ++bi)
@@ -114,10 +114,10 @@ void verifyKVTransposed(int batchSize, int headsNum, int dimsPerHead, int seqLen
 
                     for (int xi = 0; xi < X_ELEMS; ++xi)
                     {
-                        const int refKVIdx = bi * headsNum * seqLen * dimsPerHead + hi * seqLen * dimsPerHead
+                        int const refKVIdx = bi * headsNum * seqLen * dimsPerHead + hi * seqLen * dimsPerHead
                             + li * dimsPerHead + di * X_ELEMS + xi;
 
-                        const int kVIdx = buffer.getKVLocalIdx(li, hi, dimsPerHead, di * X_ELEMS + xi);
+                        int const kVIdx = buffer.getKVLocalIdx(li, hi, dimsPerHead, di * X_ELEMS + xi);
 
                         T refK = refKCacheVec[refKVIdx];
                         T refV = vTransposedCacheVec[refKVIdx];
@@ -130,14 +130,14 @@ void verifyKVTransposed(int batchSize, int headsNum, int dimsPerHead, int seqLen
                         const T_DST castedRefK = castTo<T, T_DST>(refK);
                         const T_DST castedRefV = castTo<T, T_DST>(refV);
 
-                        const auto outK = blockKPtr[kVIdx];
-                        const auto outV = blockVPtr[kVIdx];
+                        auto const outK = blockKPtr[kVIdx];
+                        auto const outV = blockVPtr[kVIdx];
 
                         // Since EXPECT_EQ does not support fp8, casting to float to compare
-                        const float outK_float = castTo<T_DST, float>(outK);
-                        const float outV_float = castTo<T_DST, float>(outV);
-                        const float castedRefK_float = castTo<T_DST, float>(castedRefK);
-                        const float castedRefV_float = castTo<T_DST, float>(castedRefV);
+                        float const outK_float = castTo<T_DST, float>(outK);
+                        float const outV_float = castTo<T_DST, float>(outV);
+                        float const castedRefK_float = castTo<T_DST, float>(castedRefK);
+                        float const castedRefV_float = castTo<T_DST, float>(castedRefV);
                         EXPECT_EQ(outK_float, castedRefK_float);
                         EXPECT_EQ(outV_float, castedRefV_float);
                     }
@@ -160,34 +160,39 @@ void testTransposeBatch4dPaged(bool multiQueryMode, bool int8KVCache, bool fp8KV
     constexpr int32_t maxBlocksPerSeq{64};
     constexpr int32_t maxSeq{64};
     constexpr int32_t batchSize{2};
-    const int32_t headsNum = multiQueryMode ? 1 : 8;
+    int32_t const headsNum = multiQueryMode ? 1 : 8;
     constexpr int32_t seqLen{16};
     constexpr int32_t maxSeqLen{2 * seqLen};
     constexpr int32_t dimsPerHead{256};
-    constexpr int32_t blockSizeBytes = tokensPerBlock * dimsPerHead * sizeof(T_DST);
+    constexpr int8_t elemSize{sizeof(T_DST)};
+    constexpr int32_t blockSize = tokensPerBlock * dimsPerHead;
+    constexpr int32_t bytesPerBlock = blockSize * elemSize;
+    constexpr int32_t bytesPerToken = dimsPerHead * elemSize;
+    constexpr int32_t maxAttentionWindow = maxSeqLen;
+    constexpr int32_t sinkTokenLen{0};
+    constexpr int32_t onlyKorV{false};
 
     TLLM_CHECK_WITH_INFO(batchSize <= maxSeq, "Batch size is larger than max number of allowed sequence");
     TLLM_CHECK_WITH_INFO(headsNum * seqLen <= maxBlocksPerSeq * tokensPerBlock,
         "Total amount of tokens is less than max amount of tokens is cache per sequence");
 
-    KVBlockArray blockArray(maxSeq, maxBlocksPerSeq, tokensPerBlock, dimsPerHead * headsNum * sizeof(T_DST));
-
-    // Allocate for pointer array
-    const auto pointerArrayElts = maxSeq * maxBlocksPerSeq;
-    const auto pointerArraySize = 2 * pointerArrayElts * sizeof(void*);
-    cudaMalloc(&blockArray.data, pointerArraySize);
-    cudaMemset(blockArray.data, 0, pointerArraySize);
-
     // Allocate for kv cache block pool
-    const auto blocksPerPool = maxBlocksPerSeq * maxSeq;
-    const auto kvPoolSize = 2 * blockSizeBytes * blocksPerPool;
-    void* kvMemoryPool;
+    auto const blocksPerPool = maxBlocksPerSeq * maxSeq;
+    auto const kvPoolSize = 2 * bytesPerBlock * blocksPerPool;
+    void* kvMemoryPool = nullptr;
     cudaMalloc(&kvMemoryPool, kvPoolSize);
     cudaMemset(kvMemoryPool, 0, kvPoolSize);
 
+    // Allocate offsets array
+    std::remove_const_t<KVBlockArray::DataType>* offsetsArray = nullptr;
+    auto const offsetsArrayElts = maxSeq * maxBlocksPerSeq;
+    auto const offsetsArraySize = 2 * offsetsArrayElts * sizeof(int64_t);
+    cudaMalloc(&offsetsArray, offsetsArraySize);
+    cudaMemset(offsetsArray, 0, offsetsArraySize);
+
     // Create page table
     std::unordered_map<int, int> mapIndicesTable;
-    for (int i = 0; i < pointerArrayElts; ++i)
+    for (int i = 0; i < offsetsArrayElts; ++i)
     {
         int value;
         int idx = i;
@@ -197,16 +202,18 @@ void testTransposeBatch4dPaged(bool multiQueryMode, bool int8KVCache, bool fp8KV
         }
         else
         {
-            value = pointerArrayElts / 2 + idx / 2;
+            value = offsetsArrayElts / 2 + idx / 2;
         }
 
         mapIndicesTable[idx] = value;
     }
 
     // Init array of pointer from page table
-    const auto pointers = pointerArrayFromPageTable(
-        mapIndicesTable, kvMemoryPool, maxSeq, maxBlocksPerSeq, blockSizeBytes, blocksPerPool);
-    cudaMemcpy(blockArray.data, pointers.data(), pointerArraySize, cudaMemcpyHostToDevice);
+    auto const offsets = offsetsArrayFromPageTable(mapIndicesTable, maxSeq, maxBlocksPerSeq, blocksPerPool);
+    cudaMemcpy(offsetsArray, offsets.data(), offsetsArraySize, cudaMemcpyHostToDevice);
+
+    auto blockArray = KVBlockArray(maxSeq, maxBlocksPerSeq, tokensPerBlock, bytesPerToken, maxAttentionWindow,
+        sinkTokenLen, kvMemoryPool, nullptr, offsetsArray);
 
     float kvScaleOrigQuant = 1.0f;
     float* kvScaleOrigQuantPtr = nullptr;
@@ -233,7 +240,7 @@ void testTransposeBatch4dPaged(bool multiQueryMode, bool int8KVCache, bool fp8KV
         vTransposedCacheVec, ITensor::makeShape({batchSize, headsNum, seqLen, dimsPerHead}), MemoryType::kGPU));
 
     // Run inference
-    const KvCacheDataType cache_type
+    KvCacheDataType const cache_type
         = int8KVCache ? KvCacheDataType::INT8 : (fp8KVCache ? KvCacheDataType::FP8 : KvCacheDataType::BASE);
     invokeTranspose4dBatchMajor(bufferCast<T>(*kTransposedCache), bufferCast<T>(*vTransposedCache), blockArray,
         batchSize, seqLen, maxSeqLen, dimsPerHead, headsNum, cache_type, kvScaleOrigQuantPtr, sequenceLengths,
@@ -246,11 +253,11 @@ void testTransposeBatch4dPaged(bool multiQueryMode, bool int8KVCache, bool fp8KV
     std::vector<T_DST> kvMemoryPoolHost(kvPoolSize);
     cudaMemcpy(kvMemoryPoolHost.data(), kvMemoryPool, kvPoolSize, cudaMemcpyDeviceToHost);
     KVBlockArray blockArrayHost = blockArray;
+    blockArrayHost.mPrimaryPoolPtr = kvMemoryPoolHost.data();
 
     // Init array of CPU pointers from page table
-    auto pointersHost = pointerArrayFromPageTable(mapIndicesTable, reinterpret_cast<void*>(kvMemoryPoolHost.data()),
-        maxSeq, maxBlocksPerSeq, blockSizeBytes, blocksPerPool);
-    blockArrayHost.data = reinterpret_cast<int64_t*>(pointersHost.data());
+    auto offsetsHost = offsetsArrayFromPageTable(mapIndicesTable, maxSeq, maxBlocksPerSeq, blocksPerPool);
+    blockArrayHost.data = offsetsHost.data();
 
     verifyKVTransposed<T, T_DST>(batchSize, headsNum, dimsPerHead, seqLen, maxSeqLen, blockArrayHost,
         kTransposedCacheVec, vTransposedCacheVec, int8KVCache || fp8KVCache, kvScaleOrigQuant);
@@ -272,16 +279,20 @@ void testTransposeBatch4dContiguous(bool multiQueryMode, bool int8KVCache, bool 
     BufferManager manager(streamPtr);
 
     constexpr int32_t batchSize{2};
-    const int32_t headsNum = multiQueryMode ? 1 : 8;
+    int32_t const headsNum = multiQueryMode ? 1 : 8;
     constexpr int32_t seqLen{16};
     constexpr int32_t maxSeqLen{2 * seqLen};
     constexpr int32_t dimsPerHead{256};
+    constexpr int32_t maxAttentionWindow = maxSeqLen;
+    constexpr int32_t sinkTokenLen{0};
+    constexpr int32_t onlyKorV{false};
 
-    KVLinearBuffer kvLinearBuffer(batchSize, 1, maxSeqLen, dimsPerHead * headsNum * sizeof(T_DST));
+    KVLinearBuffer kvLinearBuffer(batchSize, maxSeqLen, dimsPerHead * headsNum * sizeof(T_DST), maxAttentionWindow,
+        sinkTokenLen, onlyKorV, nullptr);
 
     // Allocate for kv cache pool
-    const auto kvPoolElts = 2 * batchSize * maxSeqLen * dimsPerHead * headsNum;
-    const auto kvPoolSize = kvPoolElts * sizeof(T_DST);
+    auto const kvPoolElts = 2 * batchSize * maxSeqLen * dimsPerHead * headsNum;
+    auto const kvPoolSize = kvPoolElts * sizeof(T_DST);
     cudaMalloc(&kvLinearBuffer.data, kvPoolSize);
     cudaMemset(kvLinearBuffer.data, 0, kvPoolSize);
 
@@ -310,7 +321,7 @@ void testTransposeBatch4dContiguous(bool multiQueryMode, bool int8KVCache, bool 
         vTransposedCacheVec, ITensor::makeShape({batchSize, headsNum, seqLen, dimsPerHead}), MemoryType::kGPU));
 
     // Run inference
-    const KvCacheDataType cache_type
+    KvCacheDataType const cache_type
         = int8KVCache ? KvCacheDataType::INT8 : (fp8KVCache ? KvCacheDataType::FP8 : KvCacheDataType::BASE);
     invokeTranspose4dBatchMajor(bufferCast<T>(*kTransposedCache), bufferCast<T>(*vTransposedCache), kvLinearBuffer,
         batchSize, seqLen, maxSeqLen, dimsPerHead, headsNum, cache_type, kvScaleOrigQuantPtr, sequenceLengths,

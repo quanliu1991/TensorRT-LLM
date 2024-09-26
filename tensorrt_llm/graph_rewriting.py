@@ -191,16 +191,16 @@ class PatternRewriter(_Pattern):
     def __init__(self,
                  name: str,
                  root_layer: Optional[Set[trt.LayerType]] = None,
-                 seperate_match_rewrite=False):
+                 separate_match_rewrite=False):
         '''
         Parameters:
             name: the name of the rewrite pattern
             root_layer: the root layer types to start the pattern matching, if not provided, the pattern will traverse all the layers in the graph.
-            seperate_match_rewrite: if set to True, the pattern should override match() and rewrite() separately, otherwise, the pattern should override match_and_rewrite()
+            separate_match_rewrite: if set to True, the pattern should override match() and rewrite() separately, otherwise, the pattern should override match_and_rewrite()
         '''
         super().__init__(name)
         self.root_layer = root_layer
-        self._seperate_match_rewrite = seperate_match_rewrite
+        self._separate_match_rewrite = separate_match_rewrite
 
     def match(self, layer: Layer) -> bool:
         raise NotImplementedError()
@@ -261,7 +261,7 @@ class RewritePatternManager(_PatternManager):
 
                     if pattern.root_layer is not None and layer.type not in pattern.root_layer:
                         continue
-                    if pattern._seperate_match_rewrite:
+                    if pattern._separate_match_rewrite:
                         if pattern.match(layer):
                             pattern.rewrite(layer)
                             modified = True
@@ -408,14 +408,9 @@ class FLayerInfo:
         def _swap_tensor_info(new, deprecated):
             name = deprecated.trt_tensor.name
             deprecated.trt_tensor.name = name + '_deprecated'
-            from ._common import default_net
             from .functional import cast
 
-            if default_net().strongly_typed:
-                if new.trt_tensor.dtype != deprecated.trt_tensor.dtype:
-                    new = cast(new, deprecated.trt_tensor.dtype)
-            else:
-                new.trt_tensor.dtype = deprecated.trt_tensor.dtype
+            new = cast(new, deprecated.dtype)
             new.trt_tensor.name = name
 
         def _reset_network_output_tensors(network, out, new_out):
@@ -424,16 +419,18 @@ class FLayerInfo:
             need_to_mark = False
             for i in range(num_outputs):
                 net_outputs.append(network._trt_network.get_output(i))
-                if out.trt_tensor is net_outputs[i]: need_to_mark = True
-            if need_to_mark is False: return
+                if out.trt_tensor is net_outputs[i]:
+                    need_to_mark = True
+            if need_to_mark is False:
+                return
             for output in net_outputs:
                 network.trt_network.unmark_output(output)
             for i in range(num_outputs):
-                network.trt_network.mark_output(
-                    new_out.trt_tensor
-                ) if net_outputs[
-                    i] is out.trt_tensor else network.trt_network.mark_output(
-                        net_outputs[i])
+                if net_outputs[i] is out.trt_tensor:
+                    network.trt_network.mark_output(new_out.trt_tensor)
+                    new_out.trt_tensor.dtype = out.trt_tensor.dtype
+                else:
+                    network.trt_network.mark_output(net_outputs[i])
 
         def replace_all_uses_with(out, new_out):
             if isinstance(out, Tensor):
@@ -577,7 +574,7 @@ class FuseAttentionWithBiasPass(PatternRewriter):
 
     def __init__(self):
         super().__init__(name="fuse_attention_with_bias",
-                         seperate_match_rewrite=False)
+                         separate_match_rewrite=False)
 
     @staticmethod
     def is_attention_plugin(layer: Layer) -> bool:
@@ -630,7 +627,8 @@ class FuseAttentionWithBiasPass(PatternRewriter):
                 return False
             plugin_flayer = FLayerInfoMemo.instance().get(layer.name)
             input = plugin_flayer.raw_inputs['qkv']
-            if input is None or len(list(input.get_users())) != 1:
+            if input is None or isinstance(
+                    input, list) or len(list(input.get_users())) != 1:
                 return False
             parent_layer = input.get_parent()
             if not self.is_elementwise_sum(parent_layer):

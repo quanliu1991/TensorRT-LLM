@@ -11,13 +11,13 @@ import sys
 
 import pygit2
 
-sys.path.insert(0, os.path.abspath('../..'))
+sys.path.insert(0, os.path.abspath('.'))
 
 project = 'tensorrt_llm'
-copyright = '2023, NVidia'
+copyright = '2024, NVidia'
 author = 'NVidia'
 branch_name = pygit2.Repository('.').head.shorthand
-
+html_show_sphinx = False
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
 
@@ -33,6 +33,7 @@ extensions = [
     'myst_parser',  # for markdown support
     "breathe",
     'sphinx.ext.todo',
+    'sphinxarg.ext',
 ]
 
 myst_url_schemes = {
@@ -71,6 +72,13 @@ print('CPP_INCLUDE_DIR', CPP_INCLUDE_DIR)
 print('CPP_GEN_DIR', CPP_GEN_DIR)
 
 
+def setup(app):
+    from helper import generate_examples, generate_llmapi
+
+    generate_examples()
+    generate_llmapi()
+
+
 def gen_cpp_doc(ofile_name: str, header_dir: str, summary: str):
     cpp_header_files = [
         file for file in os.listdir(header_dir) if file.endswith('.h')
@@ -98,3 +106,16 @@ Runtime
 subprocess.run(['mkdir', '-p', CPP_GEN_DIR])
 gen_cpp_doc(CPP_GEN_DIR + '/runtime.rst', CPP_INCLUDE_DIR + '/runtime',
             runtime_summary)
+
+executor_summary = f"""
+Executor
+==========
+
+.. Here are files in the cpp/include/executor
+.. We manually add subsection to enable detailed description in the future
+.. It is also doable to automatically generate this file and list all the modules in the conf.py
+    """.strip()
+
+subprocess.run(['mkdir', '-p', CPP_GEN_DIR])
+gen_cpp_doc(CPP_GEN_DIR + '/executor.rst', CPP_INCLUDE_DIR + '/executor',
+            executor_summary)

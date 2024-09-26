@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -38,6 +38,7 @@ class TestPrecisionControl(unittest.TestCase):
 
         # construct trt network
         builder = tensorrt_llm.Builder()
+        builder.strongly_typed = False  # Test need to run in weekly typed mode
         net = builder.create_network()
         with tensorrt_llm.net_guard(net):
             network = tensorrt_llm.default_trtnet()

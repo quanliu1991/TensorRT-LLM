@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -37,4 +37,15 @@ TEST(StlUtils, InclusiveScan)
         data.begin(), data.end(), std::insert_iterator<std::list<int>>(l, std::next(l.begin())));
     tensorrt_llm::common::stl_utils::basicInclusiveScan(data.begin(), data.end(), it, std::multiplies<>{});
     EXPECT_EQ(l, (std::list<int>{3, 4, 8, 9, 14, 3, 3, 12, 12, 60}));
+}
+
+TEST(StlUtils, toString)
+{
+    std::optional<int> a{10}, b;
+    auto strA = tensorrt_llm::common::stl_utils::toString(a);
+    auto strB = tensorrt_llm::common::stl_utils::toString(b);
+    auto strInt = tensorrt_llm::common::stl_utils::toString(10);
+    EXPECT_EQ(strA, "10");
+    EXPECT_EQ(strB, "None");
+    EXPECT_EQ(strInt, "10");
 }

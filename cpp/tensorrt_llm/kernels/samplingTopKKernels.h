@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2024, NVIDIA CORPORATION.  All rights reserved.
  * Copyright (c) 2021, NAVER Corp.  Authored by CLOVA.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,77 +16,175 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
+#include "tensorrt_llm/runtime/common.h"
 #include <curand_kernel.h>
 
-namespace tensorrt_llm
+namespace tensorrt_llm::kernels
 {
-namespace kernels
+
+static constexpr runtime::SizeType32 TOP_K_MAX = 1024;
+
+template <typename T>
+struct TopKSamplingKernelParams
 {
+
+    //! Input buffer [batchSize, maxTokensPerStep, vocabSizePadded].
+    //! Log probabilities of each token in the vocab. If logitsHasProbs is true,
+    //! logProbs must contain **just** probabilities instead of log probabilities.
+    T const* logProbs{nullptr};
+    //! input buffer [batchSize][vocabSizePadded] array of pointers to logits.
+    //! If nullptr, logProbs is used. Only maxTokensPerStep == 1 is supported.
+    T const* const* logProbsPtrs{nullptr};
+
+    //! output buffer [maxBatchSize][maxSeqLen], optional. Contains pointers to rows
+    //! with output tokens per request. If nullptr, outputIds must be provided.
+    runtime::TokenIdType** outputIdsPtrs{nullptr};
+    //! output buffer [maxBatchSize, maxSeqLen], optional. Tensor to store output tokens.
+    //! Not used if outputIdsPtrs != nullptr
+    runtime::TokenIdType* outputIds{nullptr};
+
+    //! Required. Pointer to the workspace of size returned by getTopKWorkspaceSize.
+    //! Has to be pre-allocated by caller.
+    //! Function does not take ownership of the buffer
+    void* workspace{nullptr};
+
+    //! input buffer [maxBatchSize], optional. EOS token ids per request
+    runtime::TokenIdType const* endIds{nullptr};
+
+    //! input/output buffer [maxBatchSize], optional. If nullptr, seqLen is 0
+    //! Current sequence length of the request. Set up to, but excluding endId token.
+    runtime::SizeType32* sequenceLengths{nullptr};
+    //! input buffer[batchSize], optional. Indices of rows of data in memory pool.
+    //! Linear indexing (batchIdx) is used if nullptr.
+    runtime::SizeType32 const* batchSlots{nullptr};
+    //! input buffer [maxBatchSize], optional. Number of tokens per step for each request.
+    //! It is assumed that all requests have maxTokensPerStep tokens per step if nullptr.
+    runtime::SizeType32 const* tokensPerStep{nullptr};
+
+    //! input buffer [maxBatchSize], optional. If true, request exits early.
+    FinishedState const* finishedInput{nullptr};
+    //! output buffer [maxBatchSize], optional.
+    //! Set to true if sequence has finished (if finished || outputId == endId).
+    FinishedState* finishedOutput{nullptr};
+    //! input buffer [maxBatchSize]. Flags whether to skip decoding per request
+    bool const* skipDecode{nullptr};
+
+    //! input/output buffer [maxBatchSize], optional.
+    //! Cumulative log probability of selected tokens. Ignored if nullptr
+    float* cumLogProbs{nullptr};
+    //! output buffer [maxBatchSize]. Log probs is the probability induced by the top-k sampling.
+    //! If normalizeLogProbs is true, we normalize the probability 'expLogit' of the selected token
+    //! by the probability 's_sum' of a set of top-k tokens, meaning the logProb is the probability
+    //! of the selected token, conditioned on the event that it is selected,
+    //! i.e., log_prob = log P(i | i is in top-k) = log(expLogit / s_sum).
+    //! Ignored if nullptr.
+    float* outputLogProbs{nullptr};
+
+    //! input buffer [maxBatchSize]. Initialized curand states
+    curandState_t* curandState{nullptr};
+    //! input buffer [maxBatchSize]. K for topK sampling per request.
+    //! Supported K is in range [1; 1024]. Where K=1 is greedy search.
+    //! If nullptr maxTopK is used for all requests.
+    runtime::SizeType32 const* topKs{nullptr};
+    //! input buffer [maxBatchSize]. Probability for topP sampling per request.
+    //! Supported P is in range (0.0, 1.0]. If nullptr, topP is used for all requests
+    float const* topPs{nullptr};
+    //! maximum among all topKs K for topK sampling
+    runtime::SizeType32 maxTopK{TOP_K_MAX};
+    //! probability for topP sampling.
+    float maxTopP{1.0f};
+
+    runtime::SizeType32 batchSize{-1};
+    runtime::SizeType32 maxBatchSize{-1};
+    runtime::SizeType32 vocabSizePadded{-1};
+    runtime::SizeType32 maxTokensPerStep{-1};
+    runtime::SizeType32 maxSeqLen{-1};
+
+    //! when set to True outputLogProbs are normalized to TopK
+    bool normalizeLogProbs{false};
+    //! flag to highlight that logProbs contains probabilities
+    bool logitsHasProbs{false};
+    //! flag to return all selectedTopK results
+    bool returnAllTopK{false};
+
+    void checkParams() const
+    {
+        TLLM_CHECK(batchSize > 0);
+        TLLM_CHECK(maxBatchSize > 0);
+        TLLM_CHECK(maxBatchSize >= batchSize);
+        TLLM_CHECK(vocabSizePadded > 0);
+        TLLM_CHECK(maxTokensPerStep > 0);
+
+        TLLM_CHECK(logProbs || logProbsPtrs);
+        TLLM_CHECK(outputIds || outputIdsPtrs);
+
+        if (maxTokensPerStep > 1)
+        {
+            TLLM_CHECK(tokensPerStep);
+        }
+
+        if (outputIds)
+        {
+            TLLM_CHECK(maxSeqLen > 0);
+        }
+
+        TLLM_CHECK(workspace);
+        TLLM_CHECK(curandState);
+
+        TLLM_CHECK(maxTokensPerStep != 1 || returnAllTopK || sequenceLengths);
+        TLLM_CHECK(maxTokensPerStep != 1 || returnAllTopK || endIds);
+        if (cumLogProbs != nullptr || outputLogProbs != nullptr)
+        {
+            TLLM_CHECK(maxTokensPerStep == 1 && !returnAllTopK);
+        }
+        TLLM_CHECK(((finishedOutput == nullptr) ^ (endIds == nullptr)) == 0);
+
+        TLLM_CHECK(0 < maxTopP && maxTopP <= 1.f);
+        TLLM_CHECK(0 <= maxTopK && maxTopK <= TOP_K_MAX);
+    }
+};
+
 // clang-format off
 //! \brief Given logProbs, performs top K **and** top P sampling at the same time. Fills sampled tokens to outputIds.
 //! Computes sequenceLength, finished state, cumLogProbs inplace.
 //! Sampling per request can be controlled using skipDecode, topPs and topKs parameters.
 //! Function sets workspaceSize and exits early if workspace is nullptr.
 //! If logits are Nan, we set output token to be the last in the vocabulary.
-//!
-//! \param workspace pointer to the workspace. Has to be pre-allocated by caller. Function does not take ownership of the
-//! buffer.
-//! \param workspaceSize size of the workspace in bytes
-//! \param logProbs input buffer [batchSize x vocabSizePadded].
-//! Log probabilities of each token in the vocab. If cumLogProbs or outputLogProbs are specified,
-//! logProbs must contain **just** probabilities instead of log probabilities.
-//! \param outputIds output buffer [batchSize][maxSeqLen]. Contains pointers to rows with output tokens per request
-//! \param sequenceLength input/output buffer [batchSize]. Current sequence length of the request up to, but excluding endId token
-//! \param finishedInput input buffer [batchSize]. If true, request exits early.
-//! \param finishedOutput output buffer [batchSize]. Set flag if sequence has finished (if finished || outputId == endId).
-//! \param cumLogProbs input/output buffer [batchSize]. Cumulative log probability of selected tokens. Ignored if nullptr
-//! \param outputLogProbs output buffer [batchSize]. Log probs is the probability induced by the top-k sampling.
-//! We normalize the probability 'expLogit' of the selected token by the probability 's_sum' of a set of top-k
-//! tokens, meaning the logProb is the probability of the selected token, conditioned on the event that it is selected,
-//! i.e., log_prob = log P(i | i is in top-k) = log(expLogit / s_sum). Ignored if nullptr.
-//! \param curandstate input buffer [batchSize]. Curand states properly
-//! initialized using invokeCurandInitialize per request.
-//! \param maxTopK maximum among all topKs K for topK sampling
-//! \param topKs input buffer [batchSize]. K for topK sampling per request.
-//! Supported K is in range [1; 1024]. Where K=1 is greedy search. If nullptr maxTopK is used for all requests.
-//! \param topP probability for topP sampling.
-//! \param topPs input buffer [batchSize]. Probability for topP sampling per request.
-//! Supported P is in range (0.0, 1.0]. If nullptr, topP is used for all requests
-//! \param vocabSizePadded size of padded vocab
-//! \param endIds input buffer [batchSize]. EOS token ids per request
-//! \param stream cuda stream
-//! \param batchSize batch size
-//! \param skipDecode input buffer [batchSize]. Flags whether to skip decoding per request
 // clang-format on
 template <typename T>
-void invokeBatchTopKSampling(void* workspace, size_t& workspaceSize, const T* logProbs, int** ids, int* sequenceLengths,
-    const FinishedState* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
-    curandState_t* curandstate, const int maxTopK, const int* topKs, const float topP, const float* topPs,
-    const int vocabSizePadded, const int* endIds, cudaStream_t stream, const int batchSize, const bool* skipDecode);
+void invokeBatchTopKSampling(TopKSamplingKernelParams<T> const& params, cudaStream_t stream);
 
-//! \brief Specialization of invokeBatchTopKSampling with topPs=nullptr and topKs=nullptr
 template <typename T>
-void invokeTopKSampling(void* workspace, size_t& workspaceSize, const T* logProbs, int** outputIds, int* sequenceLength,
-    const FinishedState* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
-    curandState_t* curandstate, const int topK, const float topP, const int vocabSizePadded, const int* endIds,
-    cudaStream_t stream, const int batchSize, const bool* skipDecode);
+[[nodiscard]] std::vector<size_t> getTopKWorkspaceSizes(runtime::SizeType32 batchSize,
+    runtime::SizeType32 maxTokensPerStep, runtime::SizeType32 maxTopK, runtime::SizeType32 vocabSizePadded)
+{
+    runtime::SizeType32 constexpr maxBlockPerBeam = 8;
+    auto const tempLogProbsBufSize = sizeof(T) * batchSize * maxTokensPerStep * vocabSizePadded;         // type T
+    auto const topKTmpIdsBufSize
+        = sizeof(runtime::SizeType32) * batchSize * maxTokensPerStep * maxTopK * maxBlockPerBeam;        // type int
+    auto const topKTmpValBufSize = sizeof(T) * batchSize * maxTokensPerStep * maxTopK * maxBlockPerBeam; // type T
 
-//! \brief Applies mask and bias to logits. Sets -MAX_FLT value for tokens in range [vocabSize; vocabSizePadded) to
-//! prevent them being chosen If request finished the generation, sets MAX_FLT to endId token and -MAX_FLT to all other
-//! tokens forcing to choose endId token. Otherwise, adds bias per token if bias pointer is not nullptr.
-//!
-//! \param logits input/output buffer [batchSize, vocabSize]. Logits to be modified.
-//! \param bias input buffer [vocabSize]. Bias to logit per token. Ignored if nullptr
-//! \param endIds input buffer [batchSize]. EOS token ids per request
-//! \param finished input buffer [batchSize] with flags set to true if request has finished the generation
+    return {tempLogProbsBufSize, topKTmpIdsBufSize, topKTmpValBufSize};
+}
+
+//! \brief Returns workspace size in bytes needed for sampling TopK computation
 //! \param batchSize batch size
-//! \param vocabSize unpadded vocab size
-//! \param vocabSizePadded padded vocab size
-//! \param stream stream
+//! \param maxTokensPerStep maximum number of tokens per computed per step
+//! \param maxTopK maximum among all topKs K for topK sampling
+//! \param vocabSizePadded size of padded vocab
 template <typename T>
-void invokeAddBiasEndMask(T* logits, const T* bias, const int* endIds, const FinishedState* finished,
-    const int batchSize, const int vocabSize, const int vocabSizePadded, cudaStream_t stream);
+[[nodiscard]] size_t getTopKWorkspaceSize(runtime::SizeType32 batchSize, runtime::SizeType32 maxTokensPerStep,
+    runtime::SizeType32 maxTopK, runtime::SizeType32 vocabSizePadded)
+{
+    auto const workspaceSizes = getTopKWorkspaceSizes<T>(batchSize, maxTokensPerStep, maxTopK, vocabSizePadded);
+    return tensorrt_llm::common::calcAlignedSize(workspaceSizes, 256);
+}
 
-} // namespace kernels
-} // namespace tensorrt_llm
+void invokeSetupTopKRuntimeArgs(runtime::SizeType32 batchSize, runtime::SizeType32 topK,
+    runtime::SizeType32* runtimeTopKDevicePtr, runtime::SizeType32 runtimeTopKSize, float topP,
+    float* runtimeTopPDevicePtr, runtime::SizeType32 runtimeTopPSize, bool* skipDecodeDevicePtr,
+    runtime::SizeType32 const* batchSlotsDevicePtr, cudaStream_t stream);
+
+} // namespace tensorrt_llm::kernels

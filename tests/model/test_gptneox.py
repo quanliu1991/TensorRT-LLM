@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,25 +19,27 @@ import unittest
 from itertools import product
 
 import numpy as np
-import pytest
 
 # isort: off
 import torch
-import tensorrt as trt
 # isort: on
 from parameterized import parameterized
 from transformers import GPTNeoXConfig, GPTNeoXForCausalLM
 
 import tensorrt_llm
 from tensorrt_llm import Builder
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-from examples.gptneox.weight import load_from_hf_gpt_neox
+import os
+import sys
+
+from examples.gptneox.convert_checkpoint import convert_hf_gptneox
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import getSMVersion
+from utils.util import skip_fp32_accum_pre_ampere, unittest_name_func
 
 
 def compare_max_abs_error(ref, res, str):
@@ -66,7 +68,7 @@ class TestGPTNeoX(unittest.TestCase):
 
     def _gen_tensorrt_llm_network(self, network, builder, hf_gpt, gpt_config,
                                   batch_size, beam_width, input_len, output_len,
-                                  fp16, gpt_attention_plugin, rank,
+                                  dtype, gpt_attention_plugin, rank,
                                   tensor_parallel,
                                   apply_query_key_layer_scaling):
         num_layers = gpt_config.num_hidden_layers
@@ -75,40 +77,50 @@ class TestGPTNeoX(unittest.TestCase):
         vocab_size = gpt_config.vocab_size
         hidden_act = gpt_config.hidden_act
         max_position_embeddings = gpt_config.max_position_embeddings
-        rotary_dim = int((hidden_size // num_heads) * gpt_config.rotary_pct)
 
         list(range(tensor_parallel))
 
+        config = {
+            'architecture': 'GPTNeoXForCausalLM',
+            'dtype': dtype,
+            "num_hidden_layers": num_layers,
+            "num_attention_heads": num_heads,
+            "hidden_size": hidden_size,
+            "vocab_size": vocab_size,
+            "position_embedding_type": "rope_gpt_neox",
+            "max_position_embeddings": max_position_embeddings,
+            "rotary_emb_base": 10000,
+            "rotary_pct": gpt_config.rotary_pct,
+            "hidden_act": hidden_act,
+            "mapping": {
+                "world_size": tensor_parallel,
+                "tp_size": tensor_parallel
+            },
+            "use_parallel_embedding": False,
+            "embedding_sharding_dim": 0,
+            "share_embedding_table": False
+        }
+        config = tensorrt_llm.models.PretrainedConfig.from_dict(config)
+        weights = convert_hf_gptneox(hf_gpt,
+                                     mapping=Mapping(rank=rank,
+                                                     world_size=tensor_parallel,
+                                                     tp_size=tensor_parallel),
+                                     dtype=dtype)
+        tensorrt_llm_gptneox = tensorrt_llm.models.GPTNeoXForCausalLM(config)
+        tensorrt_llm_gptneox.load(weights)
+
         with net_guard(network):
-            kv_dtype = trt.float16 if fp16 else trt.float32
-            # Initialize model
-            tensorrt_llm_gpt = tensorrt_llm.models.GPTNeoXForCausalLM(
-                num_layers=num_layers,
-                num_heads=num_heads,
-                hidden_size=hidden_size,
-                vocab_size=vocab_size,
-                hidden_act=hidden_act,
-                max_position_embeddings=max_position_embeddings,
-                rotary_dim=rotary_dim,
-                dtype=kv_dtype,
-                mapping=tensorrt_llm.Mapping(world_size=tensor_parallel,
-                                             tp_size=tensor_parallel),
-                apply_query_key_layer_scaling=apply_query_key_layer_scaling)
-            inputs = tensorrt_llm_gpt.prepare_inputs(batch_size,
-                                                     input_len,
-                                                     output_len,
-                                                     use_cache=True,
-                                                     max_beam_width=beam_width)
-            load_from_hf_gpt_neox(tensorrt_llm_gpt,
-                                  hf_gpt,
-                                  fp16=fp16,
-                                  rank=rank,
-                                  tp_size=tensor_parallel)
-
+            network.set_named_parameters(
+                tensorrt_llm_gptneox.named_parameters())
+            inputs = tensorrt_llm_gptneox.prepare_inputs(
+                max_batch_size=batch_size,
+                max_input_len=input_len,
+                max_seq_len=input_len + output_len,
+                max_num_tokens=batch_size * input_len,
+                use_cache=True,
+                max_beam_width=beam_width)
             # Prepare
-            network.set_named_parameters(tensorrt_llm_gpt.named_parameters())
-
-            tensorrt_llm_gpt(*inputs)
+            tensorrt_llm_gptneox(**inputs)
 
         return network
 
@@ -135,7 +147,6 @@ class TestGPTNeoX(unittest.TestCase):
 
         runtime = None
         builder = Builder()
-        fp16 = (dtype == 'float16')
 
         with tempfile.TemporaryDirectory() as tmpdirname:
             builder_config = builder.create_builder_config(
@@ -144,20 +155,21 @@ class TestGPTNeoX(unittest.TestCase):
                 timing_cache='model.cache',
                 tensor_parallel=world_size,  # TP only
                 use_refit=use_refit,
-                strongly_typed=fp16,
+                strongly_typed=True,
             )
             network = builder.create_network()
+            network.plugin_config.to_legacy_setting()
             if use_attention_plugin:
-                network.plugin_config.set_gpt_attention_plugin(dtype)
+                network.plugin_config.gpt_attention_plugin = dtype
             if use_ln_gemm_plugin:
-                network.plugin_config.set_gemm_plugin(dtype)
+                network.plugin_config.gemm_plugin = dtype
             if enable_remove_input_padding:
-                network.plugin_config.enable_remove_input_padding()
+                network.plugin_config.remove_input_padding = True
             network.plugin_config.set_context_fmha(context_fmha_flag)
 
             self._gen_tensorrt_llm_network(network, builder, hf_gpt, gpt_config,
                                            batch_size, beam_width, input_len,
-                                           output_len, fp16,
+                                           output_len, dtype,
                                            use_attention_plugin, rank,
                                            world_size,
                                            apply_query_key_layer_scaling)
@@ -178,20 +190,12 @@ class TestGPTNeoX(unittest.TestCase):
         ], [False, True])
         return test_cases
 
-    @parameterized.expand(load_test_cases)
+    @parameterized.expand(load_test_cases, name_func=unittest_name_func)
     def test_gptneox_plugin(self, context_fmha_flag,
                             enable_remove_input_padding):
 
         # Skip tests that are not supported in pre-ampere architecture
-        if getSMVersion() < 80:
-            if context_fmha_flag == ContextFMHAType.enabled:
-                pytest.skip(
-                    "ContextFMHAType is not supported in pre-ampere architecture"
-                )
-            elif context_fmha_flag == ContextFMHAType.enabled_with_fp32_acc:
-                pytest.skip(
-                    "ContextFMHAType with fp32 acc is not supported in pre-ampere architecture"
-                )
+        skip_fp32_accum_pre_ampere(context_fmha_flag)
 
         torch.random.manual_seed(0)
         use_refit = False
@@ -257,8 +261,8 @@ class TestGPTNeoX(unittest.TestCase):
         sequence_length_buffer = ctx_context_lengths.detach().clone()
 
         if enable_remove_input_padding:
-            ctx_ids = ctx_ids.view([1, batch_size * seq_len])
-            ctx_position_ids = ctx_position_ids.view([1, batch_size * seq_len])
+            ctx_ids = ctx_ids.view([batch_size * seq_len])
+            ctx_position_ids = ctx_position_ids.view([batch_size * seq_len])
             ctx_last_token_ids = torch.cumsum(ctx_last_token_ids, dim=0).int()
 
         cache_indirections = [
@@ -279,6 +283,13 @@ class TestGPTNeoX(unittest.TestCase):
                        dtype=torch.int32,
                        device='cuda')
         ]  # ping-pong buffers
+
+        perf_knob_tensor_size = 16
+        context_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
+                                                  dtype=torch.int64)
+        if context_fmha_flag == ContextFMHAType.enabled_with_fp32_acc:
+            context_runtime_perf_knobs[1] = 1  # enable_context_fmha_fp32_acc
+
         ctx_buffer = {
             'input_ids': ctx_ids,
             'context_lengths': ctx_context_lengths,
@@ -286,25 +297,30 @@ class TestGPTNeoX(unittest.TestCase):
             'position_ids': ctx_position_ids,
             'last_token_ids': ctx_last_token_ids,
             'cache_indirection': cache_indirections[0],
+            'host_runtime_perf_knobs': context_runtime_perf_knobs,
         }
         if enable_remove_input_padding:
             ctx_buffer['host_context_lengths'] = ctx_context_lengths.cpu()
         ctx_shape = {k: v.shape for k, v in ctx_buffer.items()}
         shape = (batch_size, 2, gpt_config.num_attention_heads, total_seq_len,
                  gpt_config.hidden_size // gpt_config.num_attention_heads)
+        ctx_buffer[f'host_max_attention_window_sizes'] = torch.tensor(
+            [total_seq_len] * gpt_config.num_hidden_layers, dtype=torch.int32)
+        ctx_shape[f'host_max_attention_window_sizes'] = (
+            gpt_config.num_hidden_layers, )
         for i in range(gpt_config.num_hidden_layers):
             ctx_shape[f'past_key_value_{i}'] = shape
             ctx_buffer[f'past_key_value_{i}'] = key_value_cache_buffers[i]
             ctx_buffer[f'present_key_value_{i}'] = key_value_cache_buffers[i]
-            ctx_buffer[f'host_max_attention_window_size_{i}'] = torch.tensor(
-                [total_seq_len], dtype=torch.int32)
-            ctx_shape[f'host_max_attention_window_size_{i}'] = (1, )
         ctx_buffer['sequence_length'] = sequence_length_buffer
         sequence_length_buffer = torch.add(sequence_length_buffer, step)
         ctx_shape['sequence_length'] = ctx_buffer['sequence_length'].shape
         ctx_buffer['host_past_key_value_lengths'] = ctx_context_lengths.cpu()
         ctx_shape['host_past_key_value_lengths'] = ctx_buffer[
             'host_past_key_value_lengths'].shape
+        ctx_buffer['host_sink_token_length'] = torch.tensor([0],
+                                                            dtype=torch.int32)
+        ctx_shape['host_sink_token_length'] = (1, )
 
         context = runtime.ctx_context
         runtime._set_shape(context, ctx_shape)
@@ -370,11 +386,16 @@ class TestGPTNeoX(unittest.TestCase):
         ref = hf_outputs.logits[:, -1, :]
 
         if enable_remove_input_padding:
-            step1_id = step1_id.view([1, batch_size])
-            gen_position_ids = gen_position_ids.view([1, batch_size])
+            step1_id = step1_id.view([batch_size])
+            gen_position_ids = gen_position_ids.view([batch_size])
             gen_last_token_ids = torch.ones_like(
                 gen_context_lengths).int().cuda()
             gen_last_token_ids = torch.cumsum(gen_last_token_ids, dim=0).int()
+
+        gen_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
+                                              dtype=torch.int64)
+        if context_fmha_flag == ContextFMHAType.enabled_with_fp32_acc:
+            gen_runtime_perf_knobs[1] = 1  # enable_context_fmha_fp32_acc
 
         step1_buffer = {
             'input_ids': step1_id,
@@ -383,25 +404,30 @@ class TestGPTNeoX(unittest.TestCase):
             'position_ids': gen_position_ids,
             'last_token_ids': gen_last_token_ids,
             'cache_indirection': cache_indirections[1],
+            'host_runtime_perf_knobs': gen_runtime_perf_knobs,
         }
         if enable_remove_input_padding:
             step1_buffer['host_context_lengths'] = gen_context_lengths.cpu()
         step1_shape = {k: v.shape for k, v in step1_buffer.items()}
+        step1_shape[f'host_max_attention_window_sizes'] = (
+            gpt_config.num_hidden_layers, )
         for i in range(gpt_config.num_hidden_layers):
             step1_shape[f'past_key_value_{i}'] = shape
-            step1_shape[f'host_max_attention_window_size_{i}'] = (1, )
         step1_shape['sequence_length'] = (batch_size, )
         step1_shape['host_past_key_value_lengths'] = (batch_size, )
+        step1_shape['host_sink_token_length'] = (1, )
+        step1_buffer[f'host_max_attention_window_sizes'] = torch.tensor(
+            [total_seq_len] * gpt_config.num_hidden_layers, dtype=torch.int32)
         for i in range(gpt_config.num_hidden_layers):
             step1_buffer[f'past_key_value_{i}'] = key_value_cache_buffers[i]
             step1_buffer[f'present_key_value_{i}'] = key_value_cache_buffers[i]
-            step1_buffer[f'host_max_attention_window_size_{i}'] = torch.tensor(
-                [total_seq_len], dtype=torch.int32)
         # For step 1, the sequence_lengths = context_lengths + 1.
         sequence_length_buffer = torch.add(sequence_length_buffer, step)
         step1_buffer['sequence_length'] = sequence_length_buffer
         step1_buffer['host_past_key_value_lengths'] = torch.tensor(
             [seq_len + step - 1] * batch_size, dtype=torch.int32)
+        step1_buffer['host_sink_token_length'] = torch.tensor([0],
+                                                              dtype=torch.int32)
 
         context = runtime.context_1
         runtime._set_shape(context, step1_shape)

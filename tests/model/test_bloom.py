@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,8 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
-import sys
 import tempfile
 import unittest
 from itertools import product
@@ -23,8 +21,10 @@ import pytest
 
 # isort: off
 import torch
-import tensorrt as trt
 # isort: on
+import os
+import sys
+
 from parameterized import parameterized
 from transformers import BloomConfig, BloomForCausalLM
 
@@ -37,10 +37,11 @@ from tensorrt_llm.runtime import ModelConfig, SamplingConfig
 from tensorrt_llm.runtime.generation import _prepare_attention_mask
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-from examples.bloom.weight import load_from_hf_bloom
+
+from examples.bloom.convert_checkpoint import convert_hf_bloom
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import getSMVersion
+from utils.util import skip_fp32_accum_pre_ampere, unittest_name_func
 
 
 class TestBloom(unittest.TestCase):
@@ -58,41 +59,46 @@ class TestBloom(unittest.TestCase):
 
     def _gen_tensorrt_llm_network(self, network, builder, hf_bloom,
                                   bloom_config, batch_size, input_len,
-                                  output_len, fp16, gpt_attention_plugin,
+                                  output_len, dtype, gpt_attention_plugin,
                                   tensor_parallel,
                                   apply_query_key_layer_scaling):
-        num_layers = bloom_config.n_layer
-        num_heads = bloom_config.n_head
-        hidden_size = bloom_config.hidden_size
-        vocab_size = bloom_config.vocab_size
-        n_positions = input_len + output_len
+        config = {
+            'architecture': 'BloomForCausalLM',
+            'dtype': dtype,
+            'num_hidden_layers': bloom_config.n_layer,
+            'num_attention_heads': bloom_config.n_head,
+            'hidden_size': bloom_config.hidden_size,
+            'vocab_size': bloom_config.vocab_size,
+            'position_embedding_type': 'alibi',
+            'max_position_embeddings': input_len + output_len,
+            'hidden_act': 'gelu',
+            'mapping': {
+                'world_size': tensor_parallel,
+                'tp_size': tensor_parallel
+            },
+            'use_parallel_embedding': False,
+            'embedding_sharding_dim': 0,
+            'share_embedding_table': False,
+        }
+        config = tensorrt_llm.models.PretrainedConfig.from_dict(config)
+        # config.set_rank(rank)
+        weights = convert_hf_bloom(hf_bloom,
+                                   tensor_parallel=tensor_parallel,
+                                   dtype=dtype)
+        tensorrt_llm_bloom = tensorrt_llm.models.BloomForCausalLM(config)
+        tensorrt_llm_bloom.load(weights)
 
         with net_guard(network):
-            kv_dtype = trt.float16 if fp16 else trt.float32
-            # Initialize model
-            tensorrt_llm_bloom = tensorrt_llm.models.BloomForCausalLM(
-                num_layers=num_layers,
-                num_heads=num_heads,
-                hidden_size=hidden_size,
-                vocab_size=vocab_size,
-                hidden_act='gelu',
-                max_position_embeddings=n_positions,
-                dtype=kv_dtype,
-                mapping=tensorrt_llm.Mapping(
-                    world_size=tensor_parallel,
-                    tp_size=tensor_parallel),  # TP only
-            )
-            inputs = tensorrt_llm_bloom.prepare_inputs(batch_size,
-                                                       input_len,
-                                                       output_len,
-                                                       use_cache=True,
-                                                       max_beam_width=1)
-            load_from_hf_bloom(tensorrt_llm_bloom, hf_bloom, fp16=fp16)
-
-            # Prepare
             network.set_named_parameters(tensorrt_llm_bloom.named_parameters())
-
-            tensorrt_llm_bloom(*inputs)
+            inputs = tensorrt_llm_bloom.prepare_inputs(
+                max_batch_size=batch_size,
+                max_input_len=input_len,
+                max_seq_len=input_len + output_len,
+                max_num_tokens=batch_size * input_len,
+                use_cache=True,
+                max_beam_width=1)
+            # Prepare
+            tensorrt_llm_bloom(**inputs)
 
         return network
 
@@ -117,7 +123,6 @@ class TestBloom(unittest.TestCase):
 
         runtime = None
         builder = Builder()
-        fp16 = (dtype == 'float16')
 
         with tempfile.TemporaryDirectory() as tmpdirname:
             builder_config = builder.create_builder_config(
@@ -126,20 +131,21 @@ class TestBloom(unittest.TestCase):
                 timing_cache='model.cache',
                 tensor_parallel=world_size,  # TP only
                 use_refit=use_refit,
-                strongly_typed=fp16,
+                strongly_typed=True,
             )
             network = builder.create_network()
+            network.plugin_config.to_legacy_setting()
             if use_plugin:
-                network.plugin_config.set_gpt_attention_plugin(dtype)
+                network.plugin_config.gpt_attention_plugin = dtype
             if fast_building:
-                network.plugin_config.set_gemm_plugin(dtype)
+                network.plugin_config.gemm_plugin = dtype
             network.plugin_config.set_context_fmha(context_fmha_type)
             if enable_remove_input_padding:
-                network.plugin_config.enable_remove_input_padding()
+                network.plugin_config.remove_input_padding = True
 
             self._gen_tensorrt_llm_network(network, builder, hf_bloom,
                                            bloom_config, batch_size, input_len,
-                                           output_len, fp16, use_plugin,
+                                           output_len, dtype, use_plugin,
                                            world_size,
                                            apply_query_key_layer_scaling)
 
@@ -156,7 +162,7 @@ class TestBloom(unittest.TestCase):
             ], [False], ['float16', 'float32']))
         return test_cases
 
-    @parameterized.expand(load_test_cases())
+    @parameterized.expand(load_test_cases(), name_func=unittest_name_func)
     def test_bloom(self, use_gpt_attention_plugin, context_fmha_type,
                    enable_remove_input_padding, dtype):
         model = 'bloom'
@@ -212,8 +218,16 @@ class TestBloom(unittest.TestCase):
                                            dtype=torch.int32).cuda()
         ctx_host_past_key_value_lengths = torch.tensor([0] * batch_size,
                                                        dtype=torch.int32)
-        host_max_attention_window_sizes = torch.tensor([total_length],
+        host_max_attention_window_sizes = torch.tensor([total_length] *
+                                                       bloom_config.n_layer,
                                                        dtype=torch.int32)
+        host_sink_token_length = torch.tensor([0], dtype=torch.int32)
+
+        perf_knob_tensor_size = 16
+        context_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
+                                                  dtype=torch.int64)
+        if context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
+            context_runtime_perf_knobs[1] = 1  # enable_context_fmha_fp32_acc
 
         cache_indirections = [
             torch.full((
@@ -248,13 +262,22 @@ class TestBloom(unittest.TestCase):
             ctx_buffer['sequence_length'] = ctx_sequence_length
             ctx_buffer[
                 'host_past_key_value_lengths'] = ctx_host_past_key_value_lengths
+            ctx_buffer['host_sink_token_length'] = host_sink_token_length
             if enable_remove_input_padding:
                 ctx_host_context_lengths = ctx_context_lengths.cpu()
                 ctx_buffer["host_context_lengths"] = ctx_host_context_lengths
+            ctx_buffer['host_runtime_perf_knobs'] = context_runtime_perf_knobs
         else:
             ctx_buffer['attention_mask'] = ctx_attention_mask
 
         ctx_shape = {k: v.shape for k, v in ctx_buffer.items()}
+
+        ctx_shape.update(
+            {f'host_max_attention_window_sizes': (bloom_config.n_layer, )})
+        ctx_buffer.update({
+            f'host_max_attention_window_sizes':
+            host_max_attention_window_sizes
+        })
 
         for i in range(bloom_config.n_layer):
             shape = (batch_size, 2, bloom_config.n_head, 0,
@@ -262,10 +285,7 @@ class TestBloom(unittest.TestCase):
             past_buffer = torch.zeros((1, ),
                                       dtype=str_dtype_to_torch(dtype),
                                       device='cuda')
-            ctx_shape.update({
-                f'past_key_value_{i}': shape,
-                f'host_max_attention_window_size_{i}': (1, ),
-            })
+            ctx_shape.update({f'past_key_value_{i}': shape})
             shape = (batch_size, 2, bloom_config.n_head, seq_len,
                      bloom_config.hidden_size // bloom_config.n_head)
             ctx_buffer.update({
@@ -275,8 +295,6 @@ class TestBloom(unittest.TestCase):
                 torch.zeros(shape,
                             dtype=str_dtype_to_torch(dtype),
                             device='cuda'),
-                f'host_max_attention_window_size_{i}':
-                host_max_attention_window_sizes,
             })
 
         context = runtime.ctx_context
@@ -313,8 +331,7 @@ class TestBloom(unittest.TestCase):
         gen_host_past_key_value_lengths = torch.tensor([seq_len + step - 1] *
                                                        batch_size,
                                                        dtype=torch.int32)
-        gen_host_max_attention_window_sizes = torch.tensor([total_length],
-                                                           dtype=torch.int32)
+        gen_host_sink_token_length = torch.tensor([0], dtype=torch.int32)
         step1_buffer = {
             'input_ids': gen_id,
             'context_lengths': gen_context_lengths.contiguous(),
@@ -331,24 +348,25 @@ class TestBloom(unittest.TestCase):
                 'host_past_key_value_lengths'] = gen_host_past_key_value_lengths
             gen_host_context_lengths = gen_context_lengths.cpu()
             step1_buffer['host_context_lengths'] = gen_host_context_lengths
+            step1_buffer['host_sink_token_length'] = gen_host_sink_token_length
         else:
             step1_buffer['attention_mask'] = gen_attention_mask
 
         step1_shape = {k: v.shape for k, v in step1_buffer.items()}
 
+        step1_shape.update(
+            {f'host_max_attention_window_sizes': (bloom_config.n_layer, )})
+        step1_buffer.update({
+            f'host_max_attention_window_sizes':
+            host_max_attention_window_sizes
+        })
+
         for i in range(bloom_config.n_layer):
             shape = (batch_size, 2, bloom_config.n_head, seq_len,
                      bloom_config.hidden_size // bloom_config.n_head)
-            step1_shape.update({
-                f'past_key_value_{i}': shape,
-                f'host_max_attention_window_size_{i}': (1, ),
-            })
-            step1_buffer.update({
-                f'past_key_value_{i}':
-                ctx_buffer[f'present_key_value_{i}'],
-                f'host_max_attention_window_size_{i}':
-                host_max_attention_window_sizes,
-            })
+            step1_shape.update({f'past_key_value_{i}': shape})
+            step1_buffer.update(
+                {f'past_key_value_{i}': ctx_buffer[f'present_key_value_{i}']})
 
         context = runtime.context_1
         runtime._set_shape(context, step1_shape)
@@ -370,20 +388,12 @@ class TestBloom(unittest.TestCase):
                                    res.cpu().numpy(),
                                    atol=1e-1)
 
-    @parameterized.expand(load_test_cases())
+    @parameterized.expand(load_test_cases(), name_func=unittest_name_func)
     def test_greedy_search(self, use_gpt_attention_plugin, context_fmha_type,
                            enable_remove_input_padding, dtype):
 
         # Skip tests that are not supported in pre-ampere architecture
-        if getSMVersion() < 80:
-            if context_fmha_type == ContextFMHAType.enabled:
-                pytest.skip(
-                    "ContextFMHAType is not supported in pre-ampere architecture"
-                )
-            elif context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
-                pytest.skip(
-                    "ContextFMHAType with fp32 acc is not supported in pre-ampere architecture"
-                )
+        skip_fp32_accum_pre_ampere(context_fmha_type)
 
         model = 'bloom'
         log_level = 'error'
@@ -408,6 +418,8 @@ class TestBloom(unittest.TestCase):
 
         bloom_config, hf_bloom = self._gen_hf_bloom(hidden_act, n_layer,
                                                     max_new_tokens, dtype)
+        if bloom_config.hidden_size // bloom_config.n_head < 32 and use_gpt_attention_plugin:
+            pytest.skip("unsupported head_size")
         runtime, engine_buffer = self._gen_tensorrt_llm_runtime(
             log_level,
             dtype,
@@ -426,6 +438,8 @@ class TestBloom(unittest.TestCase):
             enable_remove_input_padding=enable_remove_input_padding)
 
         model_config = ModelConfig(
+            max_batch_size=batch_size,
+            max_beam_width=num_beams,
             vocab_size=bloom_config.vocab_size,
             num_layers=bloom_config.n_layer,
             num_heads=bloom_config.n_head,
@@ -456,10 +470,14 @@ class TestBloom(unittest.TestCase):
         context_lengths = torch.ones(
             (batch_size)).type(torch.int32).cuda() * seq_len
 
-        decoder.setup(batch_size,
-                      max_context_length=seq_len,
-                      max_new_tokens=max_new_tokens,
-                      beam_width=num_beams)
+        enable_bloom_context_fmha_fp32_acc = context_fmha_type == ContextFMHAType.enabled_with_fp32_acc
+
+        decoder.setup(
+            batch_size,
+            max_context_length=seq_len,
+            max_new_tokens=max_new_tokens,
+            beam_width=num_beams,
+            enable_context_fmha_fp32_acc=enable_bloom_context_fmha_fp32_acc)
 
         output_ids = decoder.decode(input_ids, context_lengths, sampling_config)
         # TODO: change to actual ragged tensor after BLOOM plugin supports it

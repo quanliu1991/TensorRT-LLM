@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,11 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/arrayView.h"
+#include "tensorrt_llm/common/dataType.h"
+#include "tensorrt_llm/kernels/decodingCommon.h"
+#include "tensorrt_llm/kernels/kvCacheIndex.h"
+
 #include <NvInferRuntime.h>
 
 #include <cstdint>
@@ -25,15 +30,14 @@
 #ifdef ENABLE_BF16
 #include <cuda_bf16.h>
 #endif
+#include <cstddef>
 #include <cuda_fp16.h>
 #include <memory>
+#include <optional>
 #include <ostream>
-#include <stdexcept>
 #include <type_traits>
 #include <typeinfo>
 #include <vector>
-
-#include "tensorrt_llm/common/dataType.h"
 
 namespace tensorrt_llm::runtime
 {
@@ -42,7 +46,9 @@ enum class MemoryType : std::int32_t
 {
     kGPU = 0,
     kCPU = 1,
-    kPINNED = 2
+    kPINNED = 2,
+    kUVM = 3,
+    kPINNEDPOOL = 4
 };
 
 template <MemoryType T>
@@ -66,6 +72,18 @@ template <>
 struct MemoryTypeString<MemoryType::kPINNED>
 {
     static auto constexpr value = "PINNED";
+};
+
+template <>
+struct MemoryTypeString<MemoryType::kUVM>
+{
+    static auto constexpr value = "UVM";
+};
+
+template <>
+struct MemoryTypeString<MemoryType::kPINNEDPOOL>
+{
+    static auto constexpr value = "PINNEDPOOL";
 };
 
 //! \brief For converting a TensorRT data type to a C++ data type.
@@ -301,6 +319,18 @@ struct TRTDataType<__nv_fp8_e4m3>
 #endif
 
 template <>
+struct TRTDataType<kernels::KVCacheIndex>
+{
+    static constexpr auto value = TRTDataType<kernels::KVCacheIndex::UnderlyingType>::value;
+};
+
+template <>
+struct TRTDataType<kernels::FinishedState>
+{
+    static constexpr auto value = TRTDataType<kernels::FinishedState::UnderlyingType>::value;
+};
+
+template <>
 struct TRTDataType<void*>
 {
     static constexpr auto value = BufferDataType::kTrtPointerType;
@@ -310,7 +340,7 @@ template <typename T>
 struct TRTDataType<T*>
 {
 private:
-    static auto constexpr kUnderlyingType = BufferDataType{TRTDataType<T, false>::value};
+    static auto constexpr kUnderlyingType = BufferDataType{TRTDataType<std::remove_const_t<T>, false>::value};
 
 public:
     static auto constexpr value = BufferDataType{kUnderlyingType.getDataType(), kUnderlyingType.isUnsigned(), true};
@@ -391,14 +421,14 @@ public:
     //!
     [[nodiscard]] virtual DataType getDataType() const = 0;
 
-    virtual char const* getDataTypeName() const;
+    [[nodiscard]] virtual char const* getDataTypeName() const;
 
     //!
     //! \brief Returns the memory type of the buffer.
     //!
     [[nodiscard]] virtual MemoryType getMemoryType() const = 0;
 
-    virtual char const* getMemoryTypeName() const;
+    [[nodiscard]] virtual char const* getMemoryTypeName() const;
 
     //!
     //! \brief Resizes the buffer. This is a no-op if the new size is smaller than or equal to the current capacity.
@@ -507,7 +537,7 @@ public:
     template <typename T>
     static UniquePtr wrap(T* data, std::size_t size)
     {
-        return wrap<T>(data, size);
+        return wrap<T>(data, size, size);
     }
 
     template <typename T>
@@ -533,6 +563,10 @@ protected:
     }
 };
 
+/// @brief Gets a typed pointer to the constant underlying data of the buffer.
+/// @tparam T The type of the underlying data.
+/// @param buffer The buffer to get a pointer to.
+/// @return A pointer to constant @p T.
 template <typename T>
 T const* bufferCast(IBuffer const& buffer)
 {
@@ -543,6 +577,10 @@ T const* bufferCast(IBuffer const& buffer)
     return static_cast<T const*>(buffer.data());
 }
 
+/// @brief Gets a typed pointer to the underlying data of the buffer.
+/// @tparam T The type of the underlying data.
+/// @param buffer The buffer to get a pointer to.
+/// @return A pointer to @p T.
 template <typename T>
 T* bufferCast(IBuffer& buffer)
 {
@@ -553,83 +591,93 @@ T* bufferCast(IBuffer& buffer)
     return static_cast<T*>(buffer.data());
 }
 
+/// @brief Retrieves a T typed pointer to the underlying data of the buffer pointed to by the bufferPtr, or nullptr if
+/// the bufferPtr is null.
+/// @tparam T The type of the underlying data.
+/// @param bufferPtr A possibly null shared ptr.
+/// @return A pointer to T, possibly nullptr.
 template <typename T>
-class BufferRange
+T* bufferCastOrNull(IBuffer::SharedPtr const& bufferPtr)
+{
+    if (bufferPtr)
+    {
+        return bufferCast<T>(*bufferPtr);
+    }
+
+    return static_cast<T*>(nullptr);
+}
+
+/// @brief Retrieves a T const typed pointer to the underlying data of the buffer pointed to by the bufferPtr, or
+/// nullptr if the bufferPtr is null.
+/// @tparam T The type of the underlying data.
+/// @param bufferPtr A possibly null shared ptr.
+/// @return A pointer to const T, possibly nullptr.
+template <typename T>
+T const* bufferCastOrNull(IBuffer::SharedConstPtr const& bufferPtr)
+{
+    if (bufferPtr)
+    {
+        return bufferCast<T>(*bufferPtr);
+    }
+
+    return static_cast<T const*>(nullptr);
+}
+
+/// @brief Retrieves a T typed pointer to the underlying data of the buffer pointed to by the buffer pointer
+/// contained in the optionalBufferPtr, or nullptr if the optional doesn't have a value.
+/// @tparam T The type of the underlying data.
+/// @param optionalBufferPtr A possibly empty optional.
+/// @return A pointer to T, possibly nullptr.
+template <typename T>
+T* bufferCastOrNull(std::optional<IBuffer::SharedPtr> const& optionalBufferPtr)
+{
+    if (optionalBufferPtr)
+    {
+        return bufferCast<T>(*optionalBufferPtr.value());
+    }
+
+    return static_cast<T*>(nullptr);
+}
+
+/// @brief Retrieves a T const typed pointer to the underlying data of the buffer pointed to by the buffer pointer
+/// contained in the optionalBufferPtr, or nullptr if the optional doesn't have a value.
+/// @tparam T The type of the underlying data.
+/// @param optionalBufferPtr A possibly empty optional.
+/// @return A pointer to const T, possibly nullptr.
+template <typename T>
+T const* bufferCastOrNull(std::optional<IBuffer::SharedConstPtr> const& optionalBufferPtr)
+{
+    if (optionalBufferPtr)
+    {
+        return bufferCast<T>(*optionalBufferPtr.value());
+    }
+
+    return static_cast<T const*>(nullptr);
+}
+
+template <typename T>
+class BufferRange : public tensorrt_llm::common::ArrayView<T>
 {
 public:
-    using value_type = T;
-    using size_type = std::size_t;
-    using reference = value_type&;
-    using const_reference = value_type const&;
-    using pointer = T*;
-    using const_pointer = T const*;
-    using iterator = pointer;
-    using const_iterator = const_pointer;
+    using Base = tensorrt_llm::common::ArrayView<T>;
+    using typename Base::size_type;
 
+    BufferRange(T* data, size_type size)
+        : Base{data, size}
+    {
+    }
+
+    template <typename U = T, std::enable_if_t<!std::is_const_v<U>, bool> = true>
     explicit BufferRange(IBuffer& buffer)
-        : mData(bufferCast<T>(buffer))
-        , mSize(buffer.getSize())
+        : BufferRange(bufferCast<U>(buffer), buffer.getSize())
     {
     }
 
-    iterator begin()
+    template <typename U = T, std::enable_if_t<std::is_const_v<U>, bool> = true>
+    explicit BufferRange(IBuffer const& buffer)
+        : BufferRange(bufferCast<U>(buffer), buffer.getSize())
     {
-        return mData;
     }
-
-    iterator end()
-    {
-        return mData + mSize;
-    }
-
-    const_iterator begin() const
-    {
-        return mData;
-    }
-
-    const_iterator end() const
-    {
-        return mData + mSize;
-    }
-
-    const_iterator cbegin()
-    {
-        return mData;
-    }
-
-    const_iterator cend()
-    {
-        return mData + mSize;
-    }
-
-    const_iterator cbegin() const
-    {
-        return mData;
-    }
-
-    const_iterator cend() const
-    {
-        return mData + mSize;
-    }
-
-    [[nodiscard]] size_type size() const
-    {
-        return mSize;
-    }
-
-    reference operator[](size_type index)
-    {
-        return mData[index];
-    }
-
-    const_reference operator[](size_type index) const
-    {
-        return mData[index];
-    }
-
-private:
-    T* mData;
-    size_type mSize;
 };
 
 //! \brief Utility function to print a buffer.

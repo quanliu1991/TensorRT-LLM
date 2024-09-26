@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@
 #include <gtest/gtest.h>
 
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/runtime/rawEngine.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
 #include "tensorrt_llm/runtime/tllmRuntime.h"
 
@@ -34,7 +35,6 @@
 
 namespace fs = std::filesystem;
 namespace trt = nvinfer1;
-namespace onnx = nvonnxparser;
 
 namespace
 {
@@ -52,7 +52,7 @@ std::unique_ptr<trt::IHostMemory> buildMnistEngine(trt::ILogger& logger)
 {
     EXPECT_TRUE(fs::exists(MNIST_MODEL_PATH));
     auto builder = makeUnique(trt::createInferBuilder(logger));
-    const auto explicitBatch = 1U << static_cast<uint32_t>(trt::NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
+    auto const explicitBatch = 1U << static_cast<uint32_t>(trt::NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
     auto network = makeUnique(builder->createNetworkV2(explicitBatch));
     auto parser = makeUnique(nvonnxparser::createParser(*network, logger));
     auto const parsingSuccess = parser->parseFromFile(
@@ -91,7 +91,7 @@ protected:
 TEST_F(TllmRuntimeTest, SinglePass)
 {
     EXPECT_TRUE(mSerializedEngine);
-    TllmRuntime rt{*mSerializedEngine, mLogger};
+    TllmRuntime rt{RawEngine(mSerializedEngine.get()), &mLogger, 1.0F};
     auto& engine = rt.getEngine();
     EXPECT_FALSE(engine.hasImplicitBatchDimension());
     EXPECT_EQ(rt.getNbProfiles(), engine.getNbOptimizationProfiles());

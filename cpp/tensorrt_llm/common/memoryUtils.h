@@ -40,16 +40,16 @@ template <typename T>
 void deviceFill(T* devptr, size_t size, T value, cudaStream_t stream = 0);
 
 template <typename T>
-void cudaD2Hcpy(T* tgt, const T* src, const size_t size);
+void cudaD2Hcpy(T* tgt, T const* src, const size_t size);
 
 template <typename T>
-void cudaH2Dcpy(T* tgt, const T* src, const size_t size);
+void cudaH2Dcpy(T* tgt, T const* src, const size_t size);
 
 template <typename T>
-void cudaD2Dcpy(T* tgt, const T* src, const size_t size);
+void cudaD2Dcpy(T* tgt, T const* src, const size_t size, cudaStream_t stream = NULL);
 
 template <typename T>
-void cudaAutoCpy(T* tgt, const T* src, const size_t size, cudaStream_t stream = NULL);
+void cudaAutoCpy(T* tgt, T const* src, const size_t size, cudaStream_t stream = NULL);
 
 template <typename T>
 void cudaRandomUniform(T* buffer, const size_t size);
@@ -88,17 +88,17 @@ void invokeCudaCast(T_OUT* dst, T_IN const* const src, const size_t size, cudaSt
 // For examples on how to use these functions, see their tests `test_memory_utils.cu`.
 // All of these functions can be evaluated at compile time by recursive template expansion.
 
-template <typename TDim, typename T>
+template <typename TDim, typename T, typename TIndex>
 __inline__ __host__ __device__ std::enable_if_t<std::is_pointer<TDim>::value, T> constexpr flat_index(
-    T const& acc, TDim dims, T const& index)
+    T const& acc, TDim dims, TIndex const& index)
 {
     assert(index < dims[0]);
     return acc * dims[0] + index;
 }
 
-template <typename TDim, typename T, typename... TArgs>
+template <typename TDim, typename T, typename TIndex, typename... TIndices>
 __inline__ __host__ __device__ std::enable_if_t<std::is_pointer<TDim>::value, T> constexpr flat_index(
-    T const& acc, TDim dims, T const& index, TArgs... indices)
+    T const& acc, TDim dims, TIndex const& index, TIndices... indices)
 {
     assert(index < dims[0]);
     return flat_index(acc * dims[0] + index, dims + 1, indices...);
@@ -112,42 +112,44 @@ __inline__ __host__ __device__ std::enable_if_t<std::is_pointer<TDim>::value, T>
     return index;
 }
 
-template <typename TDim, typename T, typename... TArgs>
-__inline__ __host__ __device__ std::enable_if_t<std::is_pointer<TDim>::value, T> constexpr flat_index(
-    TDim dims, T const& index, TArgs... indices)
+template <typename TDim, typename TIndex, typename... TIndices>
+__inline__ __host__ __device__
+    std::enable_if_t<std::is_pointer<TDim>::value, typename std::remove_pointer<TDim>::type> constexpr flat_index(
+        TDim dims, TIndex const& index, TIndices... indices)
 {
     assert(index < dims[0]);
-    return flat_index(index, dims + 1, indices...);
+    return flat_index(static_cast<typename std::remove_pointer<TDim>::type>(index), dims + 1, indices...);
 }
 
-template <unsigned skip = 0, typename T, std::size_t N, typename... TIndices>
-__inline__ __host__ __device__ T constexpr flat_index(std::array<T, N> const& dims, T const& index, TIndices... indices)
+template <unsigned skip = 0, typename T, std::size_t N, typename TIndex, typename... TIndices>
+__inline__ __host__ __device__ T constexpr flat_index(
+    std::array<T, N> const& dims, TIndex const& index, TIndices... indices)
 {
     static_assert(skip < N);
     static_assert(sizeof...(TIndices) < N - skip, "Number of indices exceeds number of dimensions");
     return flat_index(&dims[skip], index, indices...);
 }
 
-template <unsigned skip = 0, typename T, std::size_t N, typename... TIndices>
+template <unsigned skip = 0, typename T, typename TIndex, std::size_t N, typename... TIndices>
 __inline__ __host__ __device__ T constexpr flat_index(
-    T const& acc, std::array<T, N> const& dims, T const& index, TIndices... indices)
+    T const& acc, std::array<T, N> const& dims, TIndex const& index, TIndices... indices)
 {
     static_assert(skip < N);
     static_assert(sizeof...(TIndices) < N - skip, "Number of indices exceeds number of dimensions");
     return flat_index(acc, &dims[skip], index, indices...);
 }
 
-template <unsigned skip = 0, typename T, std::size_t N, typename... TIndices>
-__inline__ __host__ __device__ T constexpr flat_index(T const (&dims)[N], T const& index, TIndices... indices)
+template <unsigned skip = 0, typename T, typename TIndex, std::size_t N, typename... TIndices>
+__inline__ __host__ __device__ T constexpr flat_index(T const (&dims)[N], TIndex const& index, TIndices... indices)
 {
     static_assert(skip < N);
     static_assert(sizeof...(TIndices) < N - skip, "Number of indices exceeds number of dimensions");
     return flat_index(static_cast<T const*>(dims) + skip, index, indices...);
 }
 
-template <unsigned skip = 0, typename T, std::size_t N, typename... TIndices>
+template <unsigned skip = 0, typename T, typename TIndex, std::size_t N, typename... TIndices>
 __inline__ __host__ __device__ T constexpr flat_index(
-    T const& acc, T const (&dims)[N], T const& index, TIndices... indices)
+    T const& acc, T const (&dims)[N], TIndex const& index, TIndices... indices)
 {
     static_assert(skip < N);
     static_assert(sizeof...(TIndices) < N - skip, "Number of indices exceeds number of dimensions");
@@ -161,49 +163,50 @@ __inline__ __host__ __device__ T constexpr flat_index(
 // which require arrays as arguments. Usage examples can be found in `test_memory_utils.cu`. The functions can be
 // evaluated at compile time.
 
-template <typename T>
-__inline__ __host__ __device__ T constexpr flat_index2(T const& index_0, T const& index_1, T const& dim_1)
+template <typename T, typename TIndex>
+__inline__ __host__ __device__ T constexpr flat_index2(TIndex const& index_0, TIndex const& index_1, T const& dim_1)
 {
     assert(index_1 < dim_1);
     return index_0 * dim_1 + index_1;
 }
 
-template <typename T>
+template <typename T, typename TIndex>
 __inline__ __host__ __device__ T constexpr flat_index3(
-    T const& index_0, T const& index_1, T const& index_2, T const& dim_1, T const& dim_2)
+    TIndex const& index_0, TIndex const& index_1, TIndex const& index_2, T const& dim_1, T const& dim_2)
 {
     assert(index_2 < dim_2);
     return flat_index2(index_0, index_1, dim_1) * dim_2 + index_2;
 }
 
-template <typename T>
-__inline__ __host__ __device__ T constexpr flat_index4(T const& index_0, T const& index_1, T const& index_2,
-    T const& index_3, T const& dim_1, T const& dim_2, T const& dim_3)
+template <typename T, typename TIndex>
+__inline__ __host__ __device__ T constexpr flat_index4(TIndex const& index_0, TIndex const& index_1,
+    TIndex const& index_2, TIndex const& index_3, T const& dim_1, T const& dim_2, T const& dim_3)
 {
     assert(index_3 < dim_3);
     return flat_index3(index_0, index_1, index_2, dim_1, dim_2) * dim_3 + index_3;
 }
 
-template <typename T>
-__inline__ __host__ __device__ T constexpr flat_index5(T const& index_0, T const& index_1, T const& index_2,
-    T const& index_3, T const& index_4, T const& dim_1, T const& dim_2, T const& dim_3, T const& dim_4)
+template <typename T, typename TIndex>
+__inline__ __host__ __device__ T constexpr flat_index5(TIndex const& index_0, TIndex const& index_1,
+    TIndex const& index_2, TIndex const& index_3, TIndex const& index_4, T const& dim_1, T const& dim_2, T const& dim_3,
+    T const& dim_4)
 {
     assert(index_4 < dim_4);
     return flat_index4(index_0, index_1, index_2, index_3, dim_1, dim_2, dim_3) * dim_4 + index_4;
 }
 
-template <typename T>
+template <typename T, typename TIndex>
 __inline__ __host__ __device__ T constexpr flat_index_strided3(
-    T const& index_0, T const& index_1, T const& index_2, T const& stride_1, T const& stride_2)
+    TIndex const& index_0, TIndex const& index_1, TIndex const& index_2, T const& stride_1, T const& stride_2)
 {
     assert(index_1 < stride_1 / stride_2);
     assert(index_2 < stride_2);
     return index_0 * stride_1 + index_1 * stride_2 + index_2;
 }
 
-template <typename T>
-__inline__ __host__ __device__ T constexpr flat_index_strided4(T const& index_0, T const& index_1, T const& index_2,
-    T const& index_3, T const& stride_1, T const& stride_2, T const& stride_3)
+template <typename T, typename TIndex>
+__inline__ __host__ __device__ T constexpr flat_index_strided4(TIndex const& index_0, TIndex const& index_1,
+    TIndex const& index_2, TIndex const& index_3, T const& stride_1, T const& stride_2, T const& stride_3)
 {
     assert(index_1 < stride_1 / stride_2);
     assert(index_2 < stride_2 / stride_3);
@@ -234,9 +237,9 @@ void invokeCudaD2DcpyConvert(T_OUT* tgt, const T_IN* src, const size_t size, cud
 
 template <typename T_IN, typename T_OUT>
 void invokeCudaD2DScaleCpyConvert(
-    T_OUT* tgt, const T_IN* src, const float* scale, bool invert_scale, const size_t size, cudaStream_t stream = 0);
+    T_OUT* tgt, const T_IN* src, float const* scale, bool invert_scale, const size_t size, cudaStream_t stream = 0);
 
-inline bool checkIfFileExist(const std::string& file_path)
+inline bool checkIfFileExist(std::string const& file_path)
 {
     std::ifstream in(file_path, std::ios::in | std::ios::binary);
     if (in.is_open())
@@ -248,7 +251,7 @@ inline bool checkIfFileExist(const std::string& file_path)
 }
 
 template <typename T>
-void saveToBinary(const T* ptr, const size_t size, std::string filename);
+void saveToBinary(T const* ptr, const size_t size, std::string filename);
 
 template <typename T_IN, typename T_fake_type>
 void invokeFakeCast(T_IN* input_ptr, const size_t size, cudaStream_t stream);
@@ -256,7 +259,10 @@ void invokeFakeCast(T_IN* input_ptr, const size_t size, cudaStream_t stream);
 size_t cuda_datatype_size(TRTLLMCudaDataType dt);
 
 template <typename T>
-bool invokeCheckRange(const T* buffer, const size_t size, T min, T max, bool* d_within_range, cudaStream_t stream);
+bool invokeCheckRange(T const* buffer, const size_t size, T min, T max, bool* d_within_range, cudaStream_t stream);
 
+size_t calcAlignedSize(std::vector<size_t> const& sizes, size_t ALIGN_BYTES = 256);
+void calcAlignedPointers(
+    std::vector<void*>& outPtrs, void const* p, std::vector<size_t> const& sizes, size_t ALIGN_BYTES = 256);
 } // namespace common
 } // namespace tensorrt_llm

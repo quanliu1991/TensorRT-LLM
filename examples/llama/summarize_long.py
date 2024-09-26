@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,32 +22,29 @@ from transformers import AutoModelForCausalLM, LlamaTokenizer
 
 import tensorrt_llm
 import tensorrt_llm.profiler as profiler
+from tensorrt_llm.bindings import KVCacheType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization import QuantMode
-
-from build import get_engine_name  # isort:skip
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--hf_model_location',
                         type=str,
-                        default='/code/tensorrt_llm/models/Mistral-7B-v0.1')
+                        default='/tmp/models/Mistral-7B-v0.1')
     parser.add_argument('--test_hf', action='store_true')
     parser.add_argument('--test_trt_llm', action='store_true')
     parser.add_argument('--data_type',
                         type=str,
                         choices=['fp16'],
                         default='fp16')
-    parser.add_argument('--dataset_path',
-                        type=str,
-                        default='/code/tensorrt_llm/data')
+    parser.add_argument('--dataset_path', type=str, default='/tmp/data')
     parser.add_argument(
         '--max_attention_window_size',
         type=int,
         default=4096,
         help=
-        'The attention window size that controls the sliding window attention / cyclic kv cache behaviour'
+        'The attention window size that controls the sliding window attention / cyclic kv cache behavior'
     )
     parser.add_argument(
         '--max_input_len',
@@ -69,35 +66,62 @@ def parse_args():
     parser.add_argument('--tensorrt_llm_rouge1_threshold',
                         type=float,
                         default=15.0)
+    parser.add_argument(
+        '--rouge_dir',
+        default=None,
+        type=str,
+        help=
+        "datasets.load_metrics('rouge') will attempt to pull rouge package from HF. Use cached rouge can avoid network outage of host or HF."
+    )
+    parser.add_argument(
+        '--multi_block_mode',
+        type=lambda s: s.lower() in
+        ("yes", "true", "t", "1"
+         ),  # custom boolean function to convert input string to boolean
+        default=True,
+        help=
+        "Distribute the work across multiple CUDA thread-blocks on the GPU for masked MHA kernel."
+    )
+    parser.add_argument('--enable_context_fmha_fp32_acc',
+                        action='store_true',
+                        help="Enable FMHA runner FP32 accumulation.")
 
     args = parser.parse_args()
     return args
 
 
 def TRTLLaMA(args, config):
-    dtype = config['builder_config']['precision']
-    tp_size = config['builder_config']['tensor_parallel']
-    pp_size = config['builder_config']['pipeline_parallel']
+
+    pretrained_config = config['pretrained_config']
+    quantization_config = pretrained_config['quantization']
+
+    build_config = config['build_config']
+    kv_cache_type = KVCacheType(build_config['kv_cache_type'])
+    plugin_config = build_config['plugin_config']
+
+    dtype = pretrained_config['dtype']
+    tp_size = pretrained_config['mapping']['tp_size']
+    pp_size = pretrained_config['mapping']['pp_size']
     world_size = tp_size * pp_size
 
     assert world_size == tensorrt_llm.mpi_world_size(), \
         f'Engine world size ({world_size}) != Runtime world size ({tensorrt_llm.mpi_world_size()})'
 
-    num_heads = config['builder_config']['num_heads'] // tp_size
-    hidden_size = config['builder_config']['hidden_size'] // tp_size
-    vocab_size = config['builder_config']['vocab_size']
-    num_layers = config['builder_config']['num_layers']
-    use_gpt_attention_plugin = bool(
-        config['plugin_config']['gpt_attention_plugin'])
-    remove_input_padding = config['plugin_config']['remove_input_padding']
-    num_kv_heads = config['builder_config'].get('num_kv_heads', num_heads)
-    paged_kv_cache = config['plugin_config']['paged_kv_cache']
-    tokens_per_block = config['plugin_config']['tokens_per_block']
-    use_custom_all_reduce = config['plugin_config'].get('use_custom_all_reduce',
-                                                        False)
+    num_heads = pretrained_config['num_attention_heads'] // tp_size
+    hidden_size = pretrained_config['hidden_size'] // tp_size
 
-    quant_mode = QuantMode(config['builder_config']['quant_mode'])
-    if config['builder_config'].get('multi_query_mode', False):
+    max_batch_size = build_config['max_batch_size']
+    vocab_size = pretrained_config['vocab_size']
+    num_layers = pretrained_config['num_hidden_layers']
+    use_gpt_attention_plugin = bool(plugin_config['gpt_attention_plugin'])
+    remove_input_padding = plugin_config['remove_input_padding']
+    num_kv_heads = pretrained_config['num_key_value_heads']
+    tokens_per_block = plugin_config['tokens_per_block']
+
+    quant_mode = QuantMode.from_quant_algo(
+        quant_algo=quantization_config['quant_algo'],
+        kv_cache_quant_algo=quantization_config['kv_cache_quant_algo'])
+    if pretrained_config.get('multi_query_mode', False):
         tensorrt_llm.logger.warning(
             "`multi_query_mode` config is deprecated. Please rebuild the engine."
         )
@@ -105,16 +129,17 @@ def TRTLLaMA(args, config):
     num_kv_heads = (num_kv_heads + tp_size - 1) // tp_size
 
     model_config = tensorrt_llm.runtime.ModelConfig(
+        max_batch_size=max_batch_size,
+        max_beam_width=args.num_beams,
         vocab_size=vocab_size,
         num_layers=num_layers,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         hidden_size=hidden_size,
-        paged_kv_cache=paged_kv_cache,
+        kv_cache_type=kv_cache_type,
         tokens_per_block=tokens_per_block,
         gpt_attention_plugin=use_gpt_attention_plugin,
         remove_input_padding=remove_input_padding,
-        use_custom_all_reduce=use_custom_all_reduce,
         dtype=dtype,
         quant_mode=quant_mode)
 
@@ -125,8 +150,7 @@ def TRTLLaMA(args, config):
                                            pp_size=pp_size)
     torch.cuda.set_device(runtime_rank % runtime_mapping.gpus_per_node)
 
-    engine_name = get_engine_name('llama', dtype, tp_size, pp_size,
-                                  runtime_rank)
+    engine_name = f'rank{runtime_rank}.engine'
     serialize_path = os.path.join(args.engine_dir, engine_name)
 
     tensorrt_llm.logger.set_level(args.log_level)
@@ -234,13 +258,17 @@ def summarize_tensorrt_llm(datapoint, tokenizer, tensorrt_llm_llama, args):
             max_context_length=max_length,
             max_new_tokens=args.output_len,
             beam_width=args.num_beams,
-            max_attention_window_size=args.max_attention_window_size)
+            max_attention_window_size=args.max_attention_window_size,
+            multi_block_mode=args.multi_block_mode,
+            enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc)
         logger.info(f"Generation session set up with the parameters: \
             batch_size: {tensorrt_llm_llama.batch_size}, \
             max_context_length: {tensorrt_llm_llama.max_context_length}, \
             max_new_tokens: {tensorrt_llm_llama.max_new_tokens}, \
             beam_width: {tensorrt_llm_llama.beam_width}, \
-            max_attention_window_size: {tensorrt_llm_llama.max_attention_window_size}"
+            max_attention_window_size: {tensorrt_llm_llama.max_attention_window_size}, \
+            multi_block_mode: {tensorrt_llm_llama.multi_block_mode}, \
+            enable_context_fmha_fp32_acc: {tensorrt_llm_llama.enable_context_fmha_fp32_acc}"
                     )
 
         if tensorrt_llm_llama.remove_input_padding:
@@ -346,8 +374,10 @@ def main(args):
     # no ground truth, compare with hf
     if runtime_rank == 0 and args.test_hf and args.test_trt_llm:
 
+        rouge_dir = args.rouge_dir if args.rouge_dir and os.path.exists(
+            args.rouge_dir) else "rouge"
         metric_tensorrt_llm = [
-            load_metric("rouge") for _ in range(args.num_beams)
+            load_metric(rouge_dir) for _ in range(args.num_beams)
         ]
 
         for i in range(args.num_beams):

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,15 +15,12 @@
 import os
 import sys
 import unittest
+from itertools import product
 
 import _utils
 import numpy as np
-import pytest
-
-# isort: off
-import torch
 import tensorrt as trt
-# isort: on
+import torch
 from parameterized import parameterized
 from polygraphy.backend.trt import CreateConfig, EngineFromNetwork, TrtRunner
 
@@ -32,7 +29,7 @@ from tensorrt_llm import Tensor
 from tensorrt_llm.quantization.functional import smooth_quant_gemm
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import getSMVersion
+from utils.util import skip_pre_ampere, unittest_name_func
 
 
 class TestSmoothQuantGemm(unittest.TestCase):
@@ -63,12 +60,12 @@ class TestSmoothQuantGemm(unittest.TestCase):
 
         # Create builder
         builder = tensorrt_llm.Builder()
+        builder.strongly_typed = False  # Test need to run in weekly typed mode
         # Create empty network
-        net = builder.create_network()
+        network = builder.create_network()
         # Allow SQ plugin of dtype type
-        net.plugin_config.set_smooth_quant_gemm_plugin(dtype)
-        with tensorrt_llm.net_guard(net):
-            network = tensorrt_llm.default_trtnet()
+        network.plugin_config.smooth_quant_gemm_plugin = dtype
+        with tensorrt_llm.net_guard(network):
             # Init TensorRT-LLM tensor for mat1
             x = Tensor(name='x',
                        shape=mat1.shape,
@@ -89,22 +86,21 @@ class TestSmoothQuantGemm(unittest.TestCase):
                 dtype=tensorrt_llm._utils.str_dtype_to_trt("float32"))
             # Get output tensor for SQ gemm
             output = smooth_quant_gemm(x, y, scale_a, scale_b,
-                                       per_token_scaling,
-                                       per_channel_scaling).trt_tensor
-            output.name = 'output'
-            network.mark_output(output)
-            output.dtype = tensorrt_llm._utils.str_dtype_to_trt(dtype)
+                                       per_token_scaling, per_channel_scaling)
+            output.mark_output('output', dtype)
 
-        # Build engine consisting of only SQ Gemm
-        build_engine = EngineFromNetwork(
-            (builder.trt_builder, net.trt_network),
+        # TODO: When dtype=int32, per_token_scaling=False, per_channel_scaling=False,
+        # This test will break using new API on A30, only when running with all other unit tests.
+        # This is a weird issue, so skip changing this file.
+        engine = EngineFromNetwork(
+            (builder.trt_builder, network.trt_network),
             config=CreateConfig(
                 int8=True,
                 fp16=(dtype == "float16"),
                 memory_pool_limits={trt.MemoryPoolType.WORKSPACE: 33554432}))
 
         # Infer engine
-        with TrtRunner(build_engine) as runner:
+        with TrtRunner(engine) as runner:
             outputs = runner.infer(
                 feed_dict={
                     'x': mat1.numpy(),
@@ -122,16 +118,10 @@ class TestSmoothQuantGemm(unittest.TestCase):
 
         np.testing.assert_allclose(ref.cpu().numpy(), outputs['output'])
 
-    @parameterized.expand([('float16', False, False), ('float16', False, True),
-                           ('float16', True, False), ('float16', True, True),
-                           ('float32', False, False), ('float32', False, True),
-                           ('float32', True, False), ('float32', True, True),
-                           ('int32', False, False), ('int32', False, True),
-                           ('int32', True, False), ('int32', True, True)])
-    @pytest.mark.skipif(
-        getSMVersion() < 80,
-        reason="Smooth quant is not supported in pre-ampere architecture"
-    )  # Skip tests that are not supported in pre-ampere architecture
+    @parameterized.expand(product(["float16", "float32", "int32"],
+                                  [True, False], [True, False]),
+                          name_func=unittest_name_func)
+    @skip_pre_ampere  # SmoothQuant is not supported in pre-Ampere
     def test_matmul(self, dtype, per_token_scaling, per_channel_scaling):
         bs = 2
         inseq = 16
@@ -149,10 +139,9 @@ class TestSmoothQuantGemm(unittest.TestCase):
         # Create builder
         builder = tensorrt_llm.Builder()
         # Create empty network
-        net = builder.create_network()
-        with tensorrt_llm.net_guard(net):
-            tensorrt_llm.default_trtnet()
-            # Get output tensor for SQ gemm
+        network = builder.create_network()
+        with tensorrt_llm.net_guard(network):
+            # SQ Gemm ootb should fail
             with self.assertRaisesRegex(
                     TypeError,
                     "Smooth Quant GEMM is only supported with plugin"):

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,6 +15,9 @@
  * limitations under the License.
  */
 #include "tensorrt_llm/plugins/common/plugin.h"
+
+#include "tensorrt_llm/common/mpiUtils.h"
+
 #include "checkMacrosPlugin.h"
 #include "cuda.h"
 #include <cstdint>
@@ -23,6 +26,7 @@
 #include <cuda_fp8.h>
 #include <functional>
 #include <mutex>
+#include <thread>
 
 #ifdef _MSC_VER
 #define FN_NAME __FUNCTION__
@@ -38,12 +42,94 @@ std::unordered_map<nvinfer1::DataType, ncclDataType_t>* getDtypeMap()
     return &dtypeMap;
 }
 
-std::map<std::set<int>, ncclComm_t>* getCommMap()
+namespace
 {
-    static std::map<std::set<int>, ncclComm_t> commMap;
-    return &commMap;
+
+// Get NCCL unique ID for a group of ranks.
+ncclUniqueId getUniqueId(std::set<int> const& group) noexcept
+{
+    auto const rank = COMM_SESSION.getRank();
+    TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, rank);
+    ncclUniqueId id;
+    if (rank == *group.begin())
+    {
+        NCCLCHECK(ncclGetUniqueId(&id));
+        for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it)
+        {
+            COMM_SESSION.sendValue(id, *it, 0);
+        }
+    }
+    else
+    {
+        COMM_SESSION.recvValue(id, *group.begin(), 0);
+    }
+    TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, rank);
+    return id;
+}
+} // namespace
+
+std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
+{
+    auto const rank = COMM_SESSION.getRank();
+    TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, rank);
+    static std::map<std::set<int>, std::weak_ptr<ncclComm_t>> commMap;
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    std::ostringstream oss;
+    int index = 0;
+    for (auto const& rank : group)
+    {
+        if (index != 0)
+        {
+            oss << ",";
+        }
+        oss << rank;
+        index++;
+    }
+    auto groupStr = oss.str();
+    auto it = commMap.find(group);
+    if (it != commMap.end())
+    {
+        // If the weak_ptr can be locked, return the shared_ptr
+        auto ncclComm = it->second.lock();
+        if (ncclComm)
+        {
+            TLLM_LOG_TRACE("NCCL comm for group(%s) is cached for rank %d", groupStr.c_str(), rank);
+            return ncclComm;
+        }
+    }
+
+    TLLM_LOG_TRACE("Init NCCL comm for group(%s) for rank %d", groupStr.c_str(), rank);
+    ncclUniqueId id = getUniqueId(group);
+    int groupRank = 0;
+    for (auto const& currentRank : group)
+    {
+        if (rank == currentRank)
+            break;
+        ++groupRank;
+    }
+    TLLM_CHECK(groupRank < group.size());
+    std::shared_ptr<ncclComm_t> ncclComm(new ncclComm_t,
+        [](ncclComm_t* comm)
+        {
+            ncclCommDestroy(*comm);
+            delete comm;
+        });
+    NCCLCHECK(ncclCommInitRank(ncclComm.get(), group.size(), id, groupRank));
+    commMap[group] = ncclComm;
+    TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, rank);
+    return ncclComm;
 }
 #endif // ENABLE_MULTI_DEVICE
+
+void const* tensorrt_llm::plugins::getCommSessionHandle()
+{
+#if ENABLE_MULTI_DEVICE
+    return &COMM_SESSION;
+#else
+    return nullptr;
+#endif // ENABLE_MULTI_DEVICE
+}
 
 namespace
 {
@@ -127,11 +213,75 @@ private:
     // CUDA resources are per-context.
     std::unordered_map<CUcontext, std::weak_ptr<T>> mObservers;
 };
+
+template <typename T>
+class PerThreadSingletonCreator
+{
+public:
+    using CreatorFunc = std::function<std::unique_ptr<T>()>;
+    using DeleterFunc = std::function<void(T*)>;
+
+    // creator returning std::unique_ptr is by design.
+    // It forces separation of memory for T and memory for control blocks.
+    // So when T is released, but we still have observer weak_ptr in mObservers, the T mem block can be released.
+    // creator itself must not own CUDA resources. Only the object it creates can.
+    PerThreadSingletonCreator(CreatorFunc creator, DeleterFunc deleter)
+        : mCreator{std::move(creator)}
+        , mDeleter{std::move(deleter)}
+    {
+    }
+
+    std::shared_ptr<T> operator()()
+    {
+        std::lock_guard<std::mutex> lk{mMutex};
+
+        std::thread::id thread = std::this_thread::get_id();
+        std::shared_ptr<T> result = mObservers[thread].lock();
+
+        if (result == nullptr)
+        {
+            // Create the resource and register with an observer.
+            result = std::shared_ptr<T>{mCreator().release(),
+                [this, thread](T* obj)
+                {
+                    if (obj == nullptr)
+                    {
+                        return;
+                    }
+                    mDeleter(obj);
+
+                    // Clears observer to avoid growth of mObservers, in case users creates/destroys cuda contexts
+                    // frequently.
+                    std::shared_ptr<T> observedObjHolder; // Delay destroy to avoid dead lock.
+                    std::lock_guard<std::mutex> lk{mMutex};
+                    // Must check observer again because another thread may created new instance for this ctx just
+                    // before we lock mMutex. We can't infer that the observer is stale from the fact that obj is
+                    // destroyed, because shared_ptr ref-count checking and observer removing are not in one atomic
+                    // operation, and the observer may be changed to observe another instance.
+                    observedObjHolder = mObservers.at(thread).lock();
+                    if (observedObjHolder == nullptr)
+                    {
+                        mObservers.erase(thread);
+                    }
+                }};
+            mObservers.at(thread) = result;
+        }
+        return result;
+    }
+
+private:
+    CreatorFunc mCreator;
+    DeleterFunc mDeleter;
+    mutable std::mutex mMutex;
+    // CUDA resources are per-thread.
+    std::unordered_map<std::thread::id, std::weak_ptr<T>> mObservers;
+};
+
 } // namespace
 
 std::shared_ptr<cublasHandle_t> getCublasHandle()
 {
-    static PerCudaCtxSingletonCreator<cublasHandle_t> creator(
+    static PerThreadSingletonCreator<cublasHandle_t> creator(
         []() -> auto
         {
             auto handle = std::unique_ptr<cublasHandle_t>(new cublasHandle_t);
@@ -148,7 +298,7 @@ std::shared_ptr<cublasHandle_t> getCublasHandle()
 
 std::shared_ptr<cublasLtHandle_t> getCublasLtHandle()
 {
-    static PerCudaCtxSingletonCreator<cublasLtHandle_t> creator(
+    static PerThreadSingletonCreator<cublasLtHandle_t> creator(
         []() -> auto
         {
             auto handle = std::unique_ptr<cublasLtHandle_t>(new cublasLtHandle_t);
@@ -163,60 +313,18 @@ std::shared_ptr<cublasLtHandle_t> getCublasLtHandle()
     return creator();
 }
 
-// ALIGNPTR
-int8_t* tensorrt_llm::plugins::alignPtr(int8_t* ptr, uintptr_t to)
+std::shared_ptr<tensorrt_llm::common::CublasMMWrapper> getCublasMMWrapper(std::shared_ptr<cublasHandle_t> cublasHandle,
+    std::shared_ptr<cublasLtHandle_t> cublasltHandle, cudaStream_t stream, void* workspace)
 {
-    uintptr_t addr = (uintptr_t) ptr;
-    if (addr % to)
-    {
-        addr += to - addr % to;
-    }
-    return (int8_t*) addr;
-}
-
-// NEXTWORKSPACEPTR
-int8_t* tensorrt_llm::plugins::nextWorkspacePtrCommon(
-    int8_t* ptr, uintptr_t previousWorkspaceSize, const uintptr_t alignment)
-{
-    uintptr_t addr = (uintptr_t) ptr;
-    addr += previousWorkspaceSize;
-    return alignPtr((int8_t*) addr, alignment);
-}
-
-int8_t* tensorrt_llm::plugins::nextWorkspacePtr(int8_t* ptr, uintptr_t previousWorkspaceSize)
-{
-    return nextWorkspacePtrCommon(ptr, previousWorkspaceSize, kCudaMemAlign);
-}
-
-int8_t* tensorrt_llm::plugins::nextWorkspacePtr(
-    int8_t* const base, uintptr_t& offset, const uintptr_t size, const uintptr_t alignment)
-{
-    uintptr_t curr_offset = offset;
-    uintptr_t next_offset = curr_offset + ((size + alignment - 1) / alignment) * alignment;
-    int8_t* newptr = size == 0 ? nullptr : base + curr_offset;
-    offset = next_offset;
-    return newptr;
-}
-
-int8_t* tensorrt_llm::plugins::nextWorkspacePtrWithAlignment(
-    int8_t* ptr, uintptr_t previousWorkspaceSize, const uintptr_t alignment)
-{
-    return nextWorkspacePtrCommon(ptr, previousWorkspaceSize, alignment);
-}
-
-// CALCULATE TOTAL WORKSPACE SIZE
-size_t tensorrt_llm::plugins::calculateTotalWorkspaceSize(size_t* workspaces, int count, const uintptr_t alignment)
-{
-    size_t total = 0;
-    for (int i = 0; i < count; i++)
-    {
-        total += workspaces[i];
-        if (workspaces[i] % alignment)
+    static PerThreadSingletonCreator<tensorrt_llm::common::CublasMMWrapper> creator(
+        [cublasHandle, cublasltHandle, stream, workspace]() -> auto
         {
-            total += alignment - (workspaces[i] % alignment);
-        }
-    }
-    return total;
+            auto wrapper = std::unique_ptr<tensorrt_llm::common::CublasMMWrapper>(
+                new tensorrt_llm::common::CublasMMWrapper(cublasHandle, cublasltHandle, stream, workspace));
+            return wrapper;
+        },
+        [](tensorrt_llm::common::CublasMMWrapper* wrapper) { delete wrapper; });
+    return creator();
 }
 
 PluginFieldParser::PluginFieldParser(int32_t nbFields, nvinfer1::PluginField const* fields)

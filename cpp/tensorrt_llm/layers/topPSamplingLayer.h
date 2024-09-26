@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2024, NVIDIA CORPORATION.  All rights reserved.
  * Copyright (c) 2021, NAVER Corp.  Authored by CLOVA.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,75 +17,55 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/tensor.h"
-#include "tensorrt_llm/kernels/decodingCommon.h"
-#include "tensorrt_llm/layers/baseSamplingLayer.h"
+#include "tensorrt_llm/layers/baseLayer.h"
+#include "tensorrt_llm/runtime/common.h"
 
-namespace tc = tensorrt_llm::common;
-
-namespace tensorrt_llm
-{
-namespace layers
+namespace tensorrt_llm::layers
 {
 
+//! \brief Layer to randomly sample tokens from TopP logits.
+//! Layer expects probs precomputed in "logits" tensor
 template <typename T>
-class TopPSamplingLayer : public BaseSamplingLayer<T>
+class TopPSamplingLayer : public BaseLayer
 {
+    using Base = BaseLayer;
+
 public:
-    using Base = BaseSamplingLayer<T>;
+    TopPSamplingLayer(DecoderDomain const& decoderDomain, std::shared_ptr<runtime::BufferManager> bufferManager,
+        bool isDeterministic = true, bool isAirTopP = true);
 
-    class SetupParams : public Base::SetupParams
-    {
-    public:
-        std::optional<std::vector<float>> top_p_decay;            // [batch_size], must between [0, 1]
-        std::optional<std::vector<float>> top_p_min;              // [batch_size], must between [0, 1]
-        std::optional<std::vector<std::int32_t>> top_p_reset_ids; // [batch_size]
-    };
+    void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, TensorConstPtr batchSlots,
+        std::shared_ptr<BaseSetupParams> const& setupParams,
+        std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace) override;
+    void forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& outputs,
+        std::shared_ptr<BaseDecodingInputs> const& inputs,
+        std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace) override;
 
-    TopPSamplingLayer(std::size_t vocab_size, std::size_t vocab_size_padded, cudaStream_t stream,
-        tensorrt_llm::common::IAllocator* allocator, bool is_free_buffer_after_forward,
-        cudaDeviceProp* cuda_device_prop);
-    TopPSamplingLayer(TopPSamplingLayer<T> const& top_p_sampling_layer);
-    ~TopPSamplingLayer();
-
-    void setup(std::size_t batch_size, SetupParams const& setupParams);
+    //! @returns workspace needed for this layer in bytes
+    [[nodiscard]] size_t getWorkspaceSize() const noexcept override;
 
 protected:
-    void runSampling(DecodingOutputParams& outputs, DecodingParams const& params) override;
-    void freeBuffer() override;
+    TensorPtr mRuntimeTopKDevice;
+    TensorPtr mRuntimeTopPDevice;
+    TensorPtr mInitialTopPDevice;
+    TensorPtr mTopPDecayDevice;
+    TensorPtr mTopPMinDevice;
+    TensorPtr mTopPResetIdsDevice;
 
-    std::uint32_t* runtime_top_k_buf_ = nullptr;
-    float* runtime_top_p_buf_ = nullptr;
-    float runtime_max_top_p_;
-    float* initial_top_p_buf_ = nullptr;
-    float* top_p_decay_buf_ = nullptr;
-    float* top_p_min_buf_ = nullptr;
-    std::int32_t* top_p_reset_ids_buf_ = nullptr;
+    TensorPtr mSkipDecodeDevice;
+    TensorPtr mSkipDecodeHost;
+    runtime::SizeType32 mAirTopPBlockNum{0};
+    size_t mWorkspaceSize{0};
+    size_t mSetupWorkspaceSize{0};
 
-    std::int32_t* topp_id_vals_buf_ = nullptr;
-    std::int32_t* topp_offset_buf_ = nullptr;
-    std::int32_t* begin_topp_offset_buf_ = nullptr;
-    std::size_t cub_temp_storage_size_;
+    cudaDeviceProp mDeviceProp;
+    bool mIsDeterministic{true};
+    bool mIsAirTopP{false};
 
-    using Base::vocab_size_;
-    using Base::vocab_size_padded_;
-
-    using Base::sampling_workspace_size_;
-    using Base::sampling_workspace_;
-    using Base::curandstate_buf_;
-    using Base::random_seeds_buf_;
-    using Base::skip_decode_buf_;
-    using Base::skip_decode_;
-    using Base::skip_any_;
-    using Base::runtime_logits_buf_;
-
-    using Base::stream_;
-    using Base::allocator_;
-    using Base::is_allocate_buffer_;
+    using Base::mDecoderDomain;
 
 private:
-    void allocateBuffer(std::size_t batch_size, std::vector<float> const& top_k);
+    void allocateBuffer(runtime::SizeType32 batchSize);
 };
 
-} // namespace layers
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::layers

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,18 +17,26 @@
 #include <gmock/gmock-matchers.h>
 #include <gtest/gtest.h>
 
+#include "tensorrt_llm/batch_manager/namedTensor.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/stringUtils.h"
+#include "tensorrt_llm/runtime/cudaMemPool.h"
 #include "tensorrt_llm/runtime/memoryCounters.h"
 #include "tensorrt_llm/runtime/tllmBuffers.h"
 
+#include <algorithm>
 #include <limits>
 #include <memory>
+#include <random>
 #include <sstream>
+#include <thread>
+#include <tuple>
 #include <type_traits>
+#include <vector>
 
 using namespace tensorrt_llm::runtime;
 namespace tc = tensorrt_llm::common;
+namespace tb = tensorrt_llm::batch_manager;
 
 class TllmBuffersTest : public ::testing::Test // NOLINT(cppcoreguidelines-pro-type-member-init)
 {
@@ -36,17 +44,30 @@ protected:
     void SetUp() override
     {
         mDeviceCount = tc::getDeviceCount();
+        PinnedPoolAllocator::getPool().setChunkSize(kPinnedPoolChunkSize);
+        mStream = std::make_shared<CudaStream>();
+        mMemPool = CudaMemPool::getPrimaryPoolForDevice(mStream->getDevice());
     }
 
     void TearDown() override {}
 
     int mDeviceCount;
+    std::shared_ptr<CudaMemPool> mMemPool = nullptr;
+    std::shared_ptr<CudaStream> mStream = nullptr;
+
+    static auto constexpr kPinnedPoolChunkSize = std::size_t(1) << 22;
+
+    static constexpr std::string_view noDeviceSkipReason = "This test cannot run without any device present";
+    static constexpr std::string_view noPoolSkipReason
+        = "This test cannot be run against devices that do not support memory pools.";
 };
 
 TEST_F(TllmBuffersTest, Stream)
 {
     if (mDeviceCount == 0)
-        GTEST_SKIP();
+    {
+        GTEST_SKIP() << noDeviceSkipReason;
+    }
 
     CudaStream stream{};
     EXPECT_NE(stream.get(), nullptr);
@@ -107,14 +128,35 @@ TEST_F(TllmBuffersTest, HostAllocator)
     EXPECT_EQ(allocator.getMemoryType(), MemoryType::kCPU);
 }
 
+TEST_F(TllmBuffersTest, UVMAllocator)
+{
+    auto constexpr size = 1024;
+    UVMAllocator allocator{};
+    auto& counters = MemoryCounters::getInstance();
+    EXPECT_EQ(counters.getUVM(), 0);
+    auto ptr = allocator.allocate(size);
+    EXPECT_NE(ptr, nullptr);
+    EXPECT_EQ(counters.getUVM(), size);
+    EXPECT_EQ(counters.getUVMDiff(), size);
+    EXPECT_NO_THROW(allocator.deallocate(ptr, size));
+    EXPECT_EQ(counters.getUVM(), 0);
+    EXPECT_EQ(counters.getUVMDiff(), -size);
+    EXPECT_EQ(allocator.getMemoryType(), MemoryType::kUVM);
+}
+
 TEST_F(TllmBuffersTest, CudaAllocatorAsync)
 {
     if (mDeviceCount == 0)
-        GTEST_SKIP();
+    {
+        GTEST_SKIP() << noDeviceSkipReason;
+    }
 
-    auto streamPtr = std::make_shared<CudaStream>();
     auto constexpr size = 1024;
-    CudaAllocatorAsync allocator{streamPtr};
+    if (mMemPool == nullptr)
+    {
+        GTEST_SKIP() << "This test cannot be run against devices that do not support memory pools.";
+    }
+    CudaAllocatorAsync allocator{mStream, mMemPool};
     auto& counters = MemoryCounters::getInstance();
     EXPECT_EQ(counters.getGpu(), 0);
     auto ptr = allocator.allocate(size);
@@ -125,11 +167,11 @@ TEST_F(TllmBuffersTest, CudaAllocatorAsync)
     EXPECT_EQ(counters.getGpu(), 0);
     EXPECT_EQ(counters.getGpuDiff(), -size);
     EXPECT_EQ(allocator.getMemoryType(), MemoryType::kGPU);
-    streamPtr->synchronize();
+    mStream->synchronize();
     CudaAllocatorAsync allocatorCopy = allocator;
-    EXPECT_EQ(allocatorCopy.getCudaStream(), streamPtr);
+    EXPECT_EQ(allocatorCopy.getCudaStream(), mStream);
     CudaAllocatorAsync allocatorMove = std::move(allocatorCopy);
-    EXPECT_EQ(allocatorMove.getCudaStream(), streamPtr);
+    EXPECT_EQ(allocatorMove.getCudaStream(), mStream);
     EXPECT_THROW(allocator.deallocate(ptr, size), std::runtime_error);
 }
 
@@ -160,44 +202,69 @@ void testBuffer(IBuffer& buffer, std::int32_t typeSize)
     EXPECT_EQ(bufferWrapped->getMemoryType(), buffer.getMemoryType());
     EXPECT_NO_THROW(bufferWrapped->resize(buffer.getCapacity() / 2));
     EXPECT_THROW(bufferWrapped->resize(buffer.getCapacity() * 2), std::bad_alloc);
+    auto byteBuffer = IBuffer::wrap(static_cast<std::uint8_t*>(buffer.data()), buffer.getSizeInBytes());
+    EXPECT_EQ(byteBuffer->getSizeInBytes(), buffer.getSizeInBytes());
+    EXPECT_EQ(byteBuffer->getCapacity(), buffer.getSizeInBytes());
     auto tensorWrapped = ITensor::wrap(buffer.data(), buffer.getDataType(),
-        ITensor::makeShape({static_cast<SizeType>(buffer.getSize())}), buffer.getCapacity());
+        ITensor::makeShape({static_cast<SizeType32>(buffer.getSize())}), buffer.getCapacity());
     EXPECT_EQ(tensorWrapped->getSize(), buffer.getSize());
     EXPECT_EQ(tensorWrapped->getCapacity(), buffer.getCapacity());
     EXPECT_EQ(tensorWrapped->getDataType(), buffer.getDataType());
     EXPECT_EQ(tensorWrapped->getMemoryType(), buffer.getMemoryType());
-    EXPECT_NO_THROW(tensorWrapped->reshape(ITensor::makeShape({static_cast<SizeType>(buffer.getCapacity()) / 2})));
-    EXPECT_THROW(
-        tensorWrapped->reshape(ITensor::makeShape({static_cast<SizeType>(buffer.getCapacity()) * 2})), std::bad_alloc);
+    EXPECT_NO_THROW(tensorWrapped->reshape(ITensor::makeShape({static_cast<SizeType32>(buffer.getCapacity()) / 2})));
+    EXPECT_THROW(tensorWrapped->reshape(ITensor::makeShape({static_cast<SizeType32>(buffer.getCapacity()) * 2})),
+        std::bad_alloc);
 }
 } // namespace
 
 TEST_F(TllmBuffersTest, DeviceBuffer)
 {
     if (mDeviceCount == 0)
-        GTEST_SKIP();
+    {
+        GTEST_SKIP() << noDeviceSkipReason;
+    }
 
     auto streamPtr = std::make_shared<CudaStream>();
     auto constexpr size = 1024;
-    CudaAllocatorAsync allocator{streamPtr};
+    if (static_cast<bool>(mMemPool))
     {
-        DeviceBuffer buffer{size, nvinfer1::DataType::kFLOAT, allocator};
-        testBuffer(buffer, sizeof(float));
-    }
-    streamPtr->synchronize();
+        CudaAllocatorAsync allocator{mStream, mMemPool};
+        {
+            DeviceBuffer buffer{size, nvinfer1::DataType::kFLOAT, allocator};
+            testBuffer(buffer, sizeof(float));
+        }
+        streamPtr->synchronize();
 
-    static_assert(!std::is_copy_constructible<DeviceBuffer>::value);
-    static_assert(!std::is_copy_assignable<DeviceBuffer>::value);
+        static_assert(!std::is_copy_constructible<DeviceBuffer>::value);
+        static_assert(!std::is_copy_assignable<DeviceBuffer>::value);
+    }
+    else
+    {
+        CudaAllocator allocator{};
+        {
+            StaticDeviceBuffer buffer{size, nvinfer1::DataType::kFLOAT, allocator};
+            testBuffer(buffer, sizeof(float));
+        }
+        streamPtr->synchronize();
+
+        static_assert(!std::is_copy_constructible<DeviceBuffer>::value);
+        static_assert(!std::is_copy_assignable<DeviceBuffer>::value);
+    }
 }
 
 TEST_F(TllmBuffersTest, DeviceTensor)
 {
     if (mDeviceCount == 0)
-        GTEST_SKIP();
-
+    {
+        GTEST_SKIP() << noDeviceSkipReason;
+    }
+    if (mMemPool == nullptr)
+    {
+        GTEST_SKIP() << noPoolSkipReason;
+    }
     auto streamPtr = std::make_shared<CudaStream>();
     nvinfer1::Dims constexpr dims{3, 16, 8, 4};
-    CudaAllocatorAsync allocator{streamPtr};
+    CudaAllocatorAsync allocator{streamPtr, mMemPool};
     {
         DeviceTensor tensor{dims, nvinfer1::DataType::kFLOAT, allocator};
         EXPECT_EQ(tensor.getSize(), ITensor::volume(dims));
@@ -240,10 +307,16 @@ TEST_F(TllmBuffersTest, BufferSlice)
 TEST_F(TllmBuffersTest, BufferOutput)
 {
     if (mDeviceCount == 0)
-        GTEST_SKIP();
+    {
+        GTEST_SKIP() << noDeviceSkipReason;
+    }
+    if (mMemPool == nullptr)
+    {
+        GTEST_SKIP() << noPoolSkipReason;
+    }
 
     auto streamPtr = std::make_shared<CudaStream>();
-    CudaAllocatorAsync allocator{streamPtr};
+    CudaAllocatorAsync allocator{streamPtr, mMemPool};
     for (std::size_t size : {0, 16})
     {
         DeviceBuffer buffer{size, nvinfer1::DataType::kFLOAT, allocator};
@@ -261,11 +334,17 @@ TEST_F(TllmBuffersTest, BufferOutput)
 TEST_F(TllmBuffersTest, TensorOutput)
 {
     if (mDeviceCount == 0)
-        GTEST_SKIP();
+    {
+        GTEST_SKIP() << noDeviceSkipReason;
+    }
+    if (mMemPool == nullptr)
+    {
+        GTEST_SKIP() << noPoolSkipReason;
+    }
 
     auto streamPtr = std::make_shared<CudaStream>();
     nvinfer1::Dims constexpr dims{3, 16, 8, 4};
-    CudaAllocatorAsync allocator{streamPtr};
+    CudaAllocatorAsync allocator{streamPtr, mMemPool};
     for (auto dataType :
         {nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kHALF, nvinfer1::DataType::kBOOL, nvinfer1::DataType::kINT8,
             nvinfer1::DataType::kINT32, nvinfer1::DataType::kINT64, nvinfer1::DataType::kUINT8})
@@ -328,7 +407,7 @@ TEST_F(TllmBuffersTest, ExtendedTypes)
 TEST_F(TllmBuffersTest, BytesToString)
 {
     auto constexpr precision = 2;
-    MemoryCounters::SizeType size;
+    MemoryCounters::SizeType32 size;
     MemoryCounters::DiffType diff;
 
     size = (1ul << 10) - 1;
@@ -380,4 +459,185 @@ TEST_F(TllmBuffersTest, BytesToString)
     EXPECT_EQ(MemoryCounters::bytesToString(diff, precision), "-1.00 TB");
     diff = -(1ll << 40) - (1ll << 39);
     EXPECT_EQ(MemoryCounters::bytesToString(diff, precision), "-1.50 TB");
+}
+
+TEST_F(TllmBuffersTest, PinnedPoolAllocator)
+{
+    if (mDeviceCount == 0)
+    {
+        GTEST_SKIP() << noDeviceSkipReason;
+    }
+
+    using MemPool = MemoryPool<PinnedAllocator>;
+    auto expectedSize = [](auto const& tensor)
+    {
+        auto s = tensor()->getSizeInBytes();
+        constexpr auto alignment = MemPool::kAlignment;
+        s = s + alignment - 1 - ((s + alignment - 1) % alignment);
+        return s;
+    };
+
+    auto& pool = PinnedPoolAllocator::getPool();
+    auto& segments = pool.getMemorySegments();
+    pool.logSegments();
+    EXPECT_EQ(segments.size(), 0);
+
+    {
+        auto a = tb::NamedTensor{nvinfer1::DataType::kFLOAT, {512, 4, 4}, "a", nullptr};
+        auto b = tb::NamedTensor{nvinfer1::DataType::kHALF, {512, 10}, "b", nullptr};
+        pool.logSegments();
+        auto it = std::begin(segments);
+        EXPECT_NE(it->tag, nullptr);
+        EXPECT_EQ(it->size, expectedSize(a));
+        it = std::next(it);
+        EXPECT_NE(it->tag, nullptr);
+        EXPECT_EQ(it->size, expectedSize(b));
+        it = std::next(it);
+        EXPECT_EQ(it->tag, nullptr);
+        it = std::next(it);
+        EXPECT_EQ(it, std::end(segments));
+    }
+
+    auto const chunkSize = pool.getChunkSize();
+    auto constexpr initChunkSize = kPinnedPoolChunkSize;
+    EXPECT_EQ(chunkSize, initChunkSize);
+
+    {
+        pool.logSegments();
+        auto it = std::begin(segments);
+        EXPECT_EQ(it->tag, nullptr);
+        EXPECT_EQ(it->size, chunkSize);
+    }
+
+    std::size_t secondChunkSize;
+    {
+        // Test creating a new chunk
+        auto c = tb::NamedTensor{nvinfer1::DataType::kUINT8, {initChunkSize + 1}, "c", nullptr};
+        pool.logSegments();
+        auto it = std::begin(segments);
+        EXPECT_EQ(it->tag, nullptr);
+        EXPECT_EQ(it->size, chunkSize);
+        it = std::next(it);
+        EXPECT_NE(it->tag, nullptr);
+        EXPECT_EQ(it->size, expectedSize(c));
+        it = std::next(it);
+        EXPECT_EQ(it, std::end(segments));
+        secondChunkSize = expectedSize(c);
+        EXPECT_EQ(secondChunkSize, pool.getChunkSize());
+    }
+
+    {
+        pool.logSegments();
+        auto it = std::begin(segments);
+        EXPECT_EQ(it->tag, nullptr);
+        EXPECT_EQ(it->size, chunkSize);
+        it = std::next(it);
+        EXPECT_EQ(it->tag, nullptr);
+        EXPECT_EQ(it->size, secondChunkSize);
+        it = std::next(it);
+        EXPECT_EQ(it, std::end(segments));
+    }
+}
+
+TEST_F(TllmBuffersTest, MemoryPool)
+{
+    using MemPool = MemoryPool<HostAllocator>;
+    auto constexpr alignment = MemPool::kAlignment;
+    auto constexpr chunkSize = alignment * 4;
+    auto& memCounters = MemoryCounters::getInstance();
+    auto const initMemory = memCounters.getCpu();
+    {
+        MemPool pool{chunkSize};
+        EXPECT_EQ(pool.getChunkSize(), chunkSize);
+        EXPECT_EQ(memCounters.getCpu(), initMemory);
+        auto constexpr sizeBytes = alignment / 4;
+        auto ptr_0 = pool.allocate(sizeBytes);
+        auto const oneChunk = initMemory + chunkSize;
+        EXPECT_EQ(memCounters.getCpu(), oneChunk);
+        auto ptr_1 = pool.allocate(0);
+        EXPECT_EQ(memCounters.getCpu(), oneChunk);
+        auto ptr_2 = pool.allocate(sizeBytes);
+        EXPECT_EQ(memCounters.getCpu(), oneChunk);
+        pool.deallocate(ptr_0, sizeBytes);
+        EXPECT_EQ(memCounters.getCpu(), oneChunk);
+        pool.deallocate(ptr_1, 0);
+        EXPECT_EQ(memCounters.getCpu(), oneChunk);
+        pool.deallocate(ptr_2, sizeBytes);
+        EXPECT_EQ(memCounters.getCpu(), oneChunk);
+        EXPECT_EQ(static_cast<std::uint8_t*>(ptr_1) - static_cast<std::uint8_t*>(ptr_0), alignment);
+        EXPECT_EQ(static_cast<std::uint8_t*>(ptr_2) - static_cast<std::uint8_t*>(ptr_1), alignment);
+    }
+    EXPECT_EQ(memCounters.getCpu(), initMemory);
+}
+
+TEST_F(TllmBuffersTest, PinnedPoolStressTest)
+{
+    if (mDeviceCount == 0)
+    {
+        GTEST_SKIP() << noDeviceSkipReason;
+    }
+
+    using Allocator = PinnedPoolAllocator;
+    using MemPool = Allocator::PoolType;
+    auto& memCounters = MemoryCounters::getInstance();
+    auto const initMemory = memCounters.getPinned();
+    auto constexpr chunkSize = MemPool::kInitialChunkSize / 4;
+    std::mt19937 rnd{42};                               // mersenne_twister_engine seeded with 42 NOLINT(*-msc51-cpp)
+    auto constexpr expectedSize = std::size_t{1} << 20; // 1 MiB
+    std::poisson_distribution distribution{expectedSize};
+    auto constexpr numberOfAllocations = chunkSize * 2 / expectedSize;
+    std::vector<std::tuple<void*, std::size_t>> allocations;
+    allocations.reserve(numberOfAllocations);
+
+    Allocator allocator{};
+    auto& pool = Allocator::getPool();
+    pool.setChunkSize(chunkSize);
+    EXPECT_EQ(pool.getChunkSize(), chunkSize);
+    EXPECT_EQ(memCounters.getPinned(), initMemory);
+    auto const poolReservedSize = pool.getReservedSize();
+    auto const poolUsedSize = pool.getUsedSize();
+    std::size_t totalUsedSize{0};
+    for (std::size_t i = 0; i < numberOfAllocations; ++i)
+    {
+        auto const size = distribution(rnd);
+        auto const ptr = allocator.allocate(size);
+        allocations.emplace_back(ptr, size);
+        totalUsedSize += size;
+    }
+    EXPECT_GE(pool.getUsedSize(), poolUsedSize + totalUsedSize);
+
+    std::shuffle(allocations.begin(), allocations.end(), rnd);
+    auto const deallocIdx = allocations.size() / 2;
+    auto const deallocSize = allocations.size() - deallocIdx;
+    for (auto const& [ptr, size] : BufferRange{allocations.data() + deallocIdx, deallocSize})
+    {
+        allocator.deallocate(ptr, size);
+        totalUsedSize -= size;
+    }
+    allocations.resize(deallocIdx);
+    EXPECT_GE(pool.getUsedSize(), poolUsedSize + totalUsedSize);
+    EXPECT_EQ(memCounters.getPinned() - initMemory, pool.getReservedSize() - poolReservedSize);
+
+    std::thread thread(
+        [&]()
+        {
+            for (std::size_t i = 0; i < deallocSize; ++i)
+            {
+                auto const size = distribution(rnd);
+                auto const ptr = allocator.allocate(size);
+                allocations.emplace_back(ptr, size);
+                totalUsedSize += size;
+            }
+            EXPECT_GE(pool.getUsedSize(), poolUsedSize + totalUsedSize);
+
+            std::shuffle(allocations.begin() + static_cast<std::ptrdiff_t>(deallocIdx), allocations.end(), rnd);
+            for (auto const& [ptr, size] : allocations)
+            {
+                allocator.deallocate(ptr, size);
+                totalUsedSize -= size;
+            }
+            EXPECT_EQ(totalUsedSize, 0u);
+            EXPECT_EQ(pool.getUsedSize(), poolUsedSize);
+        });
+    thread.join();
 }

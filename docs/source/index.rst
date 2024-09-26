@@ -3,54 +3,62 @@
    You can adapt this file completely to your liking, but it should at least
    contain the root `toctree` directive.
 
-Welcome to TensorRT-LLM's documentation!
+Welcome to TensorRT-LLM's Documentation!
 ========================================
 
 .. toctree::
-   :maxdepth: 1
-   :caption: Contents:
+   :maxdepth: 2
+   :caption: Getting Started
+   :name: Getting Started
 
-   architecture.md
-   gpt_runtime.md
-   batch_manager.md
-   gpt_attention.md
-   precision.md
-   installation.md
-   performance.md
-   2023-05-19-how-to-debug.md
-   2023-05-17-how-to-add-a-new-model.md
-   graph-rewriting.md
-   memory.md
-   new_workflow.md
-
-Python API
-----------
-
-- :doc:`tensorrt_llm.layers <python-api/tensorrt_llm.layers>`
-- :doc:`tensorrt_llm.functional <python-api/tensorrt_llm.functional>`
-- :doc:`tensorrt_llm.models <python-api/tensorrt_llm.models>`
-- :doc:`tensorrt_llm.plugin <python-api/tensorrt_llm.plugin>`
-- :doc:`tensorrt_llm.quantization <python-api/tensorrt_llm.quantization>`
-- :doc:`tensorrt_llm.runtime <python-api/tensorrt_llm.runtime>`
+   overview.md
+   quick-start-guide.md
+   key-features.md
+   release-notes.md
 
 
 .. toctree::
    :maxdepth: 2
-   :caption: Python API
+   :caption: Installation
+   :name: Installation
+
+   .. installation/overview.md
+
+   installation/linux.md
+   installation/build-from-source-linux.md
+   installation/windows.md
+   installation/build-from-source-windows.md
+
+.. toctree::
+   :maxdepth: 2
+   :caption: LLM API Examples
    :hidden:
 
-   python-api/tensorrt_llm.layers
-   python-api/tensorrt_llm.functional
-   python-api/tensorrt_llm.models
-   python-api/tensorrt_llm.plugin
-   python-api/tensorrt_llm.quantization
-   python-api/tensorrt_llm.runtime
+   llm-api-examples/index.md
+   llm-api-examples/customization.md
+   llm-api-examples/llm_api_examples
 
 
-C++ API
----------
+.. toctree::
+   :maxdepth: 2
+   :caption: LLM API
+   :hidden:
+   :glob:
 
-- :doc:`cpp/runtime <_cpp_gen/runtime>`
+   llm-api/*
+
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Model Definition API
+   :hidden:
+
+   python-api/tensorrt_llm.layers.rst
+   python-api/tensorrt_llm.functional.rst
+   python-api/tensorrt_llm.models.rst
+   python-api/tensorrt_llm.plugin.rst
+   python-api/tensorrt_llm.quantization.rst
+   python-api/tensorrt_llm.runtime.rst
 
 
 .. toctree::
@@ -58,19 +66,68 @@ C++ API
    :caption: C++ API
    :hidden:
 
-   _cpp_gen/runtime
+   _cpp_gen/executor.rst
+   _cpp_gen/runtime.rst
 
 
-Indices and tables
-==================
+.. toctree::
+   :maxdepth: 2
+   :caption: Command-Line Reference
+   :hidden:
 
-* :ref:`genindex`
-* :ref:`modindex`
-* :ref:`search`
+   commands/trtllm-build.rst
 
 
-Blogs
-----------
+.. toctree::
+   :maxdepth: 2
+   :caption: Architecture
+   :name: Architecture
+
+   architecture/overview.md
+   architecture/core-concepts.md
+   architecture/checkpoint.md
+   architecture/workflow.md
+   architecture/add-model.md
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Advanced
+   :name: Advanced
+
+   advanced/gpt-attention.md
+   advanced/gpt-runtime.md
+   advanced/executor.md
+   advanced/graph-rewriting.md
+   advanced/batch-manager.md
+   advanced/inference-request.md
+   advanced/lora.md
+   advanced/expert-parallelism.md
+   advanced/kv-cache-reuse.md
+   advanced/speculative-decoding.md
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Performance
+   :name: Performance
+
+   performance/perf-overview.md
+   performance/perf-best-practices.md
+   performance/perf-analysis.md
+
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Reference
+   :name: Reference
+
+   reference/troubleshooting.md
+   reference/support-matrix.md
+
+   .. reference/upgrading.md
+
+   reference/precision.md
+   reference/memory.md
+
 
 .. toctree::
    :maxdepth: 2
@@ -79,3 +136,14 @@ Blogs
 
    blogs/H100vsA100.md
    blogs/H200launch.md
+   blogs/Falcon180B-H200.md
+   blogs/quantization-in-TRT-LLM.md
+   blogs/XQA-kernel.md
+
+
+Indices and tables
+==================
+
+* :ref:`genindex`
+* :ref:`modindex`
+* :ref:`search`

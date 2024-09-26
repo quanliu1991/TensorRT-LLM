@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 #include "rmsnormQuantizationPlugin.h"
+#include "pluginUtils.h"
 #include "tensorrt_llm/kernels/rmsnormKernels.h"
 
 using namespace nvinfer1;
@@ -23,38 +24,54 @@ using namespace tensorrt_llm::common;
 using tensorrt_llm::plugins::RmsnormQuantizationPluginCreator;
 using tensorrt_llm::plugins::RmsnormQuantizationPlugin;
 
-static const char* RMSNORM_QUANTIZATION_PLUGIN_VERSION{"1"};
-static const char* RMSNORM_QUANTIZATION_PLUGIN_NAME{"RmsnormQuantization"};
+static char const* RMSNORM_QUANTIZATION_PLUGIN_VERSION{"1"};
+static char const* RMSNORM_QUANTIZATION_PLUGIN_NAME{"RmsnormQuantization"};
 PluginFieldCollection RmsnormQuantizationPluginCreator::mFC{};
 std::vector<nvinfer1::PluginField> RmsnormQuantizationPluginCreator::mPluginAttributes;
 
-RmsnormQuantizationPlugin::RmsnormQuantizationPlugin(float eps, bool dynamicActivationScaling, nvinfer1::DataType type)
+RmsnormQuantizationPlugin::RmsnormQuantizationPlugin(float eps, bool dynamicActivationScaling, bool clampValEnabled,
+    QuantMode quantMode, nvinfer1::DataType type, nvinfer1::DataType outputType)
     : mEps(eps)
     , mDynActScaling(dynamicActivationScaling)
+    , mClampValEnabled{clampValEnabled}
+    , mQuantMode{quantMode}
     , mType(type)
+    , mOutputType{outputType}
 {
+    TLLM_CHECK_WITH_INFO(mOutputType == nvinfer1::DataType::kINT8 || mOutputType == nvinfer1::DataType::kFP8,
+        "Only int8 or fp8 output type is allowed.");
+    // Check if the quant mode is valid.
+    TLLM_CHECK_WITH_INFO(mQuantMode.hasPerTokenScaling(), "The quant mode is not valid.");
 }
 
 // Parameterized constructor
-RmsnormQuantizationPlugin::RmsnormQuantizationPlugin(const void* data, size_t length)
+RmsnormQuantizationPlugin::RmsnormQuantizationPlugin(void const* data, size_t length)
 {
-    const char *d = reinterpret_cast<const char*>(data), *a = d;
+    char const *d = reinterpret_cast<char const*>(data), *a = d;
     read(d, mEps);
     read(d, mDynActScaling);
+    read(d, mClampValEnabled);
+    read(d, mQuantMode);
     read(d, mType);
-    TLLM_CHECK(d == a + length);
+    read(d, mOutputType);
+    TLLM_CHECK_WITH_INFO(d == a + length,
+        "Expected length (%d) != real length (%d). This is often "
+        "caused by using different TensorRT-LLM version to build "
+        "engine and run engine.",
+        (int) length, (int) (d - a));
 }
 
 // IPluginV2DynamicExt Methods
 nvinfer1::IPluginV2DynamicExt* RmsnormQuantizationPlugin::clone() const noexcept
 {
-    auto* plugin = new RmsnormQuantizationPlugin(mEps, mDynActScaling, mType);
+    auto* plugin
+        = new RmsnormQuantizationPlugin(mEps, mDynActScaling, mClampValEnabled, mQuantMode, mType, mOutputType);
     plugin->setPluginNamespace(mNamespace.c_str());
     return plugin;
 }
 
 nvinfer1::DimsExprs RmsnormQuantizationPlugin::getOutputDimensions(
-    int outputIndex, const nvinfer1::DimsExprs* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
+    int outputIndex, nvinfer1::DimsExprs const* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
 {
     if (outputIndex == 0)
     {
@@ -75,7 +92,7 @@ nvinfer1::DimsExprs RmsnormQuantizationPlugin::getOutputDimensions(
         ret.d[ret.nbDims - 1] = exprBuilder.constant(1);
         return ret;
     }
-    catch (const std::exception& e)
+    catch (std::exception const& e)
     {
         caughtError(e);
     }
@@ -83,43 +100,76 @@ nvinfer1::DimsExprs RmsnormQuantizationPlugin::getOutputDimensions(
 }
 
 bool RmsnormQuantizationPlugin::supportsFormatCombination(
-    int pos, const nvinfer1::PluginTensorDesc* inOut, int nbInputs, int nbOutputs) noexcept
+    int pos, nvinfer1::PluginTensorDesc const* inOut, int nbInputs, int nbOutputs) noexcept
 {
-    const int totalPoses = 6 + static_cast<int>(mDynActScaling);
+    int const totalPoses = 6 + static_cast<int>(mClampValEnabled) + static_cast<int>(mDynActScaling);
     TLLM_CHECK(0 <= pos && pos < totalPoses);
-    TLLM_CHECK(nbInputs == 4);
+    TLLM_CHECK(nbInputs == 4 + static_cast<int>(mClampValEnabled));
     if (pos < nbInputs)
     {
-        switch (pos)
+        if (pos < 3)
         {
-        case 0:
-        case 1:
-        case 2: return (inOut[pos].type == mType) && (inOut[pos].format == TensorFormat::kLINEAR);
-        case 3: return (inOut[pos].type == nvinfer1::DataType::kFLOAT) && (inOut[pos].format == TensorFormat::kLINEAR);
+            // activation, weight, bias
+            return (inOut[pos].type == mType) && (inOut[pos].format == TensorFormat::kLINEAR);
+        }
+        else if (pos == 3)
+        {
+            // scale
+            return (inOut[pos].type == nvinfer1::DataType::kFLOAT) && (inOut[pos].format == TensorFormat::kLINEAR);
+        }
+        else if (pos == 4 && mClampValEnabled)
+        {
+            // clamp_max_v
+            return inOut[pos].type == nvinfer1::DataType::kFLOAT && inOut[pos].format == TensorFormat::kLINEAR;
         }
     }
-    if (pos == 4)
+    else if (pos == 4 + int(mClampValEnabled))
     {
         // Quantized output
-        return (inOut[pos].type == nvinfer1::DataType::kINT8) && (inOut[pos].format == TensorFormat::kLINEAR);
+        return (inOut[pos].type == mOutputType) && (inOut[pos].format == TensorFormat::kLINEAR);
     }
-    // Dynamic scaling if enabled
-    return (inOut[pos].type == nvinfer1::DataType::kFLOAT) && (inOut[pos].format == TensorFormat::kLINEAR);
+    else if (pos == 5 + int(mClampValEnabled))
+    {
+        // Dynamic scaling if enabled
+        return (inOut[pos].type == nvinfer1::DataType::kFLOAT) && (inOut[pos].format == TensorFormat::kLINEAR);
+    }
+
+    // Never should be here
+    TLLM_CHECK_WITH_INFO(false, "The input/output is not supported.");
+    return false;
 }
 
-void RmsnormQuantizationPlugin::configurePlugin(const nvinfer1::DynamicPluginTensorDesc* in, int nbInputs,
-    const nvinfer1::DynamicPluginTensorDesc* out, int nbOutputs) noexcept
+void RmsnormQuantizationPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int nbInputs,
+    nvinfer1::DynamicPluginTensorDesc const* out, int nbOutputs) noexcept
 {
 }
 
-size_t RmsnormQuantizationPlugin::getWorkspaceSize(const nvinfer1::PluginTensorDesc* inputs, int nbInputs,
-    const nvinfer1::PluginTensorDesc* outputs, int nbOutputs) const noexcept
+size_t RmsnormQuantizationPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* inputs, int nbInputs,
+    nvinfer1::PluginTensorDesc const* outputs, int nbOutputs) const noexcept
 {
     return 0;
 }
 
-int RmsnormQuantizationPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc,
-    const nvinfer1::PluginTensorDesc* outputDesc, const void* const* inputs, void* const* outputs, void* workspace,
+template <typename T, typename QuantT>
+void RmsnormQuantizationPlugin::dispatchDataType(void* out, void const* input, void const* gamma, void const* beta,
+    float const eps, int const tokens, int const hidden_dim, cudaStream_t stream, void const* clampValPtr,
+    void const* scale, void* dynamic_scale, void* normed_output_quant) noexcept
+{
+    // inputs
+    //     activation     [dim0(*), dim1]
+    //     clamp_value    [2], contains min val, and max val (optional)
+    // outputs
+    //     quant          [dim0(*), dim1]
+    //     scale_tokens   [dim0(*), 1]
+
+    invokeGeneralRmsNorm(reinterpret_cast<T*>(out), reinterpret_cast<T const*>(input),
+        reinterpret_cast<T const*>(gamma), reinterpret_cast<T const*>(beta), eps, tokens, hidden_dim, mQuantMode,
+        stream, reinterpret_cast<float const*>(clampValPtr), reinterpret_cast<float const*>(scale),
+        reinterpret_cast<float*>(dynamic_scale), reinterpret_cast<QuantT*>(normed_output_quant));
+}
+
+int RmsnormQuantizationPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
+    nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
     cudaStream_t stream) noexcept
 {
     // inputs
@@ -127,48 +177,78 @@ int RmsnormQuantizationPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDe
     //     weight [N, ]
     //     bias [N, ]
     //     scale_to_int [1]
+    //     clamp_value [2], contains min val, and max val (optional)
     // outputs
     //     output [M(*), N]
     //     dynamic_scaling [M(*), 1] (optional output)
 
-    int m = 1;
+    int64_t m64 = 1;
     for (int i = 0; i < inputDesc[0].dims.nbDims - 1; ++i)
     {
-        m *= inputDesc[0].dims.d[i];
+        m64 *= inputDesc[0].dims.d[i];
     }
-    const int n = inputDesc[1].dims.d[0];
+    int const m = TLLM_INT32_CAST(m64);
+    int const n = TLLM_INT32_CAST(inputDesc[1].dims.d[0]);
 
-    const float* scale = reinterpret_cast<const float*>(inputs[3]);
-    int8_t* output = reinterpret_cast<int8_t*>(outputs[0]);
-    float* dynamic_scale = mDynActScaling ? reinterpret_cast<float*>(outputs[1]) : nullptr;
+    void const* input = inputs[0];
+    void const* weight = inputs[1];
+    void const* bias = inputs[2];
+    void const* scale = inputs[3];
+    void const* clampValPtr = mClampValEnabled ? inputs[4] : nullptr;
+    void* output = outputs[0];
+    void* dynamic_scale = mDynActScaling ? outputs[1] : nullptr;
 
-    if (mType == DataType::kHALF)
+    if (inputDesc[0].type == DataType::kFLOAT && mOutputType == DataType::kINT8)
     {
-        const half* input = reinterpret_cast<const half*>(inputs[0]);
-        const half* weight = reinterpret_cast<const half*>(inputs[1]);
-        const half* bias = reinterpret_cast<const half*>(inputs[2]);
-        invokeGeneralRmsNorm((half*) nullptr, input, weight, bias, mEps, m, n, stream, scale, dynamic_scale, output);
+        dispatchDataType<float, int8_t>(
+            nullptr, input, weight, bias, mEps, m, n, stream, clampValPtr, scale, dynamic_scale, output);
     }
-    else if (mType == DataType::kFLOAT)
+#ifdef ENABLE_FP8
+    else if (inputDesc[0].type == DataType::kFLOAT && mOutputType == DataType::kFP8)
     {
-        const float* input = reinterpret_cast<const float*>(inputs[0]);
-        const float* weight = reinterpret_cast<const float*>(inputs[1]);
-        const float* bias = reinterpret_cast<const float*>(inputs[2]);
-        invokeGeneralRmsNorm((float*) nullptr, input, weight, bias, mEps, m, n, stream, scale, dynamic_scale, output);
+        dispatchDataType<float, __nv_fp8_e4m3>(
+            nullptr, input, weight, bias, mEps, m, n, stream, clampValPtr, scale, dynamic_scale, output);
     }
+#endif // ENABLE_FP8
+    else if (inputDesc[0].type == DataType::kHALF && mOutputType == DataType::kINT8)
+    {
+        dispatchDataType<half, int8_t>(
+            nullptr, input, weight, bias, mEps, m, n, stream, clampValPtr, scale, dynamic_scale, output);
+    }
+#ifdef ENABLE_FP8
+    else if (inputDesc[0].type == DataType::kHALF && mOutputType == DataType::kFP8)
+    {
+        dispatchDataType<half, __nv_fp8_e4m3>(
+            nullptr, input, weight, bias, mEps, m, n, stream, clampValPtr, scale, dynamic_scale, output);
+    }
+#endif // ENABLE_FP8
+#ifdef ENABLE_BF16
+    else if (inputDesc[0].type == DataType::kBF16 && mOutputType == DataType::kINT8)
+    {
+        dispatchDataType<__nv_bfloat16, int8_t>(
+            nullptr, input, weight, bias, mEps, m, n, stream, clampValPtr, scale, dynamic_scale, output);
+    }
+#ifdef ENABLE_FP8
+    else if (inputDesc[0].type == DataType::kBF16 && mOutputType == DataType::kFP8)
+    {
+        dispatchDataType<__nv_bfloat16, __nv_fp8_e4m3>(
+            nullptr, input, weight, bias, mEps, m, n, stream, clampValPtr, scale, dynamic_scale, output);
+    }
+#endif // ENABLE_FP8
+#endif // ENABLE_BF16
 
     return 0;
 }
 
 // IPluginV2Ext Methods
 nvinfer1::DataType RmsnormQuantizationPlugin::getOutputDataType(
-    int index, const nvinfer1::DataType* inputTypes, int nbInputs) const noexcept
+    int index, nvinfer1::DataType const* inputTypes, int nbInputs) const noexcept
 {
     assert((mDynActScaling && index < 2) || (!mDynActScaling && index == 0));
     if (index == 0)
     {
         // Output 0 quantized output of layer norm
-        return nvinfer1::DataType::kINT8;
+        return mOutputType;
     }
     // Output 1 dynamic act scaling
     return nvinfer1::DataType::kFLOAT;
@@ -176,12 +256,12 @@ nvinfer1::DataType RmsnormQuantizationPlugin::getOutputDataType(
 
 // IPluginV2 Methods
 
-const char* RmsnormQuantizationPlugin::getPluginType() const noexcept
+char const* RmsnormQuantizationPlugin::getPluginType() const noexcept
 {
     return RMSNORM_QUANTIZATION_PLUGIN_NAME;
 }
 
-const char* RmsnormQuantizationPlugin::getPluginVersion() const noexcept
+char const* RmsnormQuantizationPlugin::getPluginVersion() const noexcept
 {
     return RMSNORM_QUANTIZATION_PLUGIN_VERSION;
 }
@@ -200,7 +280,8 @@ void RmsnormQuantizationPlugin::terminate() noexcept {}
 
 size_t RmsnormQuantizationPlugin::getSerializationSize() const noexcept
 {
-    return sizeof(mEps) + sizeof(mDynActScaling) + sizeof(mType);
+    return sizeof(mOutputType) + sizeof(mClampValEnabled) + sizeof(mEps) + sizeof(mDynActScaling) + sizeof(mType)
+        + sizeof(mQuantMode);
 }
 
 void RmsnormQuantizationPlugin::serialize(void* buffer) const noexcept
@@ -208,7 +289,10 @@ void RmsnormQuantizationPlugin::serialize(void* buffer) const noexcept
     char *d = static_cast<char*>(buffer), *a = d;
     write(d, mEps);
     write(d, mDynActScaling);
+    write(d, mClampValEnabled);
+    write(d, mQuantMode);
     write(d, mType);
+    write(d, mOutputType);
     assert(d == a + getSerializationSize());
 }
 
@@ -226,59 +310,81 @@ RmsnormQuantizationPluginCreator::RmsnormQuantizationPluginCreator()
     mPluginAttributes.clear();
     mPluginAttributes.emplace_back(PluginField("eps", nullptr, PluginFieldType::kFLOAT32, 1e-5f));
     mPluginAttributes.emplace_back(PluginField("dyn_act_scaling", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("clamp_enabled", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("quant_mode", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("out_type_id", nullptr, PluginFieldType::kINT32, 1));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }
 
-const char* RmsnormQuantizationPluginCreator::getPluginName() const noexcept
+char const* RmsnormQuantizationPluginCreator::getPluginName() const noexcept
 {
     return RMSNORM_QUANTIZATION_PLUGIN_NAME;
 }
 
-const char* RmsnormQuantizationPluginCreator::getPluginVersion() const noexcept
+char const* RmsnormQuantizationPluginCreator::getPluginVersion() const noexcept
 {
     return RMSNORM_QUANTIZATION_PLUGIN_VERSION;
 }
 
-const PluginFieldCollection* RmsnormQuantizationPluginCreator::getFieldNames() noexcept
+PluginFieldCollection const* RmsnormQuantizationPluginCreator::getFieldNames() noexcept
 {
     return &mFC;
 }
 
-IPluginV2* RmsnormQuantizationPluginCreator::createPlugin(const char* name, const PluginFieldCollection* fc) noexcept
+IPluginV2* RmsnormQuantizationPluginCreator::createPlugin(char const* name, PluginFieldCollection const* fc) noexcept
 {
-    const PluginField* fields = fc->fields;
+    PluginField const* fields = fc->fields;
+    nvinfer1::DataType outputType;
+    QuantMode quantMode;
+    bool clampValEnabled = false;
     float eps;
     nvinfer1::DataType type;
     bool dynamicActivationScaling;
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {
-        const char* attrName = fields[i].name;
-        if (!strcmp(attrName, "eps"))
+        char const* attrName = fields[i].name;
+        if (!strcmp(attrName, "quant_mode"))
+        {
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
+            quantMode = QuantMode(*(static_cast<int32_t const*>(fields[i].data)));
+        }
+        else if (!strcmp(attrName, "out_type_id"))
+        {
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
+            outputType = static_cast<nvinfer1::DataType>(*(static_cast<nvinfer1::DataType const*>(fields[i].data)));
+        }
+        else if (!strcmp(attrName, "clamp_enabled"))
+        {
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
+            clampValEnabled = static_cast<bool>(*(static_cast<bool const*>(fields[i].data)));
+        }
+        else if (!strcmp(attrName, "eps"))
         {
             TLLM_CHECK(fields[i].type == PluginFieldType::kFLOAT32);
-            eps = static_cast<float>(*(static_cast<const float*>(fields[i].data)));
+            eps = static_cast<float>(*(static_cast<float const*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "type_id"))
         {
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
-            type = static_cast<nvinfer1::DataType>(*(static_cast<const nvinfer1::DataType*>(fields[i].data)));
+            type = static_cast<nvinfer1::DataType>(*(static_cast<nvinfer1::DataType const*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "dyn_act_scaling"))
         {
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
-            dynamicActivationScaling = static_cast<bool>(*(static_cast<const bool*>(fields[i].data)));
+            dynamicActivationScaling = static_cast<bool>(*(static_cast<bool const*>(fields[i].data)));
         }
     }
     try
     {
-        auto* obj = new RmsnormQuantizationPlugin(eps, dynamicActivationScaling, type);
+        auto* obj = new RmsnormQuantizationPlugin(
+            eps, dynamicActivationScaling, clampValEnabled, quantMode, type, outputType);
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }
-    catch (const std::exception& e)
+    catch (std::exception const& e)
     {
         caughtError(e);
     }
@@ -286,7 +392,7 @@ IPluginV2* RmsnormQuantizationPluginCreator::createPlugin(const char* name, cons
 }
 
 IPluginV2* RmsnormQuantizationPluginCreator::deserializePlugin(
-    const char* name, const void* serialData, size_t serialLength) noexcept
+    char const* name, void const* serialData, size_t serialLength) noexcept
 {
     // This object will be deleted when the network is destroyed, which will
     // call RmsnormQuantizationPlugin::destroy()
@@ -296,7 +402,7 @@ IPluginV2* RmsnormQuantizationPluginCreator::deserializePlugin(
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }
-    catch (const std::exception& e)
+    catch (std::exception const& e)
     {
         caughtError(e);
     }

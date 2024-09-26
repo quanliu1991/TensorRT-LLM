@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2024, NVIDIA CORPORATION.  All rights reserved.
  * Copyright (c) 2021, NAVER Corp.  Authored by CLOVA.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,57 +17,47 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/memoryUtils.h"
-#include "tensorrt_llm/common/tensor.h"
-#include "tensorrt_llm/kernels/decodingCommon.h"
-#include "tensorrt_llm/layers/baseSamplingLayer.h"
+#include "tensorrt_llm/layers/baseLayer.h"
+#include "tensorrt_llm/runtime/common.h"
 
-namespace tensorrt_llm
-{
-namespace layers
+namespace tensorrt_llm::layers
 {
 
+//! \brief Layer to randomly sample tokens from TopK logits.
+//! When both TopK and TopP are specified, layer jointly samples using TopK and TopP.
+//! When no TopK param is specified, sampling is skipped for particular request.
 template <typename T>
-class TopKSamplingLayer : public BaseSamplingLayer<T>
+class TopKSamplingLayer : public BaseLayer
 {
+    using Base = BaseLayer;
+
 public:
-    using Base = BaseSamplingLayer<T>;
-    using SetupParams = typename Base::SetupParams;
+    TopKSamplingLayer(DecoderDomain const& decoderDomain, std::shared_ptr<runtime::BufferManager> bufferManager);
 
-    TopKSamplingLayer(size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream,
-        tensorrt_llm::common::IAllocator* allocator, bool is_free_buffer_after_forward);
-    TopKSamplingLayer(TopKSamplingLayer<T> const& top_k_sampling_layer);
-    ~TopKSamplingLayer();
+    void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, TensorConstPtr batchSlots,
+        std::shared_ptr<BaseSetupParams> const& setupParams,
+        std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace) override;
+    void forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& outputs,
+        std::shared_ptr<BaseDecodingInputs> const& inputs,
+        std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace) override;
 
-    void setup(size_t batch_size, SetupParams const& setupParams);
+    //! @returns workspace needed for this layer in bytes
+    [[nodiscard]] size_t getWorkspaceSize() const noexcept override;
 
 protected:
-    void runSampling(DecodingOutputParams& outputs, DecodingParams const& params) override;
+    bool mNormalizeLogProbs{true};
+    size_t mWorkspaceSize{0};
+    size_t mSetupWorkspaceSize{0};
+    runtime::SizeType32 mRuntimeMaxTopK{0};
+    TensorPtr mRuntimeTopKDevice;
+    TensorPtr mRuntimeTopPDevice;
+    TensorPtr mSkipDecodeDevice;
+    TensorPtr mSkipDecodeHost;
 
-    void freeBuffer() override;
-
-    uint32_t runtime_max_top_k_ = 1;
-    uint32_t* runtime_top_k_buf_ = nullptr;
-    float* runtime_top_p_buf_ = nullptr;
-    using Base::vocab_size_;
-    using Base::vocab_size_padded_;
-
-    using Base::sampling_workspace_size_;
-    using Base::sampling_workspace_;
-    using Base::curandstate_buf_;
-    using Base::random_seeds_buf_;
-    using Base::skip_decode_buf_;
-    using Base::skip_decode_;
-    using Base::skip_any_;
-    using Base::runtime_logits_buf_;
-
-    using Base::stream_;
-    using Base::allocator_;
-    using Base::is_allocate_buffer_;
+    using Base::mDecoderDomain;
 
 private:
-    void allocateBuffer(size_t batch_size, std::vector<uint32_t> const& top_k);
+    void allocateBuffer(runtime::SizeType32 batchSize);
 };
 
-} // namespace layers
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::layers

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,8 +19,8 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 
-#include <algorithm>
-#include <cstdint>
+#include <atomic>
+#include <cstddef>
 #include <string>
 
 namespace tensorrt_llm::runtime
@@ -29,24 +29,34 @@ namespace tensorrt_llm::runtime
 class MemoryCounters
 {
 public:
-    using SizeType = std::size_t;
+    using SizeType32 = std::size_t;
     using DiffType = std::ptrdiff_t;
 
     MemoryCounters() = default;
 
-    [[nodiscard]] SizeType getGpu() const
+    [[nodiscard]] SizeType32 getGpu() const
     {
         return mGpu;
     }
 
-    [[nodiscard]] SizeType getCpu() const
+    [[nodiscard]] SizeType32 getCpu() const
     {
         return mCpu;
     }
 
-    [[nodiscard]] SizeType getPinned() const
+    [[nodiscard]] SizeType32 getPinned() const
     {
         return mPinned;
+    }
+
+    [[nodiscard]] SizeType32 getUVM() const
+    {
+        return mUVM;
+    }
+
+    [[nodiscard]] SizeType32 getPinnedPool() const
+    {
+        return mPinnedPool;
     }
 
     [[nodiscard]] DiffType getGpuDiff() const
@@ -64,8 +74,18 @@ public:
         return mPinnedDiff;
     }
 
+    [[nodiscard]] DiffType getUVMDiff() const
+    {
+        return mUVMDiff;
+    }
+
+    [[nodiscard]] DiffType getPinnedPoolDiff() const
+    {
+        return mPinnedPoolDiff;
+    }
+
     template <MemoryType T>
-    void allocate(SizeType size)
+    void allocate(SizeType32 size)
     {
         auto const sizeDiff = static_cast<DiffType>(size);
         if constexpr (T == MemoryType::kGPU)
@@ -83,32 +103,52 @@ public:
             mPinned += size;
             mPinnedDiff = sizeDiff;
         }
+        else if constexpr (T == MemoryType::kUVM)
+        {
+            mUVM += size;
+            mUVMDiff = sizeDiff;
+        }
+        else if constexpr (T == MemoryType::kPINNEDPOOL)
+        {
+            mPinnedPool += size;
+            mPinnedPoolDiff = sizeDiff;
+        }
         else
         {
             TLLM_THROW("Unknown memory type: %s", MemoryTypeString<T>::value);
         }
     }
 
-    void allocate(MemoryType memoryType, SizeType size);
+    void allocate(MemoryType memoryType, SizeType32 size);
 
     template <MemoryType T>
-    void deallocate(SizeType size)
+    void deallocate(SizeType32 size)
     {
         auto const sizeDiff = -static_cast<DiffType>(size);
         if constexpr (T == MemoryType::kGPU)
         {
-            mGpu -= std::min(size, mGpu);
+            mGpu -= size;
             mGpuDiff = sizeDiff;
         }
         else if constexpr (T == MemoryType::kCPU)
         {
-            mCpu -= std::min(size, mCpu);
+            mCpu -= size;
             mCpuDiff = sizeDiff;
         }
         else if constexpr (T == MemoryType::kPINNED)
         {
-            mPinned -= std::min(size, mPinned);
+            mPinned -= size;
             mPinnedDiff = sizeDiff;
+        }
+        else if constexpr (T == MemoryType::kUVM)
+        {
+            mUVM -= size;
+            mUVMDiff = sizeDiff;
+        }
+        else if constexpr (T == MemoryType::kPINNEDPOOL)
+        {
+            mPinnedPool -= size;
+            mPinnedPoolDiff = sizeDiff;
         }
         else
         {
@@ -116,23 +156,19 @@ public:
         }
     }
 
-    void deallocate(MemoryType memoryType, SizeType size);
+    void deallocate(MemoryType memoryType, SizeType32 size);
 
-    static MemoryCounters& getInstance()
-    {
-        return mInstance;
-    }
+    static MemoryCounters& getInstance();
 
-    static std::string bytesToString(SizeType bytes, int precision = 2);
+    static std::string bytesToString(SizeType32 bytes, int precision = 2);
 
     static std::string bytesToString(DiffType bytes, int precision = 2);
 
-    std::string toString() const;
+    [[nodiscard]] std::string toString() const;
 
 private:
-    SizeType mGpu{}, mCpu{}, mPinned{};
-    DiffType mGpuDiff{}, mCpuDiff{}, mPinnedDiff{};
-    static thread_local MemoryCounters mInstance;
+    std::atomic<SizeType32> mGpu{}, mCpu{}, mPinned{}, mUVM{}, mPinnedPool{};
+    std::atomic<DiffType> mGpuDiff{}, mCpuDiff{}, mPinnedDiff{}, mUVMDiff{}, mPinnedPoolDiff{};
 };
 
 } // namespace tensorrt_llm::runtime

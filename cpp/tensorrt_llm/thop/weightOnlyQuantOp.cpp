@@ -38,16 +38,21 @@ void check_quant_type_allowed(torch::ScalarType quant_type)
 #endif
 }
 
-QuantType get_ft_quant_type(torch::ScalarType quant_type)
+QuantType get_ft_quant_type(torch::ScalarType quant_type, torch::ScalarType activation_type = torch::kFloat16)
 {
-    if (quant_type == torch::kInt8)
+    // Actually we need FP8 here, but current torch version does not support FP8. That's why INT8 is employed here
+    if (activation_type == torch::kFloat8_e4m3fn)
     {
-        return QuantType::INT8_WEIGHT_ONLY;
+        return QuantType::W4_AFP8;
+    }
+    else if (quant_type == torch::kInt8)
+    {
+        return QuantType::W8_A16;
     }
 #ifdef TORCH_IS_AT_LEAST_v190
     else if (quant_type == at::ScalarType::QUInt4x2)
     {
-        return QuantType::PACKED_INT4_WEIGHT_ONLY;
+        return QuantType::W4_A16;
     }
 #endif
     else
@@ -68,7 +73,7 @@ Tensor permute_B_rows_for_mixed_gemm(Tensor quantized_tensor, torch::ScalarType 
         quantized_tensor.dim() == 2 || quantized_tensor.dim() == 3, "Invalid dim. The dim of weight should be 2 or 3");
 
     QuantType ft_quant_type = get_ft_quant_type(quant_type);
-    const size_t bits_in_quant_type = get_bits_in_quant_type(ft_quant_type);
+    const size_t bits_in_quant_type = get_weight_quant_bits(ft_quant_type);
 
     const size_t num_experts = quantized_tensor.dim() == 2 ? 1 : quantized_tensor.size(0);
     const size_t num_rows = quantized_tensor.size(-2);
@@ -98,7 +103,7 @@ Tensor subbyte_transpose(Tensor quantized_tensor, torch::ScalarType quant_type)
         quantized_tensor.dim() == 2 || quantized_tensor.dim() == 3, "Invalid dim. The dim of weight should be 2 or 3");
 
     QuantType ft_quant_type = get_ft_quant_type(quant_type);
-    const size_t bits_in_quant_type = get_bits_in_quant_type(ft_quant_type);
+    const size_t bits_in_quant_type = get_weight_quant_bits(ft_quant_type);
 
     const size_t num_experts = quantized_tensor.dim() == 2 ? 1 : quantized_tensor.size(0);
     const size_t num_rows = quantized_tensor.size(-2);
@@ -113,7 +118,10 @@ Tensor subbyte_transpose(Tensor quantized_tensor, torch::ScalarType quant_type)
     return transposed_tensor;
 }
 
-Tensor preprocess_weights_for_mixed_gemm(Tensor row_major_quantized_weight, torch::ScalarType quant_type)
+// NOTE: TODO this API must change to take in the quant type. We must know the intended activation type since
+//       W4A8 and W4A16 have different layouts.
+Tensor preprocess_weights_for_mixed_gemm(
+    Tensor row_major_quantized_weight, torch::ScalarType quant_type, torch::ScalarType activation_type)
 {
     auto _st = row_major_quantized_weight.scalar_type();
     CHECK_CPU(row_major_quantized_weight);
@@ -123,8 +131,8 @@ Tensor preprocess_weights_for_mixed_gemm(Tensor row_major_quantized_weight, torc
     TORCH_CHECK(row_major_quantized_weight.dim() == 2 || row_major_quantized_weight.dim() == 3,
         "Invalid dim. The dim of weight should be 2 or 3");
 
-    QuantType ft_quant_type = get_ft_quant_type(quant_type);
-    const size_t bits_in_quant_type = get_bits_in_quant_type(ft_quant_type);
+    QuantType ft_quant_type = get_ft_quant_type(quant_type, activation_type);
+    const size_t bits_in_quant_type = get_weight_quant_bits(ft_quant_type);
 
     const size_t num_experts = row_major_quantized_weight.dim() == 2 ? 1 : row_major_quantized_weight.size(0);
     const size_t num_rows = row_major_quantized_weight.size(-2);
@@ -134,8 +142,10 @@ Tensor preprocess_weights_for_mixed_gemm(Tensor row_major_quantized_weight, torc
     int8_t* input_byte_ptr = get_ptr<int8_t>(row_major_quantized_weight);
     int8_t* output_byte_ptr = get_ptr<int8_t>(processed_tensor);
 
+    bool force_interleave = row_major_quantized_weight.dim() == 3; // WAR for MoE 3-D tensors.
+
     preprocess_weights_for_mixed_gemm(
-        output_byte_ptr, input_byte_ptr, {num_experts, num_rows, num_cols}, ft_quant_type);
+        output_byte_ptr, input_byte_ptr, {num_experts, num_rows, num_cols}, ft_quant_type, force_interleave);
 
     return processed_tensor;
 }
@@ -158,7 +168,7 @@ std::vector<Tensor> symmetric_quantize_helper(
     const size_t num_rows = weight.size(-2);
     const size_t num_cols = weight.size(-1);
 
-    const size_t bits_in_type = get_bits_in_quant_type(ft_quant_type);
+    const size_t bits_in_type = get_weight_quant_bits(ft_quant_type);
     const size_t bytes_per_out_col = num_cols * bits_in_type / 8;
 
     const size_t input_mat_size = num_rows * num_cols;
@@ -191,22 +201,27 @@ std::vector<Tensor> symmetric_quantize_helper(
     int8_t* unprocessed_quantized_weight_ptr = get_ptr<int8_t>(unprocessed_quantized_weight);
     int8_t* processed_quantized_weight_ptr = get_ptr<int8_t>(processed_quantized_weight);
 
+    // TODO(dastokes) This should be removed if Grouped GEMM is updated to not need interleaved input
+    bool force_interleave = weight.dim() == 3;
+
     if (weight.scalar_type() == at::ScalarType::Float)
     {
         symmetric_quantize<float, float>(processed_quantized_weight_ptr, unprocessed_quantized_weight_ptr,
-            get_ptr<float>(scales), get_ptr<const float>(weight), {num_experts, num_rows, num_cols}, ft_quant_type);
+            get_ptr<float>(scales), get_ptr<float const>(weight), {num_experts, num_rows, num_cols}, ft_quant_type,
+            force_interleave);
     }
     else if (weight.scalar_type() == at::ScalarType::Half)
     {
         symmetric_quantize<half, half>(processed_quantized_weight_ptr, unprocessed_quantized_weight_ptr,
-            get_ptr<half>(scales), get_ptr<const half>(weight), {num_experts, num_rows, num_cols}, ft_quant_type);
+            get_ptr<half>(scales), get_ptr<half const>(weight), {num_experts, num_rows, num_cols}, ft_quant_type,
+            force_interleave);
     }
 #ifdef ENABLE_BF16
     else if (weight.scalar_type() == at::ScalarType::BFloat16)
     {
         symmetric_quantize<__nv_bfloat16, __nv_bfloat16>(processed_quantized_weight_ptr,
-            unprocessed_quantized_weight_ptr, get_ptr<__nv_bfloat16>(scales), get_ptr<const __nv_bfloat16>(weight),
-            {num_experts, num_rows, num_cols}, ft_quant_type);
+            unprocessed_quantized_weight_ptr, get_ptr<__nv_bfloat16>(scales), get_ptr<__nv_bfloat16 const>(weight),
+            {num_experts, num_rows, num_cols}, ft_quant_type, force_interleave);
     }
 #endif
     else
@@ -246,7 +261,7 @@ Tensor add_bias_and_interleave_int4s(Tensor weight)
     int8_t* int4_tensor_ptr = get_ptr<int8_t>(output);
     const size_t num_bytes = output.numel();
     const size_t num_elts = 2 * num_bytes;
-    add_bias_and_interleave_quantized_tensor_inplace(int4_tensor_ptr, num_elts, QuantType::PACKED_INT4_WEIGHT_ONLY);
+    add_bias_and_interleave_quantized_tensor_inplace(int4_tensor_ptr, num_elts, QuantType::W4_A16);
 
     return output;
 }
@@ -261,7 +276,7 @@ Tensor add_bias_and_interleave_int8s(Tensor weight)
 
     int8_t* int8_tensor_ptr = get_ptr<int8_t>(output);
     const size_t num_elts = output.numel();
-    add_bias_and_interleave_quantized_tensor_inplace(int8_tensor_ptr, num_elts, QuantType::INT8_WEIGHT_ONLY);
+    add_bias_and_interleave_quantized_tensor_inplace(int8_tensor_ptr, num_elts, QuantType::W8_A16);
 
     return output;
 }
@@ -341,31 +356,30 @@ Tensor pack_int8_tensor_to_packed_int4(Tensor weight)
 
 // Utility methods that may be useful for preprocessing weights in torch.
 static auto symmetric_quantize_last_axis_of_batched_matrix
-    = torch::RegisterOperators("fastertransformer::symmetric_quantize_last_axis_of_batched_matrix",
+    = torch::RegisterOperators("trtllm::symmetric_quantize_last_axis_of_batched_matrix",
         &torch_ext::symmetric_quantize_last_axis_of_batched_matrix);
 
 static auto preprocess_weights_for_mixed_gemm = torch::RegisterOperators(
-    "fastertransformer::preprocess_weights_for_mixed_gemm", &torch_ext::preprocess_weights_for_mixed_gemm);
+    "trtllm::preprocess_weights_for_mixed_gemm", &torch_ext::preprocess_weights_for_mixed_gemm);
 
 static auto unpack_int4_packed_tensor_to_int8 = torch::RegisterOperators(
-    "fastertransformer::unpack_int4_packed_tensor_to_int8", &torch_ext::unpack_int4_packed_tensor_to_int8);
+    "trtllm::unpack_int4_packed_tensor_to_int8", &torch_ext::unpack_int4_packed_tensor_to_int8);
 
-static auto pack_int8_tensor_to_packed_int4 = torch::RegisterOperators(
-    "fastertransformer::pack_int8_tensor_to_packed_int4", &torch_ext::pack_int8_tensor_to_packed_int4);
+static auto pack_int8_tensor_to_packed_int4
+    = torch::RegisterOperators("trtllm::pack_int8_tensor_to_packed_int4", &torch_ext::pack_int8_tensor_to_packed_int4);
 
 // Utility methods exposed purely for unit tests in torch.
 static auto _symmetric_quantize_last_axis_of_batched_matrix
-    = torch::RegisterOperators("fastertransformer::_symmetric_quantize_last_axis_of_batched_matrix",
+    = torch::RegisterOperators("trtllm::_symmetric_quantize_last_axis_of_batched_matrix",
         &torch_ext::_symmetric_quantize_last_axis_of_batched_matrix);
 
-static auto add_bias_and_interleave_int4s = torch::RegisterOperators(
-    "fastertransformer::_add_bias_and_interleave_int4s", &torch_ext::add_bias_and_interleave_int4s);
+static auto add_bias_and_interleave_int4s
+    = torch::RegisterOperators("trtllm::_add_bias_and_interleave_int4s", &torch_ext::add_bias_and_interleave_int4s);
 
-static auto add_bias_and_interleave_int8s = torch::RegisterOperators(
-    "fastertransformer::_add_bias_and_interleave_int8s", &torch_ext::add_bias_and_interleave_int8s);
+static auto add_bias_and_interleave_int8s
+    = torch::RegisterOperators("trtllm::_add_bias_and_interleave_int8s", &torch_ext::add_bias_and_interleave_int8s);
 
-static auto permute_B_rows_for_mixed_gemm = torch::RegisterOperators(
-    "fastertransformer::_permute_B_rows_for_mixed_gemm", &torch_ext::permute_B_rows_for_mixed_gemm);
+static auto permute_B_rows_for_mixed_gemm
+    = torch::RegisterOperators("trtllm::_permute_B_rows_for_mixed_gemm", &torch_ext::permute_B_rows_for_mixed_gemm);
 
-static auto subbyte_transpose
-    = torch::RegisterOperators("fastertransformer::_subbyte_transpose", &torch_ext::subbyte_transpose);
+static auto subbyte_transpose = torch::RegisterOperators("trtllm::_subbyte_transpose", &torch_ext::subbyte_transpose);

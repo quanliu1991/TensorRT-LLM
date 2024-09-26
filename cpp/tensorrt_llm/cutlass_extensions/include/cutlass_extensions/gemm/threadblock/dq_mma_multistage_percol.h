@@ -80,13 +80,13 @@ template <
     typename SmemIteratorB_,
     /// Cache operation for operand B
     cutlass::arch::CacheOperation::Kind CacheOpB,
-    /// Data type for the scales
+    /// Iterators over scales in global memory
     typename IteratorScale_,
     /// Iterators over scales in shared memory
     typename SmemIteratorScale_,
     /// Data type of accumulator matrix
     typename ElementC_,
-    /// Data type of accumulator matrix
+    /// Layout of accumulator matrix
     typename LayoutC_,
     /// Policy describing tuning details (concept: MmaPolicy)
     typename Policy_,
@@ -190,8 +190,9 @@ private:
     using WarpFragmentB = typename Operator::FragmentB;
     Dequantizer warp_dequantizer_;
 
+    using ElementA = typename IteratorA::Element;
     using ElementB = typename IteratorB::Element;
-    using LayoutDetailsForB = kernel::LayoutDetailsB<ElementB, ArchTag>;
+    using LayoutDetailsForB = kernel::LayoutDetailsB<ElementA, ElementB, ArchTag>;
 
     static constexpr bool RequiresTileInterleave
         = layout::IsColumnMajorTileInterleave<typename LayoutDetailsForB::Layout>::value;
@@ -219,7 +220,7 @@ public:
         ///< Shared storage needed for internal use by threadblock-scoped GEMM
         typename Base::SharedStorage& shared_storage,
         ///< Group size for quantization. Not used by this main loop since it assumes per-column
-        const int group_size,
+        int const group_size,
         ///< ID within the threadblock
         int thread_idx,
         ///< ID of warp
@@ -482,7 +483,7 @@ public:
             }
         }
 
-        // Waits until kStages-2 stages have committed.
+        // Wait until we have at least one committed global fetch stage. (#uncommitted = Base::kStages - 1 - #committed)
         cutlass::arch::cp_async_wait<Base::kStages - 2>();
         __syncthreads();
 
@@ -534,8 +535,8 @@ public:
                 this->warp_tile_iterator_A_.load(warp_frag_A[(warp_mma_k + 1) % 2]);
                 ++this->warp_tile_iterator_A_;
 
-                const int warp_tileB_k_compute_offset = warp_mma_k % Base::kNumKIterationsPerWarpBLoad;
-                const int warp_tileB_k_load_offset = warp_mma_k / Base::kNumKIterationsPerWarpBLoad;
+                int const warp_tileB_k_compute_offset = warp_mma_k % Base::kNumKIterationsPerWarpBLoad;
+                int const warp_tileB_k_load_offset = warp_mma_k / Base::kNumKIterationsPerWarpBLoad;
                 if (warp_tileB_k_compute_offset == Base::kNumKIterationsPerWarpBLoad - 1)
                 {
                     this->warp_tile_iterator_B_.set_kgroup_index(
@@ -548,8 +549,17 @@ public:
                     = lds_converter(warp_frag_B[warp_tileB_k_load_offset % 2]);
                 warp_dequantizer_.dequantize(converted_frag_B, warp_frag_scales);
 
-                run_warp_mma(
-                    warp_mma, accum, warp_frag_A[warp_mma_k % 2], converted_frag_B, accum, warp_tileB_k_compute_offset);
+                using FragmentOperandB = cutlass::Array<ElementA, Operator::FragmentB::kElements>;
+                constexpr cutlass::FloatRoundStyle RoundStyle = cutlass::FloatRoundStyle::round_to_nearest;
+                constexpr int ConversionVectorWidth = TransformBAfterLDS::result_type::kElements;
+                static_assert(ConversionVectorWidth == FragmentOperandB::kElements);
+
+                using Converter
+                    = cutlass::NumericArrayConverter<ElementA, ElementScale, ConversionVectorWidth, RoundStyle>;
+
+                FragmentOperandB converted_frag_B_operand = Converter::convert(converted_frag_B);
+                run_warp_mma(warp_mma, accum, warp_frag_A[warp_mma_k % 2], converted_frag_B_operand, accum,
+                    warp_tileB_k_compute_offset);
 
                 // Issue global->shared copies for the this stage
                 if (warp_mma_k < Base::kWarpGemmIterations - 1)
@@ -573,7 +583,8 @@ public:
                     // Inserts a memory fence between stages of cp.async instructions.
                     cutlass::arch::cp_async_fence();
 
-                    // Waits until kStages-2 stages have committed.
+                    // Wait until we have at least one committed global fetch stage. (#uncommitted = Base::kStages - 1 -
+                    // #committed)
                     arch::cp_async_wait<Base::kStages - 2>();
                     __syncthreads();
 

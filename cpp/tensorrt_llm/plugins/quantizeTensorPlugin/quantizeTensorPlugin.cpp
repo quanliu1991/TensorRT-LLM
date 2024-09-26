@@ -22,18 +22,22 @@ using namespace tensorrt_llm::kernels;
 using tensorrt_llm::plugins::QuantizeTensorPluginCreator;
 using tensorrt_llm::plugins::QuantizeTensorPlugin;
 
-static const char* QUANTIZE_TENSOR_PLUGIN_VERSION{"1"};
-static const char* QUANTIZE_TENSOR_PLUGIN_NAME{"QuantizeTensor"};
+static char const* QUANTIZE_TENSOR_PLUGIN_VERSION{"1"};
+static char const* QUANTIZE_TENSOR_PLUGIN_NAME{"QuantizeTensor"};
 PluginFieldCollection QuantizeTensorPluginCreator::mFC{};
 std::vector<nvinfer1::PluginField> QuantizeTensorPluginCreator::mPluginAttributes;
 
 QuantizeTensorPlugin::QuantizeTensorPlugin() {}
 
 // Parameterized constructor
-QuantizeTensorPlugin::QuantizeTensorPlugin(const void* data, size_t length)
+QuantizeTensorPlugin::QuantizeTensorPlugin(void const* data, size_t length)
 {
-    const char *d = reinterpret_cast<const char*>(data), *a = d;
-    TLLM_CHECK(d == a + length);
+    char const *d = reinterpret_cast<char const*>(data), *a = d;
+    TLLM_CHECK_WITH_INFO(d == a + length,
+        "Expected length (%d) != real length (%d). This is often "
+        "caused by using different TensorRT-LLM version to build "
+        "engine and run engine.",
+        (int) length, (int) (d - a));
 }
 
 // IPluginV2DynamicExt Methods
@@ -43,7 +47,7 @@ nvinfer1::IPluginV2DynamicExt* QuantizeTensorPlugin::clone() const noexcept
 }
 
 nvinfer1::DimsExprs QuantizeTensorPlugin::getOutputDimensions(
-    int outputIndex, const nvinfer1::DimsExprs* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
+    int outputIndex, nvinfer1::DimsExprs const* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
 {
     try
     {
@@ -52,7 +56,7 @@ nvinfer1::DimsExprs QuantizeTensorPlugin::getOutputDimensions(
         // Quantized input
         return inputs[0];
     }
-    catch (const std::exception& e)
+    catch (std::exception const& e)
     {
         caughtError(e);
     }
@@ -60,13 +64,17 @@ nvinfer1::DimsExprs QuantizeTensorPlugin::getOutputDimensions(
 }
 
 bool QuantizeTensorPlugin::supportsFormatCombination(
-    int pos, const nvinfer1::PluginTensorDesc* inOut, int nbInputs, int nbOutputs) noexcept
+    int pos, nvinfer1::PluginTensorDesc const* inOut, int nbInputs, int nbOutputs) noexcept
 {
     switch (pos)
     {
     case 0:
         // activation
-        return (inOut[pos].type == nvinfer1::DataType::kFLOAT || inOut[pos].type == nvinfer1::DataType::kHALF)
+        return (inOut[pos].type == nvinfer1::DataType::kFLOAT || inOut[pos].type == nvinfer1::DataType::kHALF
+#ifdef ENABLE_BF16
+                   || inOut[pos].type == nvinfer1::DataType::kBF16
+#endif
+                   )
             && inOut[pos].format == TensorFormat::kLINEAR;
     case 1:
         // scales
@@ -81,19 +89,19 @@ bool QuantizeTensorPlugin::supportsFormatCombination(
     }
 }
 
-void QuantizeTensorPlugin::configurePlugin(const nvinfer1::DynamicPluginTensorDesc* in, int nbInputs,
-    const nvinfer1::DynamicPluginTensorDesc* out, int nbOutputs) noexcept
+void QuantizeTensorPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int nbInputs,
+    nvinfer1::DynamicPluginTensorDesc const* out, int nbOutputs) noexcept
 {
 }
 
-size_t QuantizeTensorPlugin::getWorkspaceSize(const nvinfer1::PluginTensorDesc* inputs, int nbInputs,
-    const nvinfer1::PluginTensorDesc* outputs, int nbOutputs) const noexcept
+size_t QuantizeTensorPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* inputs, int nbInputs,
+    nvinfer1::PluginTensorDesc const* outputs, int nbOutputs) const noexcept
 {
     return 0;
 }
 
-int QuantizeTensorPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc,
-    const nvinfer1::PluginTensorDesc* outputDesc, const void* const* inputs, void* const* outputs, void* workspace,
+int QuantizeTensorPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
+    nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
     cudaStream_t stream) noexcept
 {
     // inputs
@@ -110,21 +118,29 @@ int QuantizeTensorPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc,
 
     if (inputDesc[0].type == DataType::kFLOAT)
     {
-        invokeQuantization<float>(reinterpret_cast<int8_t*>(outputs[0]), reinterpret_cast<const float*>(inputs[0]),
-            numElts, reinterpret_cast<const float*>(inputs[1]), stream, mProp.maxGridSize[0]);
+        invokeQuantization<float>(reinterpret_cast<int8_t*>(outputs[0]), reinterpret_cast<float const*>(inputs[0]),
+            numElts, reinterpret_cast<float const*>(inputs[1]), stream, mProp.maxGridSize[0]);
     }
-    else
+    else if (inputDesc[0].type == DataType::kHALF)
     {
-        invokeQuantization<half>(reinterpret_cast<int8_t*>(outputs[0]), reinterpret_cast<const half*>(inputs[0]),
-            numElts, reinterpret_cast<const float*>(inputs[1]), stream, mProp.maxGridSize[0]);
+        invokeQuantization<half>(reinterpret_cast<int8_t*>(outputs[0]), reinterpret_cast<half const*>(inputs[0]),
+            numElts, reinterpret_cast<float const*>(inputs[1]), stream, mProp.maxGridSize[0]);
     }
+#ifdef ENABLE_BF16
+    else if (inputDesc[0].type == DataType::kBF16)
+    {
+        invokeQuantization<__nv_bfloat16>(reinterpret_cast<int8_t*>(outputs[0]),
+            reinterpret_cast<__nv_bfloat16 const*>(inputs[0]), numElts, reinterpret_cast<float const*>(inputs[1]),
+            stream, mProp.maxGridSize[0]);
+    }
+#endif
 
     return 0;
 }
 
 // IPluginV2Ext Methods
 nvinfer1::DataType QuantizeTensorPlugin::getOutputDataType(
-    int index, const nvinfer1::DataType* inputTypes, int nbInputs) const noexcept
+    int index, nvinfer1::DataType const* inputTypes, int nbInputs) const noexcept
 {
     TLLM_CHECK(nbInputs == 2);
     TLLM_CHECK(index == 0);
@@ -133,12 +149,12 @@ nvinfer1::DataType QuantizeTensorPlugin::getOutputDataType(
 
 // IPluginV2 Methods
 
-const char* QuantizeTensorPlugin::getPluginType() const noexcept
+char const* QuantizeTensorPlugin::getPluginType() const noexcept
 {
     return QUANTIZE_TENSOR_PLUGIN_NAME;
 }
 
-const char* QuantizeTensorPlugin::getPluginVersion() const noexcept
+char const* QuantizeTensorPlugin::getPluginVersion() const noexcept
 {
     return QUANTIZE_TENSOR_PLUGIN_VERSION;
 }
@@ -185,22 +201,22 @@ QuantizeTensorPluginCreator::QuantizeTensorPluginCreator()
     mFC.fields = mPluginAttributes.data();
 }
 
-const char* QuantizeTensorPluginCreator::getPluginName() const noexcept
+char const* QuantizeTensorPluginCreator::getPluginName() const noexcept
 {
     return QUANTIZE_TENSOR_PLUGIN_NAME;
 }
 
-const char* QuantizeTensorPluginCreator::getPluginVersion() const noexcept
+char const* QuantizeTensorPluginCreator::getPluginVersion() const noexcept
 {
     return QUANTIZE_TENSOR_PLUGIN_VERSION;
 }
 
-const PluginFieldCollection* QuantizeTensorPluginCreator::getFieldNames() noexcept
+PluginFieldCollection const* QuantizeTensorPluginCreator::getFieldNames() noexcept
 {
     return &mFC;
 }
 
-IPluginV2* QuantizeTensorPluginCreator::createPlugin(const char* name, const PluginFieldCollection* fc) noexcept
+IPluginV2* QuantizeTensorPluginCreator::createPlugin(char const* name, PluginFieldCollection const* fc) noexcept
 {
     try
     {
@@ -208,7 +224,7 @@ IPluginV2* QuantizeTensorPluginCreator::createPlugin(const char* name, const Plu
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }
-    catch (const std::exception& e)
+    catch (std::exception const& e)
     {
         caughtError(e);
     }
@@ -216,7 +232,7 @@ IPluginV2* QuantizeTensorPluginCreator::createPlugin(const char* name, const Plu
 }
 
 IPluginV2* QuantizeTensorPluginCreator::deserializePlugin(
-    const char* name, const void* serialData, size_t serialLength) noexcept
+    char const* name, void const* serialData, size_t serialLength) noexcept
 {
     // This object will be deleted when the network is destroyed, which will
     // call QuantizeTensorPlugin::destroy()
@@ -226,7 +242,7 @@ IPluginV2* QuantizeTensorPluginCreator::deserializePlugin(
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }
-    catch (const std::exception& e)
+    catch (std::exception const& e)
     {
         caughtError(e);
     }

@@ -15,23 +15,28 @@
  * limitations under the License.
  */
 #include "identityPlugin.h"
+#include "tensorrt_llm/runtime/iBuffer.h"
 
 using namespace nvinfer1;
 using tensorrt_llm::plugins::IdentityPluginCreator;
 using tensorrt_llm::plugins::IdentityPlugin;
 
-static const char* IDENTITY_PLUGIN_VERSION{"1"};
-static const char* IDENTITY_PLUGIN_NAME{"Identity"};
+static char const* IDENTITY_PLUGIN_VERSION{"1"};
+static char const* IDENTITY_PLUGIN_NAME{"Identity"};
 PluginFieldCollection IdentityPluginCreator::mFC{};
 std::vector<nvinfer1::PluginField> IdentityPluginCreator::mPluginAttributes;
 
 IdentityPlugin::IdentityPlugin() {}
 
 // Parameterized constructor
-IdentityPlugin::IdentityPlugin(const void* data, size_t length)
+IdentityPlugin::IdentityPlugin(void const* data, size_t length)
 {
-    const char *d = reinterpret_cast<const char*>(data), *a = d;
-    TLLM_CHECK(d == a + length);
+    char const *d = reinterpret_cast<char const*>(data), *a = d;
+    TLLM_CHECK_WITH_INFO(d == a + length,
+        "Expected length (%d) != real length (%d). This is often "
+        "caused by using different TensorRT-LLM version to build "
+        "engine and run engine.",
+        (int) length, (int) (d - a));
 }
 
 // IPluginV2DynamicExt Methods
@@ -43,64 +48,45 @@ nvinfer1::IPluginV2DynamicExt* IdentityPlugin::clone() const noexcept
 }
 
 nvinfer1::DimsExprs IdentityPlugin::getOutputDimensions(
-    int outputIndex, const nvinfer1::DimsExprs* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
+    int outputIndex, nvinfer1::DimsExprs const* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
 {
     return inputs[outputIndex];
 }
 
 bool IdentityPlugin::supportsFormatCombination(
-    int pos, const nvinfer1::PluginTensorDesc* inOut, int nbInputs, int nbOutputs) noexcept
+    int pos, nvinfer1::PluginTensorDesc const* inOut, int nbInputs, int nbOutputs) noexcept
 {
     assert(0 <= pos && pos < 2);
-    const PluginTensorDesc& input = inOut[0];
-    const PluginTensorDesc& output = inOut[1];
+    PluginTensorDesc const& input = inOut[0];
+    PluginTensorDesc const& output = inOut[1];
     switch (pos)
     {
-    case 0:
-        return (input.type == DataType::kHALF || input.type == DataType::kFLOAT
-#ifdef ENABLE_BF16
-                   || input.type == DataType::kBF16
-#endif
-                   )
-            && input.format == nvinfer1::TensorFormat::kLINEAR;
+    case 0: return input.format == nvinfer1::TensorFormat::kLINEAR;
     case 1: return output.type == input.type && output.format == nvinfer1::TensorFormat::kLINEAR;
     }
     return false;
 }
 
-void IdentityPlugin::configurePlugin(const nvinfer1::DynamicPluginTensorDesc* in, int nbInputs,
-    const nvinfer1::DynamicPluginTensorDesc* out, int nbOutputs) noexcept
+void IdentityPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int nbInputs,
+    nvinfer1::DynamicPluginTensorDesc const* out, int nbOutputs) noexcept
 {
 }
 
-size_t IdentityPlugin::getWorkspaceSize(const nvinfer1::PluginTensorDesc* inputs, int nbInputs,
-    const nvinfer1::PluginTensorDesc* outputs, int nbOutputs) const noexcept
+size_t IdentityPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* inputs, int nbInputs,
+    nvinfer1::PluginTensorDesc const* outputs, int nbOutputs) const noexcept
 {
     return 0;
 }
 
-int IdentityPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const nvinfer1::PluginTensorDesc* outputDesc,
-    const void* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
+int IdentityPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
+    void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
 {
     size_t count = 1;
     for (int i = 0; i < inputDesc[0].dims.nbDims; ++i)
     {
         count *= inputDesc[0].dims.d[i];
     }
-    if (inputDesc[0].type == DataType::kHALF)
-    {
-        count *= sizeof(half);
-    }
-    else if (inputDesc[0].type == DataType::kFLOAT)
-    {
-        count *= sizeof(float);
-    }
-#ifdef ENABLE_BF16
-    else if (inputDesc[0].type == DataType::kBF16)
-    {
-        count *= sizeof(__nv_bfloat16);
-    }
-#endif
+    count *= tensorrt_llm::runtime::BufferDataType(inputDesc[0].type).getSize();
 
     cudaMemcpyAsync(outputs[0], inputs[0], count, cudaMemcpyDeviceToDevice, stream);
 
@@ -109,7 +95,7 @@ int IdentityPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const n
 
 // IPluginV2Ext Methods
 nvinfer1::DataType IdentityPlugin::getOutputDataType(
-    int index, const nvinfer1::DataType* inputTypes, int nbInputs) const noexcept
+    int index, nvinfer1::DataType const* inputTypes, int nbInputs) const noexcept
 {
     assert(index == 0);
     return inputTypes[0];
@@ -117,12 +103,12 @@ nvinfer1::DataType IdentityPlugin::getOutputDataType(
 
 // IPluginV2 Methods
 
-const char* IdentityPlugin::getPluginType() const noexcept
+char const* IdentityPlugin::getPluginType() const noexcept
 {
     return IDENTITY_PLUGIN_NAME;
 }
 
-const char* IdentityPlugin::getPluginVersion() const noexcept
+char const* IdentityPlugin::getPluginVersion() const noexcept
 {
     return IDENTITY_PLUGIN_VERSION;
 }
@@ -162,22 +148,22 @@ IdentityPluginCreator::IdentityPluginCreator()
     mFC.fields = mPluginAttributes.data();
 }
 
-const char* IdentityPluginCreator::getPluginName() const noexcept
+char const* IdentityPluginCreator::getPluginName() const noexcept
 {
     return IDENTITY_PLUGIN_NAME;
 }
 
-const char* IdentityPluginCreator::getPluginVersion() const noexcept
+char const* IdentityPluginCreator::getPluginVersion() const noexcept
 {
     return IDENTITY_PLUGIN_VERSION;
 }
 
-const PluginFieldCollection* IdentityPluginCreator::getFieldNames() noexcept
+PluginFieldCollection const* IdentityPluginCreator::getFieldNames() noexcept
 {
     return &mFC;
 }
 
-IPluginV2* IdentityPluginCreator::createPlugin(const char* name, const PluginFieldCollection* fc) noexcept
+IPluginV2* IdentityPluginCreator::createPlugin(char const* name, PluginFieldCollection const* fc) noexcept
 {
     try
     {
@@ -185,7 +171,7 @@ IPluginV2* IdentityPluginCreator::createPlugin(const char* name, const PluginFie
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }
-    catch (const std::exception& e)
+    catch (std::exception const& e)
     {
         caughtError(e);
     }
@@ -193,7 +179,7 @@ IPluginV2* IdentityPluginCreator::createPlugin(const char* name, const PluginFie
 }
 
 IPluginV2* IdentityPluginCreator::deserializePlugin(
-    const char* name, const void* serialData, size_t serialLength) noexcept
+    char const* name, void const* serialData, size_t serialLength) noexcept
 {
     // This object will be deleted when the network is destroyed, which will
     // call IdentityPlugin::destroy()
@@ -203,7 +189,7 @@ IPluginV2* IdentityPluginCreator::deserializePlugin(
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }
-    catch (const std::exception& e)
+    catch (std::exception const& e)
     {
         caughtError(e);
     }

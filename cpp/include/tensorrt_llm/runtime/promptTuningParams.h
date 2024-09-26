@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,13 +16,10 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
-#include "tensorrt_llm/runtime/tllmBuffers.h"
 
-#include <optional>
 #include <utility>
 
 namespace tensorrt_llm::runtime
@@ -33,7 +30,7 @@ class GenericPromptTuningParams
 {
 public:
     using TensorPtr = TTensor;
-    using SizeType = tensorrt_llm::runtime::SizeType;
+    using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
     explicit GenericPromptTuningParams(
         TensorPtr embeddingTable = TensorPtr(), TensorPtr tasks = TensorPtr(), TensorPtr vocabSize = TensorPtr())
@@ -46,7 +43,7 @@ public:
     // In GenerationInput, tasks expected shape is [batchSize]
     // For context requests with non-packed inputs, expected shape is [batchSize, 1]
     // For generation requests with non-packed inputs, expected shape is [batchSize*beamWidth] for generation requests.
-    // For packed inputs, expected shape is [1, packedLength] (note that ifb currently doesn't support non-packed
+    // For packed inputs, expected shape is [packedLength] (note that ifb currently doesn't support non-packed
     // inputs)
     TensorPtr tasks;
     TensorPtr vocabSize; // [1], on gpu
@@ -59,7 +56,7 @@ class PromptTuningParams : public GenericPromptTuningParams<ITensor::SharedPtr>
 {
 public:
     using TensorPtr = ITensor::SharedPtr;
-    using SizeType = GenericPromptTuningParams::SizeType;
+    using SizeType32 = GenericPromptTuningParams::SizeType32;
 
     explicit PromptTuningParams(
         TensorPtr embeddingTable = nullptr, TensorPtr tasks = nullptr, TensorPtr vocabSize = nullptr)
@@ -69,8 +66,8 @@ public:
 
     // Fill the tasks tensor for the batch using the provided tasksHost
     // Function assumes that the first numContextRequests requests in the batch are context requests
-    void fillTasksTensor(TensorPtr tasksHost, const SizeType batchSize, const SizeType numContextRequests,
-        const std::vector<SizeType>& reqBeamWidths, const std::vector<SizeType>& reqPromptLengths,
+    void fillTasksTensor(TensorPtr tasksHost, const SizeType32 batchSize, const SizeType32 numContextRequests,
+        std::vector<SizeType32> const& reqBeamWidths, std::vector<SizeType32> const& reqPromptLengths,
         BufferManager const& manager, bool packedInput);
 };
 

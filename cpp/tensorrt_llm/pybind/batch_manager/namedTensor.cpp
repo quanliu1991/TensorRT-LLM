@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,7 +29,7 @@ namespace tb = tensorrt_llm::batch_manager;
 namespace tensorrt_llm::pybind::batch_manager
 {
 
-NamedTensor::NamedTensor(const tb::NamedTensor& cppNamedTensor)
+NamedTensor::NamedTensor(tb::NamedTensor const& cppNamedTensor)
     : Base(runtime::Torch::tensor(cppNamedTensor.tensor), cppNamedTensor.name)
 {
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,14 +22,19 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include <NvInferRuntime.h>
 
-#include <cstdint>
+#include <cstring>
 #include <memory>
-#include <stdexcept>
 #include <string>
 #include <vector>
 
+class BufferManagerTest;
+
 namespace tensorrt_llm::runtime
 {
+
+/// @brief Forward declaration as only used through pointer.
+class CudaMemPool;
+
 //! \brief A helper class for managing memory on host and device.
 class BufferManager
 {
@@ -39,20 +44,36 @@ public:
     using ITensorPtr = ITensor::UniquePtr;
 
     using CudaStreamPtr = std::shared_ptr<CudaStream>;
+    using CudaMemPoolPtr = std::shared_ptr<CudaMemPool>;
 
     //! \brief Construct a BufferManager.
     //!
     //! \param[in] cudaStream The cuda stream to use for all operations on GPU (allocation, de-allocation, copying,
     //! etc.).
-    explicit BufferManager(CudaStreamPtr stream);
+    explicit BufferManager(CudaStreamPtr stream, bool trimPool = false);
+
+    //! \brief Destructor.
+    ~BufferManager()
+    {
+        if (mTrimPool)
+        {
+            memoryPoolTrimTo(0);
+        }
+    }
 
     static auto constexpr kBYTE_TYPE = nvinfer1::DataType::kUINT8;
 
-    //! \brief Allocates an `IBuffer` of the given size on the GPU.
+    //! \brief Allocates an `IBuffer` of the given size on the GPU, using cudaMallocAsync.
     [[nodiscard]] IBufferPtr gpu(std::size_t size, nvinfer1::DataType type = kBYTE_TYPE) const;
 
-    //! \brief Allocates an `ITensor` of the given dimensions on the GPU.
+    //! \brief Allocates an `ITensor` of the given dimensions on the GPU, using cudaMallocAsync.
     [[nodiscard]] ITensorPtr gpu(nvinfer1::Dims dims, nvinfer1::DataType type = kBYTE_TYPE) const;
+
+    //! \brief Allocates an `IBuffer` of the given size on the GPU, using cudaMalloc.
+    [[nodiscard]] static IBufferPtr gpuSync(std::size_t size, nvinfer1::DataType type = kBYTE_TYPE);
+
+    //! \brief Allocates an `ITensor` of the given dimensions on the GPU, using cudaMalloc.
+    [[nodiscard]] static ITensorPtr gpuSync(nvinfer1::Dims dims, nvinfer1::DataType type = kBYTE_TYPE);
 
     //! \brief Allocates an `IBuffer` of the given size on the CPU.
     [[nodiscard]] static IBufferPtr cpu(std::size_t size, nvinfer1::DataType type = kBYTE_TYPE);
@@ -65,6 +86,18 @@ public:
 
     //! \brief Allocates a pinned `ITensor` of the given dimensions on the CPU.
     [[nodiscard]] static ITensorPtr pinned(nvinfer1::Dims dims, nvinfer1::DataType type = kBYTE_TYPE);
+
+    //! \brief Allocates a pinned `IBuffer` of the given size on the CPU in the default memory pool.
+    [[nodiscard]] static IBufferPtr pinnedPool(std::size_t size, nvinfer1::DataType type = kBYTE_TYPE);
+
+    //! \brief Allocates a pinned `ITensor` of the given dimensions on the CPU in the default memory pool.
+    [[nodiscard]] static ITensorPtr pinnedPool(nvinfer1::Dims dims, nvinfer1::DataType type = kBYTE_TYPE);
+
+    //! \brief Allocates an `IBuffer` of the given size in UVM.
+    [[nodiscard]] static IBufferPtr managed(std::size_t size, nvinfer1::DataType type = kBYTE_TYPE);
+
+    //! \brief Allocates an `ITensor` of the given dimensions in UVM.
+    [[nodiscard]] static ITensorPtr managed(nvinfer1::Dims dims, nvinfer1::DataType type = kBYTE_TYPE);
 
     //! \brief Allocates an `IBuffer` of the given size and memory type.
     [[nodiscard]] IBufferPtr allocate(
@@ -85,6 +118,9 @@ public:
     {
         return allocate(memoryType, ITensor::makeShape({}), type);
     }
+
+    //! \brief Set the contents of the given `buffer` to value.
+    void setMem(IBuffer& buffer, int32_t value) const;
 
     //! \brief Set the contents of the given `buffer` to zero.
     void setZero(IBuffer& buffer) const;
@@ -161,20 +197,11 @@ public:
     void memoryPoolTrimTo(std::size_t size);
 
 private:
-    void static initMemoryPool(int device);
-
-    std::size_t static memoryPoolReserved(int device);
-
-    std::size_t static memoryPoolUsed(int device);
-
-    std::size_t static memoryPoolFree(int device)
-    {
-        return memoryPoolReserved(device) - memoryPoolUsed(device);
-    }
-
-    void static memoryPoolTrimTo(int device, std::size_t size);
+    friend class ::BufferManagerTest;
 
     CudaStreamPtr mStream;
+    CudaMemPoolPtr mPool;
+    bool const mTrimPool;
 };
 
 } // namespace tensorrt_llm::runtime

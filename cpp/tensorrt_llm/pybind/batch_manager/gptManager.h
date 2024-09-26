@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,40 +16,45 @@
  */
 
 #pragma once
+
 #include "inferenceRequest.h"
 #include "namedTensor.h"
 #include "tensorrt_llm/batch_manager/GptManager.h"
 #include "tensorrt_llm/batch_manager/callbacks.h"
-#include <pybind11/functional.h>
 
 #include <ATen/ops/tensor.h>
 #include <functional>
+#include <memory>
+#include <pybind11/functional.h>
 
 namespace tensorrt_llm::pybind::batch_manager
 {
 
 using GetInferenceRequestsCallback = std::function<std::list<InferenceRequest>(int32_t)>;
-using SendResponseCallback = std::function<void(uint64_t, std::list<NamedTensor> const&, bool, const std::string&)>;
+using SendResponseCallback = std::function<void(uint64_t, std::list<NamedTensor> const&, bool, std::string const&)>;
 
-tensorrt_llm::batch_manager::GetInferenceRequestsCallback callbackAdapter(GetInferenceRequestsCallback callback);
-tensorrt_llm::batch_manager::SendResponseCallback callbackAdapter(SendResponseCallback callback);
+tensorrt_llm::batch_manager::GetInferenceRequestsCallback callbackAdapter(GetInferenceRequestsCallback const& callback);
+tensorrt_llm::batch_manager::SendResponseCallback callbackAdapter(SendResponseCallback const& callback);
 
-class GptManager : tensorrt_llm::batch_manager::GptManager
+class GptManager
 {
 public:
     GptManager(std::filesystem::path const& trtEnginePath, tensorrt_llm::batch_manager::TrtGptModelType modelType,
-        int32_t maxBeamWidth, tensorrt_llm::batch_manager::batch_scheduler::SchedulerPolicy schedulerPolicy,
-        GetInferenceRequestsCallback getInferenceRequestsCb, SendResponseCallback sendResponseCb,
-        tensorrt_llm::batch_manager::PollStopSignalCallback pollStopSignalCb = nullptr,
-        tensorrt_llm::batch_manager::ReturnBatchManagerStatsCallback returnBatchManagerStatsCb = nullptr,
-        const tensorrt_llm::batch_manager::TrtGptModelOptionalParams& optionalParams
+        GetInferenceRequestsCallback const& getInferenceRequestsCb, SendResponseCallback const& sendResponseCb,
+        tensorrt_llm::batch_manager::PollStopSignalCallback const& pollStopSignalCb = nullptr,
+        tensorrt_llm::batch_manager::ReturnBatchManagerStatsCallback const& returnBatchManagerStatsCb = nullptr,
+        tensorrt_llm::batch_manager::TrtGptModelOptionalParams const& optionalParams
         = tensorrt_llm::batch_manager::TrtGptModelOptionalParams(),
         std::optional<uint64_t> terminateReqId = std::nullopt);
 
     pybind11::object enter();
     void exit(pybind11::handle type, pybind11::handle value, pybind11::handle traceback);
+    void shutdown();
 
     static void initBindings(pybind11::module_& m);
+
+private:
+    std::unique_ptr<tensorrt_llm::batch_manager::GptManager> mManager;
 };
 
 } // namespace tensorrt_llm::pybind::batch_manager

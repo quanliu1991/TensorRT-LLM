@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,17 +14,20 @@
 # limitations under the License.
 from .activation import Mish
 from .attention import (Attention, AttentionMaskType, AttentionParams,
-                        BertAttention, KeyValueCacheParams,
-                        PositionEmbeddingType)
+                        BertAttention, BlockSparseAttnParams, CogVLMAttention,
+                        KeyValueCacheParams, PositionEmbeddingType,
+                        SpecDecodingParams)
 from .cast import Cast
 from .conv import Conv1d, Conv2d, ConvTranspose2d
 from .embedding import Embedding, PromptTuningEmbedding
 from .linear import ColumnLinear, Linear, RowLinear
-from .lora import Lora, LoraParams, LoraRuntimeParam
+from .lora import Lora, LoraParams, LoraRuntimeParams
 from .mlp import MLP, FusedGatedMLP, GatedMLP
-from .moe import MOE
+from .moe import MOE, MoeConfig, SharedMoE
 from .normalization import GroupNorm, LayerNorm, RmsNorm
 from .pooling import AvgPool2d
+from .recurrent import FusedRgLru, GroupedLinear, Recurrent, RgLru
+from .ssm import Mamba, Mamba2
 
 __all__ = [
     'LayerNorm',
@@ -36,6 +39,7 @@ __all__ = [
     'PositionEmbeddingType',
     'Attention',
     'BertAttention',
+    'CogVLMAttention',
     'GroupNorm',
     'Embedding',
     'PromptTuningEmbedding',
@@ -49,9 +53,19 @@ __all__ = [
     'FusedGatedMLP',
     'Cast',
     'AttentionParams',
+    'SpecDecodingParams',
     'KeyValueCacheParams',
+    'BlockSparseAttnParams',
     'Lora',
     'LoraParams',
-    'LoraRuntimeParam',
+    'LoraRuntimeParams',
     'MOE',
+    'MoeConfig',
+    'SharedMoE',
+    'Mamba',
+    'Mamba2',
+    'Recurrent',
+    'GroupedLinear',
+    'RgLru',
+    'FusedRgLru',
 ]

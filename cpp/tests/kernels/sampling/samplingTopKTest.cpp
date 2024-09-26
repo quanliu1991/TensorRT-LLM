@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 #error "Define TOP_LEVEL_DIR"
 #endif
 
+#include "tensorrt_llm/common/tllmException.h"
 #include "tests/kernels/sampling/samplingTest.h"
 #include <random>
 
@@ -35,40 +36,58 @@ class TopKSamplingKernelTest : public SamplingKernelTest<T>
 {
 
 protected:
-    const int32_t endId = 0;
+    int32_t const endId = 0;
     using SamplingKernelTest<T>::mSeed;
     using SamplingKernelTest<T>::mStream;
     using SamplingKernelTest<T>::mBufferManager;
 
-    size_t getWorkspaceSize(const SamplingKernelTestParam& params) override
+    size_t getWorkspaceSize(SamplingKernelTestParam const& params) override
     {
-        size_t workspaceSize;
-        tk::invokeTopKSampling<T>(nullptr, workspaceSize, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-            nullptr, this->mMaxTopK, 1.0f, params.vocabSize, nullptr, this->mStream->get(), params.batchSize, nullptr);
-        return workspaceSize;
+        return tk::getTopKWorkspaceSize<T>(params.batchSize, params.maxTokensPerStep, this->mMaxTopK, params.vocabSize);
     }
 
-    void callTestedFunction(const SamplingKernelTestParam& params, bool hasDiffRuntimeArgs, size_t workspaceSize,
-        tensorrt_llm::runtime::ITensor::SharedPtr& workspaceDevice) override
+    void callTestedFunction(
+        SamplingKernelTestParam const& params, tensorrt_llm::runtime::ITensor::SharedPtr& workspaceDevice) override
     {
+        auto const maxBatchSize = 2 * params.batchSize;
+
+        tk::TopKSamplingKernelParams<T> kernelParams;
+        kernelParams.logProbs = params.useLogitsPtrs ? nullptr : bufferCast<T>(*this->mProbsDevice);
+        kernelParams.logProbsPtrs = params.useLogitsPtrs
+            ? reinterpret_cast<T const* const*>(bufferCast<int64_t>(*this->mProbsPtrsDevice))
+            : nullptr;
+        kernelParams.outputIdsPtrs = bufferCast<int32_t*>(*this->mIdsPtrHost);
+        kernelParams.workspace = workspaceDevice->data();
+        kernelParams.maxTopP = params.topP;
+        kernelParams.topPs = bufferCast<float>(*this->mTopPsDevice);
+        kernelParams.maxTopK = this->mMaxTopK;
+        kernelParams.topKs = bufferCast<int32_t>(*this->mTopKsDevice);
+        kernelParams.sequenceLengths = bufferCast<int32_t>(*this->mSeqLengthsDevice);
+        kernelParams.endIds = bufferCast<int32_t>(*this->mEndIdsDevice);
+        kernelParams.batchSlots = bufferCast<int32_t>(*this->mBatchSlots);
+        kernelParams.finishedInput = reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
+            bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(*this->mFinishedDevice));
+        kernelParams.finishedOutput = reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
+            bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(*this->mFinishedDevice));
+        kernelParams.skipDecode = bufferCast<bool>(*this->mSkipDecodeDevice);
+        kernelParams.cumLogProbs = params.returnAllTopK || params.maxTokensPerStep > 1
+            ? nullptr
+            : bufferCast<float>(*this->mCumLogProbsDevice);
+        kernelParams.outputLogProbs = params.returnAllTopK || params.maxTokensPerStep > 1
+            ? nullptr
+            : bufferCast<float>(*this->mOutputLogProbsDevice);
+        kernelParams.curandState = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*this->mCurandStatesDevice));
+        kernelParams.batchSize = params.batchSize;
+        kernelParams.maxBatchSize = maxBatchSize;
+        kernelParams.maxTokensPerStep = params.maxTokensPerStep;
+        kernelParams.tokensPerStep = bufferCast<int32_t>(*this->mTokensPerStep);
+        kernelParams.vocabSizePadded = params.vocabSize;
+        kernelParams.normalizeLogProbs = params.normalizeLogProbs;
+        kernelParams.logitsHasProbs = params.logitsHasProbs;
+        kernelParams.returnAllTopK = params.returnAllTopK;
+
         // Perform batched TopK sampling
-        tk::invokeBatchTopKSampling(workspaceDevice->data(), workspaceSize,
-            // Note that the kernel needs vocab probs instead of
-            // log-prob if cum_log_probs or output_log_probs are
-            // provided. It's because the sampling layer already
-            // preprocesses log_prob_buf when those are provided.
-            bufferCast<T>(*this->mProbsDevice), bufferCast<int*>(*this->mIdsPtrHost),
-            bufferCast<int32_t>(*this->mSeqLengthsDevice),
-            reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
-                bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(*this->mFinishedDevice)),
-            reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
-                bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(*this->mFinishedDevice)),
-            bufferCast<float>(*this->mCumLogProbsDevice), bufferCast<float>(*this->mOutputLogProbsDevice),
-            this->mCurandStatesDevice, this->mMaxTopK,
-            hasDiffRuntimeArgs ? bufferCast<int32_t>(*this->mTopKsDevice) : nullptr, params.topP,
-            hasDiffRuntimeArgs ? bufferCast<float>(*this->mTopPsDevice) : nullptr, params.vocabSize,
-            bufferCast<int32_t>(*this->mEndIdsDevice), this->mStream->get(), params.batchSize,
-            bufferCast<bool>(*this->mSkipDecodeDevice));
+        tk::invokeBatchTopKSampling(kernelParams, this->mStream->get());
     }
 };
 
@@ -76,44 +95,66 @@ TYPED_TEST_SUITE(TopKSamplingKernelTest, FloatAndHalfTypes);
 
 TYPED_TEST(TopKSamplingKernelTest, CorrectnessGreedy)
 {
-    this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopK(1).setTopP(1.0f).setOutputLen(1));
+    this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopK(1).setTopP(1.0f));
 };
 
 TYPED_TEST(TopKSamplingKernelTest, CorrectnessGreedyLarge)
 {
-    this->runTest(
-        SamplingKernelTestParam().setBatchSize(16).setVocabSize(51200).setTopK(1).setTopP(1.0f).setOutputLen(8));
+    this->runTest(SamplingKernelTestParam().setBatchSize(16).setVocabSize(51200).setTopK(1).setTopP(1.0f));
 };
 
 TYPED_TEST(TopKSamplingKernelTest, CorrectnessAncestral)
 {
-    this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopK(4).setTopP(1.0f).setOutputLen(1));
+    this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopK(4).setTopP(1.0f));
 };
 
 TYPED_TEST(TopKSamplingKernelTest, CorrectnessLargeK63)
 {
-    this->runTest(
-        SamplingKernelTestParam().setBatchSize(16).setVocabSize(51200).setTopK(63).setTopP(1.0f).setOutputLen(8));
+    this->runTest(SamplingKernelTestParam().setBatchSize(16).setVocabSize(51200).setTopK(63).setTopP(1.0f));
 };
 
 TYPED_TEST(TopKSamplingKernelTest, CorrectnessLargeK1024)
 {
-    this->runTest(
-        SamplingKernelTestParam().setBatchSize(16).setVocabSize(51200).setTopK(1024).setTopP(1.0f).setOutputLen(8));
+    this->runTest(SamplingKernelTestParam().setBatchSize(16).setVocabSize(51200).setTopK(1024).setTopP(1.0f));
 };
 
 TYPED_TEST(TopKSamplingKernelTest, CorrectnessTopKTopP)
 {
-    this->runTest(
-        SamplingKernelTestParam().setBatchSize(16).setVocabSize(4000).setTopK(63).setTopP(0.3f).setOutputLen(8));
+    this->runTest(SamplingKernelTestParam().setBatchSize(16).setVocabSize(4000).setTopK(63).setTopP(0.3f));
 };
 
 TYPED_TEST(TopKSamplingKernelTest, NotSupportedLargerThanK1024)
 {
     EXPECT_THROW(
-        this->runTest(
-            SamplingKernelTestParam().setBatchSize(16).setVocabSize(4000).setTopK(1025).setTopP(1.0f).setOutputLen(8)),
-        std::domain_error);
+        this->runTest(SamplingKernelTestParam().setBatchSize(16).setVocabSize(4000).setTopK(1025).setTopP(1.0f)),
+        tensorrt_llm::common::TllmException);
 };
 
+TYPED_TEST(TopKSamplingKernelTest, CorrectnessTopKMaxTokensPerStep)
+{
+    this->runTest(
+        SamplingKernelTestParam().setBatchSize(16).setVocabSize(4000).setTopK(63).setTopP(1.0f).setMaxTokensPerStep(4));
+};
+
+TYPED_TEST(TopKSamplingKernelTest, CorrectnessReturnAllTopK)
+{
+    this->runTest(SamplingKernelTestParam()
+                      .setBatchSize(16)
+                      .setVocabSize(50)
+                      .setTopK(10)
+                      .setTopP(1.0f)
+                      .setMaxTokensPerStep(4)
+                      .setReturnAllTopK());
+};
+
+TYPED_TEST(TopKSamplingKernelTest, CorrectnessLogitsPtrs)
+{
+    this->runTest(SamplingKernelTestParam()
+                      .setBatchSize(16)
+                      .setVocabSize(50)
+                      .setTopK(10)
+                      .setTopP(1.0f)
+                      .setMaxTokensPerStep(4)
+                      .setUseLogitsPtrs());
+};
 } // end of namespace

@@ -5,7 +5,7 @@ import argparse
 import glob
 import logging
 import os
-import subprocess
+import subprocess  # nosec B404
 import sys
 from dataclasses import dataclass
 from typing import ClassVar, Iterable, List, Optional, Tuple, Union
@@ -15,11 +15,11 @@ try:
 except ImportError:
     raise ImportError("Triton is not installed. Please install it first.")
 
-from tensorrt_llm.tools.plugin_gen.core import (KernelMetaData,
-                                                PluginCmakeCodegen,
-                                                PluginCppCodegen,
-                                                PluginPyCodegen,
-                                                PluginRegistryCodegen)
+# isort: off
+from tensorrt_llm.tools.plugin_gen.core import (
+    KernelMetaData, PluginCmakeCodegen, PluginCppCodegen, PluginPyCodegen,
+    PluginRegistryCodegen, copy_common_files)
+# isort: on
 
 PYTHON_BIN = sys.executable
 
@@ -210,6 +210,7 @@ class Stage:
         PluginRegistryCodegen(out_path=os.path.join(self.config.sub_workspace,
                                                     'tritonPlugins.cpp'),
                               plugin_names=kernel_names).generate()
+        copy_common_files(self.config.sub_workspace)
         PluginCmakeCodegen(out_path=os.path.join(self.config.sub_workspace,
                                                  'CMakeLists.txt'),
                            plugin_names=kernel_names,
@@ -264,7 +265,7 @@ def gen_trt_plugins(workspace: str,
                     metas: List[KernelMetaData],
                     trt_lib_dir: Optional[str] = None,
                     trt_include_dir: Optional[str] = None,
-                    trt_llm_inlcude_dir: Optional[str] = None):
+                    trt_llm_include_dir: Optional[str] = None):
     '''
     Generate TRT plugins end-to-end.
     '''
@@ -278,7 +279,7 @@ def gen_trt_plugins(workspace: str,
         workspace=workspace,
         trt_lib_dir=trt_lib_dir,
         trt_include_dir=trt_include_dir,
-        trt_llm_include_dir=trt_llm_inlcude_dir,
+        trt_llm_include_dir=trt_llm_include_dir,
     )
     Stage(compile_args).run()
     Stage(metas[0].to_CopyOutputArgs(workspace)).run()
@@ -369,5 +370,5 @@ if __name__ == '__main__':
     gen_trt_plugins(workspace=args.workspace,
                     trt_lib_dir=args.trt_lib_dir,
                     trt_include_dir=args.trt_include_dir,
-                    trt_llm_inlcude_dir=args.trt_llm_include_dir,
+                    trt_llm_include_dir=args.trt_llm_include_dir,
                     metas=kernel_configs)

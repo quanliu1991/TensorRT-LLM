@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -19,27 +19,42 @@ set(SRCS
     utils/sessionUtils.cpp
     utils/debugUtils.cu
     bufferManager.cpp
+    cudaMemPool.cpp
+    decodingLayerWorkspace.cpp
+    explicitDraftTokensBuffers.cpp
+    lookaheadBuffers.cpp
+    layerProfiler.cpp
+    loraManager.cpp
+    loraUtils.cpp
+    loraModule.cpp
+    loraCache.cpp
     decodingOutput.cpp
+    generationConfig.cpp
     gptDecoder.cpp
-    gptDecoderBatch.cpp
+    gptDecoderBatched.cpp
     gptJsonConfig.cpp
     gptSession.cpp
     iBuffer.cpp
     iTensor.cpp
     ipcUtils.cpp
     memoryCounters.cpp
+    medusaModule.cpp
     ncclCommunicator.cpp
     promptTuningParams.cpp
     runtimeBuffers.cpp
     runtimeKernels.cu
+    rnnStateBuffers.cpp
     statefulGptDecoder.cpp
+    tllmBuffers.cpp
     tllmRuntime.cpp
     tllmLogger.cpp
+    transformerBuffers.cpp
+    workerPool.cpp
     worldConfig.cpp)
 
 include_directories(${API_INCLUDE_DIR}/tensorrt_llm/runtime)
 
-if(NOT MSVC)
+if(NOT WIN32)
   # additional warnings
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall")
   if(WARNING_IS_ERROR)
@@ -55,8 +70,8 @@ add_library(runtime_src OBJECT ${SRCS})
 set_property(TARGET runtime_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET runtime_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
-target_include_directories(runtime_src PRIVATE ${MPI_INCLUDE_PATH})
+target_include_directories(runtime_src PRIVATE ${MPI_C_INCLUDE_DIRS})
 
-if(ENABLE_MULTI_DEVICE EQUAL 1)
+if(ENABLE_MULTI_DEVICE)
   target_link_libraries(runtime_src PUBLIC ${NCCL_LIB})
 endif()

@@ -27,8 +27,8 @@ using namespace tensorrt_llm::common;
 using tensorrt_llm::plugins::LookupPluginCreator;
 using tensorrt_llm::plugins::LookupPlugin;
 
-static const char* LOOKUP_PLUGIN_VERSION{"1"};
-static const char* LOOKUP_PLUGIN_NAME{"Lookup"};
+static char const* LOOKUP_PLUGIN_VERSION{"1"};
+static char const* LOOKUP_PLUGIN_NAME{"Lookup"};
 PluginFieldCollection LookupPluginCreator::mFC{};
 std::vector<nvinfer1::PluginField> LookupPluginCreator::mPluginAttributes;
 
@@ -36,15 +36,21 @@ LookupPlugin::LookupPlugin(nvinfer1::DataType type, int rank)
     : mType(type)
     , mRank(rank)
 {
+    mArch = tensorrt_llm::common::getSMVersion();
 }
 
 // Parameterized constructor
-LookupPlugin::LookupPlugin(const void* data, size_t length)
+LookupPlugin::LookupPlugin(void const* data, size_t length)
 {
-    const char *d = reinterpret_cast<const char*>(data), *a = d;
+    mArch = tensorrt_llm::common::getSMVersion();
+    char const *d = reinterpret_cast<char const*>(data), *a = d;
     read(d, mType);
     read(d, mRank);
-    TLLM_CHECK(d == a + length);
+    TLLM_CHECK_WITH_INFO(d == a + length,
+        "Expected length (%d) != real length (%d). This is often "
+        "caused by using different TensorRT-LLM version to build "
+        "engine and run engine.",
+        (int) length, (int) (d - a));
 }
 
 // IPluginV2DynamicExt Methods
@@ -57,15 +63,15 @@ nvinfer1::IPluginV2DynamicExt* LookupPlugin::clone() const noexcept
 }
 
 nvinfer1::DimsExprs LookupPlugin::getOutputDimensions(
-    int outputIndex, const nvinfer1::DimsExprs* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
+    int outputIndex, nvinfer1::DimsExprs const* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
 {
     try
     {
-        TLLM_CHECK(nbInputs == 2);
+        TLLM_CHECK(nbInputs == 2 || nbInputs == 3);
         TLLM_CHECK(outputIndex == 0);
         DimsExprs ret;
-        const int nbDimsInput = inputs[0].nbDims;
-        const int nbDimsWeight = inputs[1].nbDims;
+        int const nbDimsInput = inputs[0].nbDims;
+        int const nbDimsWeight = inputs[1].nbDims;
         ret.nbDims = nbDimsInput + 1;
 
         for (int i = 0; i < nbDimsInput; ++i)
@@ -76,7 +82,7 @@ nvinfer1::DimsExprs LookupPlugin::getOutputDimensions(
 
         return ret;
     }
-    catch (const std::exception& e)
+    catch (std::exception const& e)
     {
         caughtError(e);
     }
@@ -84,91 +90,143 @@ nvinfer1::DimsExprs LookupPlugin::getOutputDimensions(
 }
 
 bool LookupPlugin::supportsFormatCombination(
-    int pos, const nvinfer1::PluginTensorDesc* inOut, int nbInputs, int nbOutputs) noexcept
+    int pos, nvinfer1::PluginTensorDesc const* inOut, int nbInputs, int nbOutputs) noexcept
 {
     bool res = false;
-    switch (pos)
+    if (nbInputs == 2)
     {
-    case 0: res = ((inOut[0].type == DataType::kINT32) && (inOut[0].format == TensorFormat::kLINEAR)); break;
-    case 1: res = ((inOut[1].type == mType) && (inOut[1].format == TensorFormat::kLINEAR)); break;
-    case 2: res = ((inOut[2].type == mType) && (inOut[2].format == TensorFormat::kLINEAR)); break;
-    default: // should NOT be here!
-        res = false;
+        switch (pos)
+        {
+        case 0: res = ((inOut[0].type == DataType::kINT32) && (inOut[0].format == TensorFormat::kLINEAR)); break;
+        case 1: res = ((inOut[1].type == mType) && (inOut[1].format == TensorFormat::kLINEAR)); break;
+        case 2: res = ((inOut[2].type == mType) && (inOut[2].format == TensorFormat::kLINEAR)); break;
+        default: // should NOT be here!
+            res = false;
+        }
     }
-
+    else
+    {
+        TLLM_CHECK_WITH_INFO(mArch == 90, "int8 weight only lookupPlugin is only supported in SM 90 now.");
+        switch (pos)
+        {
+        case 0: res = ((inOut[0].type == DataType::kINT32) && (inOut[0].format == TensorFormat::kLINEAR)); break;
+        case 1:
+            res = ((inOut[1].type == DataType::kINT8 || inOut[1].type == mType)
+                && (inOut[1].format == TensorFormat::kLINEAR));
+            break;
+        case 2: res = ((inOut[2].type == mType) && (inOut[2].format == TensorFormat::kLINEAR)); break;
+        case 3: res = ((inOut[3].type == mType) && (inOut[3].format == TensorFormat::kLINEAR)); break;
+        default: // should NOT be here!
+            res = false;
+        }
+    }
     return res;
 }
 
-void LookupPlugin::configurePlugin(const nvinfer1::DynamicPluginTensorDesc* in, int nbInputs,
-    const nvinfer1::DynamicPluginTensorDesc* out, int nbOutputs) noexcept
+void LookupPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int nbInputs,
+    nvinfer1::DynamicPluginTensorDesc const* out, int nbOutputs) noexcept
 {
+    mNbInputs = nbInputs;
 }
 
-size_t LookupPlugin::getWorkspaceSize(const nvinfer1::PluginTensorDesc* inputs, int nbInputs,
-    const nvinfer1::PluginTensorDesc* outputs, int nbOutputs) const noexcept
+size_t LookupPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* inputs, int nbInputs,
+    nvinfer1::PluginTensorDesc const* outputs, int nbOutputs) const noexcept
 {
     return 0;
 }
 
-int LookupPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const nvinfer1::PluginTensorDesc* outputDesc,
-    const void* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
+int LookupPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
+    void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
 {
     // inputs
-    //     input  [batchSize]
+    //     input  [tokenNum]
     //     weight [localVocabSize, hidden]
+    //     per_token_scales [localVocabSize], optional
     // outputs
-    //     embedding [batchSize, hidden]
+    //     embedding [tokenNum, hidden]
 
-    int batchSize = 1;
+    int64_t tokenNum = 1;
     for (int i = 0; i < inputDesc[0].dims.nbDims; ++i)
     {
-        batchSize *= inputDesc[0].dims.d[i];
+        tokenNum *= inputDesc[0].dims.d[i];
     }
 
-    const int localVocabSize = inputDesc[1].dims.d[0];
-    const int hidden = inputDesc[1].dims.d[inputDesc[1].dims.nbDims - 1];
-    const int* input = reinterpret_cast<const int*>(inputs[0]);
+    int const localVocabSize = inputDesc[1].dims.d[0];
+    int const hidden = inputDesc[1].dims.d[inputDesc[1].dims.nbDims - 1];
+    int const* input = reinterpret_cast<int const*>(inputs[0]);
 
     int offset = mRank * localVocabSize;
 
-    if (mType == DataType::kHALF)
+    if (mNbInputs == 3)
     {
-        const half* weight = reinterpret_cast<const half*>(inputs[1]);
-        half* output = reinterpret_cast<half*>(outputs[0]);
-        invokeLookUp<half, int>(output, input, weight, batchSize, offset, localVocabSize, hidden, stream);
+        int8_t const* weight = reinterpret_cast<int8_t const*>(inputs[1]);
+        if (mType == DataType::kHALF)
+        {
+            half const* per_token_scales = reinterpret_cast<half const*>(inputs[2]);
+            half* output = reinterpret_cast<half*>(outputs[0]);
+            invokeLookUp<half, int8_t, int>(
+                output, input, weight, tokenNum, offset, localVocabSize, hidden, per_token_scales, stream);
+        }
+        else if (mType == DataType::kFLOAT)
+        {
+            float const* per_token_scales = reinterpret_cast<float const*>(inputs[2]);
+            float* output = reinterpret_cast<float*>(outputs[0]);
+            invokeLookUp<float, int8_t, int>(
+                output, input, weight, tokenNum, offset, localVocabSize, hidden, per_token_scales, stream);
+        }
+        else if (mType == DataType::kBF16)
+        {
+            __nv_bfloat16 const* per_token_scales = reinterpret_cast<__nv_bfloat16 const*>(inputs[2]);
+            __nv_bfloat16* output = reinterpret_cast<__nv_bfloat16*>(outputs[0]);
+            invokeLookUp<__nv_bfloat16, int8_t, int>(
+                output, input, weight, tokenNum, offset, localVocabSize, hidden, per_token_scales, stream);
+        }
     }
-    else if (mType == DataType::kFLOAT)
+    else
     {
-        const float* weight = reinterpret_cast<const float*>(inputs[1]);
-        float* output = reinterpret_cast<float*>(outputs[0]);
-        invokeLookUp<float, int>(output, input, weight, batchSize, offset, localVocabSize, hidden, stream);
+        if (mType == DataType::kHALF)
+        {
+            half const* weight = reinterpret_cast<half const*>(inputs[1]);
+            half* output = reinterpret_cast<half*>(outputs[0]);
+            invokeLookUp<half, half, int>(
+                output, input, weight, tokenNum, offset, localVocabSize, hidden, nullptr, stream);
+        }
+        else if (mType == DataType::kFLOAT)
+        {
+            float const* weight = reinterpret_cast<float const*>(inputs[1]);
+            float* output = reinterpret_cast<float*>(outputs[0]);
+            invokeLookUp<float, float, int>(
+                output, input, weight, tokenNum, offset, localVocabSize, hidden, nullptr, stream);
+        }
+        else if (mType == DataType::kBF16)
+        {
+            __nv_bfloat16 const* weight = reinterpret_cast<__nv_bfloat16 const*>(inputs[1]);
+            __nv_bfloat16* output = reinterpret_cast<__nv_bfloat16*>(outputs[0]);
+            invokeLookUp<__nv_bfloat16, __nv_bfloat16, int>(
+                output, input, weight, tokenNum, offset, localVocabSize, hidden, nullptr, stream);
+        }
     }
-    else if (mType == DataType::kBF16)
-    {
-        const __nv_bfloat16* weight = reinterpret_cast<const __nv_bfloat16*>(inputs[1]);
-        __nv_bfloat16* output = reinterpret_cast<__nv_bfloat16*>(outputs[0]);
-        invokeLookUp<__nv_bfloat16, int>(output, input, weight, batchSize, offset, localVocabSize, hidden, stream);
-    }
+    sync_check_cuda_error();
 
     return 0;
 }
 
 // IPluginV2Ext Methods
 nvinfer1::DataType LookupPlugin::getOutputDataType(
-    int index, const nvinfer1::DataType* inputTypes, int nbInputs) const noexcept
+    int index, nvinfer1::DataType const* inputTypes, int nbInputs) const noexcept
 {
     TLLM_CHECK(index == 0);
-    return inputTypes[1];
+    return mType;
 }
 
 // IPluginV2 Methods
 
-const char* LookupPlugin::getPluginType() const noexcept
+char const* LookupPlugin::getPluginType() const noexcept
 {
     return LOOKUP_PLUGIN_NAME;
 }
 
-const char* LookupPlugin::getPluginVersion() const noexcept
+char const* LookupPlugin::getPluginVersion() const noexcept
 {
     return LOOKUP_PLUGIN_VERSION;
 }
@@ -216,39 +274,39 @@ LookupPluginCreator::LookupPluginCreator()
     mFC.fields = mPluginAttributes.data();
 }
 
-const char* LookupPluginCreator::getPluginName() const noexcept
+char const* LookupPluginCreator::getPluginName() const noexcept
 {
     return LOOKUP_PLUGIN_NAME;
 }
 
-const char* LookupPluginCreator::getPluginVersion() const noexcept
+char const* LookupPluginCreator::getPluginVersion() const noexcept
 {
     return LOOKUP_PLUGIN_VERSION;
 }
 
-const PluginFieldCollection* LookupPluginCreator::getFieldNames() noexcept
+PluginFieldCollection const* LookupPluginCreator::getFieldNames() noexcept
 {
     return &mFC;
 }
 
-IPluginV2* LookupPluginCreator::createPlugin(const char* name, const PluginFieldCollection* fc) noexcept
+IPluginV2* LookupPluginCreator::createPlugin(char const* name, PluginFieldCollection const* fc) noexcept
 {
-    const PluginField* fields = fc->fields;
+    PluginField const* fields = fc->fields;
     nvinfer1::DataType type;
     int rank;
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {
-        const char* attrName = fields[i].name;
+        char const* attrName = fields[i].name;
         if (!strcmp(attrName, "type_id"))
         {
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
-            type = static_cast<nvinfer1::DataType>(*(static_cast<const nvinfer1::DataType*>(fields[i].data)));
+            type = static_cast<nvinfer1::DataType>(*(static_cast<nvinfer1::DataType const*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "rank"))
         {
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
-            rank = static_cast<int>(*(static_cast<const int*>(fields[i].data)));
+            rank = static_cast<int>(*(static_cast<int const*>(fields[i].data)));
         }
     }
     try
@@ -257,7 +315,7 @@ IPluginV2* LookupPluginCreator::createPlugin(const char* name, const PluginField
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }
-    catch (const std::exception& e)
+    catch (std::exception const& e)
     {
         caughtError(e);
     }
@@ -265,7 +323,7 @@ IPluginV2* LookupPluginCreator::createPlugin(const char* name, const PluginField
 }
 
 IPluginV2* LookupPluginCreator::deserializePlugin(
-    const char* name, const void* serialData, size_t serialLength) noexcept
+    char const* name, void const* serialData, size_t serialLength) noexcept
 {
     // This object will be deleted when the network is destroyed, which will
     // call LookupPlugin::destroy()
@@ -275,7 +333,7 @@ IPluginV2* LookupPluginCreator::deserializePlugin(
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }
-    catch (const std::exception& e)
+    catch (std::exception const& e)
     {
         caughtError(e);
     }

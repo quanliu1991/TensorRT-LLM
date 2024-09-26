@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,99 +12,148 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import numpy as np
+from typing import Optional
 
-from .._utils import trt_dtype_to_np
-from ..functional import ACT2FN
+import tensorrt as trt
+
+from .._common import default_net
+from ..functional import (ACT2FN, AllReduceFusionParams, cast, concat,
+                          gemm_swiglu, is_gated_activation)
 from ..module import Module
 from ..quantization import QuantMode
+from ..quantization.functional import quantize
 from ..quantization.layers import FP8Linear, FP8RowLinear
 from .linear import ColumnLinear, RowLinear
+from .lora import LoraRuntimeParams
+from .normalization import LayerNorm
+
+
+def fc_gate_lora(hidden_states, lora, lora_layer_params):
+    if lora_layer_params is not None:
+        mlp_fc_lora_params = lora_layer_params.get_runtime_params(
+            0, "mlp_h_to_4h")
+        mlp_gate_lora_params = lora_layer_params.get_runtime_params(
+            0, "mlp_gate")
+
+        if mlp_fc_lora_params is not None and mlp_gate_lora_params is not None:
+            mlp_in_lora_params = LoraRuntimeParams(
+                lora_ranks=[
+                    mlp_fc_lora_params.lora_ranks[0],
+                    mlp_gate_lora_params.lora_ranks[0]
+                ],
+                lora_weights_pointers=[
+                    mlp_fc_lora_params.lora_weights_pointers[0],
+                    mlp_gate_lora_params.lora_weights_pointers[0]
+                ],
+                host_request_types=mlp_fc_lora_params.host_request_types,
+                host_context_lengths=mlp_fc_lora_params.host_context_lengths)
+
+            mlp_fc_lora, mlp_gate_lora = lora(hidden_states, mlp_in_lora_params)
+            mlp_in_result = concat([mlp_gate_lora, mlp_fc_lora],
+                                   dim=mlp_fc_lora.rank() - 1)
+            return mlp_in_result
+    return None
 
 
 class MLP(Module):
 
-    def __init__(self,
-                 hidden_size,
-                 ffn_hidden_size,
-                 hidden_act,
-                 bias=True,
-                 dtype=None,
-                 tp_group=None,
-                 tp_size=1,
-                 quant_mode=QuantMode(0),
-                 instance_id: int = 0):
+    def __init__(
+        self,
+        hidden_size,
+        ffn_hidden_size,
+        hidden_act,
+        bias=True,
+        dtype=None,
+        tp_group=None,
+        tp_size=1,
+        quant_mode=QuantMode(0),
+        inner_layernorm=False,
+        eps=1e-05,
+        is_expert=False,
+    ):
         super().__init__()
         if hidden_act not in ACT2FN:
             raise ValueError(
                 'unsupported activation function: {}'.format(hidden_act))
-        fc_output_size = 2 * ffn_hidden_size if hidden_act == 'swiglu' else ffn_hidden_size
-        self.use_fp8_qdq = quant_mode.has_fp8_qdq()
+        fc_output_size = 2 * ffn_hidden_size if hidden_act in [
+            'swiglu', 'gegelu'
+        ] else ffn_hidden_size
+        self.inner_layernorm = LayerNorm(ffn_hidden_size, dtype=dtype,
+                                         eps=eps) if inner_layernorm else None
 
-        if self.use_fp8_qdq:
-            self.fc = FP8Linear(hidden_size,
-                                fc_output_size,
-                                bias=bias,
-                                dtype=dtype,
-                                tp_group=tp_group,
-                                tp_size=tp_size,
-                                gather_output=False)
-            self.proj = FP8RowLinear(ffn_hidden_size,
-                                     hidden_size,
-                                     bias=bias,
-                                     dtype=dtype,
-                                     tp_group=tp_group,
-                                     tp_size=tp_size,
-                                     instance_id=instance_id)
-        else:
-            self.fc = ColumnLinear(hidden_size,
-                                   fc_output_size,
-                                   bias=bias,
-                                   dtype=dtype,
-                                   tp_group=tp_group,
-                                   tp_size=tp_size,
-                                   gather_output=False)
-            self.proj = RowLinear(ffn_hidden_size,
-                                  hidden_size,
-                                  bias=bias,
-                                  dtype=dtype,
-                                  tp_group=tp_group,
-                                  tp_size=tp_size,
-                                  instance_id=instance_id)
+        self.fc = ColumnLinear(hidden_size,
+                               fc_output_size,
+                               bias=bias,
+                               dtype=dtype,
+                               tp_group=tp_group,
+                               tp_size=tp_size,
+                               gather_output=False)
+        self.proj = RowLinear(ffn_hidden_size,
+                              hidden_size,
+                              bias=bias,
+                              dtype=dtype,
+                              tp_group=tp_group,
+                              tp_size=tp_size,
+                              is_expert=is_expert)
 
+        self.hidden_size = hidden_size
+        self.ffn_hidden_size = ffn_hidden_size
         self.hidden_act = hidden_act
         self.dtype = dtype
+        self.bias = bias
+        self.tp_group = tp_group
+        self.tp_size = tp_size
+        self.quant_mode = quant_mode
+        self.eps = eps
+        self.is_expert = is_expert
+        # see optimize_model's add_lora for LoRA initialization
+        self.lora = None
 
-    def forward(self, hidden_states, workspace=None, lora_param=None):
-        mlp_h_to_4h_param = None
-        if lora_param is not None:
-            mlp_h_to_4h_param = lora_param.get_runtime_params(0, "mlp_h_to_4h")
+    def forward(self, hidden_states, lora_layer_params=None, gegelu_limit=None):
+        if is_gated_activation(self.hidden_act):
+            inter = self.fc(hidden_states)
+            lora_result = fc_gate_lora(hidden_states, self.lora,
+                                       lora_layer_params)
+            if lora_result is not None:
+                inter = inter + lora_result
+        else:
+            mlp_fc_lora_params = None
+            if lora_layer_params is not None:
+                mlp_fc_lora_params = lora_layer_params.get_runtime_params(
+                    0, "mlp_h_to_4h")
+            inter = self.fc(hidden_states, mlp_fc_lora_params)
 
-        mlp_4h_to_h_param = None
-        if lora_param is not None:
-            mlp_4h_to_h_param = lora_param.get_runtime_params(0, "mlp_4h_to_h")
+        mlp_proj_lora_params = None
+        if lora_layer_params is not None:
+            mlp_proj_lora_params = lora_layer_params.get_runtime_params(
+                0, "mlp_4h_to_h")
 
-        inter = self.fc(hidden_states, mlp_h_to_4h_param)
-        inter = ACT2FN[self.hidden_act](inter)
-        output = self.proj(inter,
-                           workspace,
-                           lora_runtime_param=mlp_4h_to_h_param)
+        if self.hidden_act == 'gegelu':
+            inter = ACT2FN[self.hidden_act](inter, gegelu_limit)
+        else:
+            inter = ACT2FN[self.hidden_act](inter)
+        if self.inner_layernorm is not None:
+            inter = self.inner_layernorm(inter)
+        output = self.proj(inter, lora_runtime_params=mlp_proj_lora_params)
         return output
 
 
 class GatedMLP(MLP):
 
-    def __init__(self,
-                 hidden_size,
-                 ffn_hidden_size,
-                 hidden_act,
-                 bias=True,
-                 dtype=None,
-                 tp_group=None,
-                 tp_size=1,
-                 quant_mode=QuantMode(0),
-                 instance_id: int = 0):
-        self.use_fp8_qdq = quant_mode.has_fp8_qdq()
+    def __init__(
+        self,
+        hidden_size,
+        ffn_hidden_size,
+        hidden_act,
+        bias=True,
+        dtype=None,
+        tp_group=None,
+        tp_size=1,
+        quant_mode=QuantMode(0),
+        inner_layernorm=False,
+        eps=1e-05,
+        is_expert=False,
+    ):
         super().__init__(hidden_size,
                          ffn_hidden_size,
                          hidden_act,
@@ -113,8 +162,72 @@ class GatedMLP(MLP):
                          tp_group=tp_group,
                          tp_size=tp_size,
                          quant_mode=quant_mode,
-                         instance_id=instance_id)
+                         inner_layernorm=inner_layernorm,
+                         eps=eps,
+                         is_expert=is_expert)
 
+        self.hidden_size = hidden_size
+        self.ffn_hidden_size = ffn_hidden_size
+        self.tp_group = tp_group
+        self.tp_size = tp_size
+
+        self.gate = ColumnLinear(hidden_size,
+                                 ffn_hidden_size,
+                                 bias=bias,
+                                 dtype=dtype,
+                                 tp_group=tp_group,
+                                 tp_size=tp_size,
+                                 gather_output=False)
+
+    def forward(self,
+                hidden_states,
+                lora_layer_params=None,
+                reduce_fusion_params: Optional[AllReduceFusionParams] = None):
+
+        mlp_fc_lora_params = None
+        if lora_layer_params is not None:
+            mlp_fc_lora_params = lora_layer_params.get_runtime_params(
+                0, "mlp_h_to_4h")
+
+        mlp_gate_lora_params = None
+        if lora_layer_params is not None:
+            mlp_gate_lora_params = lora_layer_params.get_runtime_params(
+                0, "mlp_gate")
+
+        mlp_proj_lora_params = None
+        if lora_layer_params is not None:
+            mlp_proj_lora_params = lora_layer_params.get_runtime_params(
+                0, "mlp_4h_to_h")
+
+        inter = self.fc(hidden_states, mlp_fc_lora_params)
+        inter = ACT2FN[self.hidden_act](inter)
+        gate = self.gate(hidden_states, mlp_gate_lora_params)
+        intermediate = inter * gate
+        if self.inner_layernorm is not None:
+            intermediate = self.inner_layernorm(intermediate)
+        output = self.proj(intermediate,
+                           lora_runtime_params=mlp_proj_lora_params,
+                           reduce_fusion_params=reduce_fusion_params)
+        return output
+
+
+class FusedGatedMLP(Module):
+
+    def __init__(
+        self,
+        hidden_size,
+        ffn_hidden_size,
+        hidden_act,
+        bias=True,
+        dtype=None,
+        tp_group=None,
+        tp_size=1,
+        quant_mode=QuantMode(0),
+        inner_layernorm=False,
+        eps=1e-05,
+        is_expert=False,
+    ):
+        super().__init__()
         self.hidden_size = hidden_size
         self.ffn_hidden_size = ffn_hidden_size
         self.hidden_act = hidden_act
@@ -123,72 +236,87 @@ class GatedMLP(MLP):
         self.tp_group = tp_group
         self.tp_size = tp_size
         self.quant_mode = quant_mode
-        self.instance_id = instance_id
 
-        if self.use_fp8_qdq:
-            self.gate = FP8Linear(hidden_size,
-                                  ffn_hidden_size,
-                                  bias=bias,
-                                  dtype=dtype,
-                                  tp_group=tp_group,
-                                  tp_size=tp_size,
-                                  gather_output=False)
-        else:
-            self.gate = ColumnLinear(hidden_size,
-                                     ffn_hidden_size,
-                                     bias=bias,
-                                     dtype=dtype,
-                                     tp_group=tp_group,
-                                     tp_size=tp_size,
-                                     gather_output=False)
+        self.fused_fc = ColumnLinear(
+            self.hidden_size,
+            self.ffn_hidden_size * 2,
+            bias=self.bias,
+            dtype=self.dtype,
+            tp_group=self.tp_group,
+            tp_size=self.tp_size,
+            gather_output=False,
+        )
+        self.inner_layernorm = LayerNorm(ffn_hidden_size, dtype=dtype,
+                                         eps=eps) if inner_layernorm else None
+        self.proj = RowLinear(ffn_hidden_size,
+                              hidden_size,
+                              bias=bias,
+                              dtype=dtype,
+                              tp_group=tp_group,
+                              tp_size=tp_size,
+                              is_expert=is_expert)
 
-    def forward(self, hidden_states, workspace=None, lora_param=None):
+        # see optimize_model's add_lora for LoRA initialization
+        self.lora = None
 
-        mlp_h_to_4h_param = None
-        if lora_param is not None:
-            mlp_h_to_4h_param = lora_param.get_runtime_params(0, "mlp_h_to_4h")
+    def fc_gate_plugin(self, hidden_states, lora_layer_params=None):
+        # Combine the following pattern
+        #
+        #   SiLU(FC(x)) + Gate(x)
+        #
+        # into:
+        #
+        #   SwiGLU(FusedFC(x))
+        p_dtype = default_net().plugin_config.gemm_swiglu_plugin
+        use_fp8 = p_dtype == 'fp8'
+        assert use_fp8, "gemm_swiglu_plugin only supports fp8 now"
 
-        mlp_gate_param = None
-        if lora_param is not None:
-            mlp_gate_param = lora_param.get_runtime_params(0, "mlp_gate")
+        if lora_layer_params is not None:
+            mlp_fc_lora_params = lora_layer_params.get_runtime_params(
+                0, "mlp_h_to_4h")
+            mlp_gate_lora_params = lora_layer_params.get_runtime_params(
+                0, "mlp_gate")
 
-        mlp_4h_to_h_param = None
-        if lora_param is not None:
-            mlp_4h_to_h_param = lora_param.get_runtime_params(0, "mlp_4h_to_h")
+            if mlp_fc_lora_params is not None or mlp_gate_lora_params is not None:
+                raise NotImplementedError(
+                    f"LoRA not yet implemented for gemm_swiglu_plugin")
 
-        inter = self.fc(hidden_states, mlp_h_to_4h_param)
-        inter = ACT2FN[self.hidden_act](inter)
-        gate = self.gate(hidden_states, mlp_gate_param)
-        intermediate = inter * gate
-        output = self.proj(intermediate,
-                           workspace,
-                           lora_runtime_param=mlp_4h_to_h_param)
-        return output
+        if self.hidden_act != 'silu':
+            raise NotImplementedError(
+                f"Activation {self.hidden_act} not yet implemented for gemm_swiglu_plugin"
+            )
 
+        if self.bias:
+            raise NotImplementedError(
+                f"bias not yet implemented for gemm_swiglu_plugin fp8")
 
-class FusedGatedMLP(GatedMLP):
+        assert isinstance(
+            self.fused_fc,
+            FP8Linear), "fp8 gemm_swiglu only supports fp8 weights"
+        assert isinstance(
+            self.proj,
+            FP8RowLinear), "fp8 gemm_swiglu only supports fp8 weights"
+        assert self.fused_fc.weight.shape == (
+            self.hidden_size, self.ffn_hidden_size * 2 //
+            self.tp_size), "fp8 gemm_swiglu only supports (k, n) weights"
 
-    def __init__(self,
-                 hidden_size,
-                 ffn_hidden_size,
-                 hidden_act,
-                 bias=True,
-                 dtype=None,
-                 tp_group=None,
-                 tp_size=1,
-                 quant_mode=QuantMode(0),
-                 instance_id: int = 0):
-        super().__init__(hidden_size,
-                         ffn_hidden_size,
-                         hidden_act,
-                         bias=bias,
-                         dtype=dtype,
-                         tp_group=tp_group,
-                         tp_size=tp_size,
-                         quant_mode=quant_mode,
-                         instance_id=instance_id)
+        scale_d0 = (self.fused_fc.weights_scaling_factor.raw_value.item() *
+                    self.fused_fc.activation_scaling_factor.raw_value.item())
+        scale_d1 = scale_d0
+        scale_output = 1.0 / self.proj.activation_scaling_factor.raw_value.item(
+        )
+        activation_scaling_factor = cast(
+            self.fused_fc.activation_scaling_factor.value, self.dtype)
+        if hidden_states.dtype != trt.fp8:
+            hidden_states = quantize(hidden_states, activation_scaling_factor,
+                                     'fp8')
 
-    def forward(self, hidden_states, workspace=None, lora_param=None):
+        inter = gemm_swiglu(hidden_states, self.fused_fc.weight.value, None,
+                            scale_d0, scale_d1, scale_output)
+
+        return inter
+
+    def fc_gate(self, hidden_states, lora_layer_params=None):
         # Combine the following pattern
         #
         #   SiLU(FC(x)) + Gate(x)
@@ -199,61 +327,39 @@ class FusedGatedMLP(GatedMLP):
         #
         # Upside is we don't need to modify 4 different weight loading paths just to concat weights
 
-        _np_dtype = trt_dtype_to_np(self.dtype)
-        concat_weight = np.concatenate(
-            [self.gate.weight.raw_value, self.fc.weight.raw_value],
-            axis=0).astype(_np_dtype)
-        if self.bias:
-            concat_bias = np.concatenate(
-                [self.gate.bias.raw_value, self.fc.bias.raw_value],
-                axis=0).astype(_np_dtype)
+        inter = self.fused_fc(hidden_states)
 
-        if self.use_fp8_qdq:
-            gate_weights_scaling_factor = self.gate.weights_scaling_factor.raw_value
-            fc_weights_scaling_factor = self.fc.weights_scaling_factor.raw_value
-            fc_activation_scaling_factor = self.fc.activation_scaling_factor.raw_value
-            gate_activation_scaling_factor = self.gate.activation_scaling_factor.raw_value
-            assert fc_activation_scaling_factor == gate_activation_scaling_factor, "Activation scales should be identical"
+        lora_result = fc_gate_lora(hidden_states, self.lora, lora_layer_params)
+        if lora_result is not None:
+            inter = inter + lora_result
 
-        # Remove dangling TRT-LLM parameter references after the graph rewrite.
-        for param, _ in list(self.gate.named_parameters()):
-            self.gate._parameters.pop(param)
-        self.gate = None
-
-        if self.use_fp8_qdq:
-            self.fc = FP8Linear(self.hidden_size,
-                                self.ffn_hidden_size * 2,
-                                bias=self.bias,
-                                dtype=self.dtype,
-                                tp_group=self.tp_group,
-                                tp_size=self.tp_size,
-                                gather_output=False)
-        else:
-            self.fc = ColumnLinear(self.hidden_size,
-                                   self.ffn_hidden_size * 2,
-                                   bias=self.bias,
-                                   dtype=self.dtype,
-                                   tp_group=self.tp_group,
-                                   tp_size=self.tp_size,
-                                   gather_output=False)
-
-        self.fc.weight.value = concat_weight
-
-        if self.use_fp8_qdq:
-            self.fc.activation_scaling_factor.value = fc_activation_scaling_factor
-            # TODO: need to align with quantization toolkit; preferably put a constraint to equalize
-            # fc/gate weight scaling factor to allow horizontal fusion without accuracy loss
-            self.fc.weights_scaling_factor.value = max(
-                gate_weights_scaling_factor, fc_weights_scaling_factor)
-
-        if self.bias:
-            self.fc.bias.value = concat_bias
-        inter = self.fc(hidden_states)
         if self.hidden_act == 'silu':
             inter = ACT2FN['swiglu'](inter)
+        elif self.hidden_act == 'gelu':
+            inter = ACT2FN['geglu'](inter)
         else:
             raise NotImplementedError(
                 f"Activation {self.hidden_act} not yet implemented for FusedGatedMLP"
             )
-        output = self.proj(inter, workspace)
+        return inter
+
+    def forward(self,
+                hidden_states,
+                lora_layer_params=None,
+                reduce_fusion_params: Optional[AllReduceFusionParams] = None):
+        if default_net().plugin_config.gemm_swiglu_plugin:
+            inter = self.fc_gate_plugin(hidden_states, lora_layer_params)
+        else:
+            inter = self.fc_gate(hidden_states, lora_layer_params)
+
+        if self.inner_layernorm is not None:
+            inter = self.inner_layernorm(inter)
+
+        mlp_proj_lora_params = None
+        if lora_layer_params is not None:
+            mlp_proj_lora_params = lora_layer_params.get_runtime_params(
+                0, "mlp_4h_to_h")
+        output = self.proj(inter,
+                           lora_runtime_params=mlp_proj_lora_params,
+                           reduce_fusion_params=reduce_fusion_params)
         return output

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,9 +25,9 @@ namespace tensorrt_llm::runtime::utils
 {
 
 //! \brief Create new tensor from numpy file.
-[[nodiscard]] ITensor::UniquePtr loadNpy(BufferManager& manager, const std::string& npyFile, const MemoryType where);
+[[nodiscard]] ITensor::UniquePtr loadNpy(BufferManager const& manager, std::string const& npyFile, MemoryType where);
 
 //! \brief Save tensor to numpy file.
-void saveNpy(BufferManager& manager, ITensor const& tensor, const std::string& filename);
+void saveNpy(BufferManager const& manager, ITensor const& tensor, std::string const& filename);
 
 } // namespace tensorrt_llm::runtime::utils

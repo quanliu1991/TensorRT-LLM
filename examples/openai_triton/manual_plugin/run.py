@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -79,7 +79,7 @@ def run(engine_dir,
     }
 
     # Execute model inference
-    stream = torch.cuda.current_stream()
+    stream = torch.cuda.Stream()
     ok = session.run(inputs=inputs, outputs=outputs, stream=stream.cuda_stream)
     assert ok, 'Engine execution failed'
 

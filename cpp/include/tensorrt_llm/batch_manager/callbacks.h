@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,9 +29,9 @@ class InferenceRequest;
 class NamedTensor;
 
 using GetInferenceRequestsCallback = std::function<std::list<std::shared_ptr<InferenceRequest>>(int32_t)>;
-using SendResponseCallback = std::function<void(uint64_t, std::list<NamedTensor> const&, bool, const std::string&)>;
+using SendResponseCallback = std::function<void(uint64_t, std::list<NamedTensor> const&, bool, std::string const&)>;
 using PollStopSignalCallback = std::function<std::unordered_set<uint64_t>()>;
 // json of stats as a string
-using ReturnBatchManagerStatsCallback = std::function<void(const std::string&)>;
+using ReturnBatchManagerStatsCallback = std::function<void(std::string const&)>;
 
 } // namespace tensorrt_llm::batch_manager

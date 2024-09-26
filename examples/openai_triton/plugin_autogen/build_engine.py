@@ -2,6 +2,7 @@ import argparse
 import math
 # include plugins
 # yapf: disable
+import os
 import sys
 import time
 from pathlib import Path
@@ -17,7 +18,7 @@ from tensorrt_llm.functional import Tensor
 from tensorrt_llm.logger import logger
 from tensorrt_llm.network import net_guard
 
-sys.path.append('./tmp')
+sys.path.append(os.environ.get('PLUGIN_GEN_WORKSPACE', './tmp'))
 from functional import fused_attention_kernel # isort:skip
 # yapf: enable
 
@@ -102,6 +103,7 @@ def build_engine(builder: Builder, builder_config: BuilderConfig,
     # Module -> Network
     network = builder.create_network()
     network.trt_network.name = engine_name
+    network.plugin_config.to_legacy_setting()
     with net_guard(network):
         # Prepare
         inputs = layer.prepare_inputs(args.max_batch_size, args.max_seq_len)
@@ -112,8 +114,8 @@ def build_engine(builder: Builder, builder_config: BuilderConfig,
         print('dot:')
         print(network.to_dot())
 
-        layer = network.get_layer_by_name(
-            "FmhaLayer/PLUGIN_V2_fused_attention_kernelPlugin_2").as_layer()
+        layer = network.get_layer_by_name(next(
+            network.get_layers()).name).as_layer()
         print('layer', layer.plugin.plugin_type)
         print('layer', layer.plugin.plugin_version)
         print('layer', layer.plugin.plugin_namespace)
@@ -135,7 +137,8 @@ def build(args):
     builder_config = builder.create_builder_config(
         name='fmha_triton',
         precision=args.dtype,
-        timing_cache=args.timing_cache if cache is None else cache)
+        timing_cache=args.timing_cache if cache is None else cache,
+        profiling_verbosity=args.profiling_verbosity)
 
     engine_name = get_engine_name(args.head_size, args.dtype)
     engine = build_engine(builder, builder_config, engine_name, args)
@@ -172,6 +175,14 @@ if __name__ == '__main__':
         default='model.cache',
         help='The path of to read timing cache from, will be ignored '
         'if the file does not exist')
+    parser.add_argument(
+        '--profiling_verbosity',
+        type=str,
+        default='layer_names_only',
+        choices=['layer_names_only', 'detailed', 'none'],
+        help=
+        'The profiling verbosity for the generated TRT engine. Set to detailed can inspect tactic choices and kernel parameters.'
+    )
     parser.add_argument('--log_level', type=str, default='info')
     parser.add_argument(
         '--output_dir',

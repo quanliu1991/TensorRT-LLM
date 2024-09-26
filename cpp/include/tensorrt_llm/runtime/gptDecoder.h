@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,17 +16,17 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/cudaAllocator.h"
+#include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/decodingInput.h"
 #include "tensorrt_llm/runtime/decodingOutput.h"
+#include "tensorrt_llm/runtime/request.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
-#include <curand_kernel.h>
-
-#include <cstdint>
-#include <memory>
 
 #include <NvInferRuntime.h>
+#include <curand_kernel.h>
+
+#include <memory>
 
 namespace tensorrt_llm
 {
@@ -41,35 +41,43 @@ class DynamicDecodeLayer;
 namespace runtime
 {
 
+class SpeculativeDecodingModule;
+
+class DecodingLayerWorkspace;
+
 class IGptDecoder
 {
 public:
+    using TensorPtr = runtime::ITensor::SharedPtr;
+    using TensorConstPtr = runtime::ITensor::SharedConstPtr;
+
     virtual ~IGptDecoder() = default;
 
-    virtual void setup(SamplingConfig const& samplingConfig, size_t batchSize, SizeType maxSequenceLength) = 0;
-
-    virtual bool forward(DecodingOutput& output, DecodingInput const& input) = 0;
+    virtual void setup(SamplingConfig const& samplingConfig, size_t batchSize, TensorConstPtr const& batchSlots,
+        std::optional<DecodingOutput> const& output = std::nullopt,
+        std::optional<std::vector<decoder_batch::Request> const> const& requests = std::nullopt)
+        = 0;
 
     virtual void forwardAsync(DecodingOutput& output, DecodingInput const& input) = 0;
 
-    virtual void gatherTree(ITensor& finalOutputIds, DecodingOutput const& decodingOutput,
-        DecodingInput const& decodingInput, BufferManager const& manager)
-        = 0;
+    virtual void forwardSync(DecodingOutput& output, DecodingInput const& input) = 0;
 
-    virtual const SamplingConfig& getSamplingConfig() = 0;
+    virtual SamplingConfig const& getSamplingConfig() = 0;
 
-    static void acceptDraftTokensByIds(const ITensor& targetTokenIds, const ITensor& draftTokenIds,
-        const ITensor& contextLengths, const ITensor& numDraftTokens, ITensor& sequenceLengths,
-        const ITensor& finishedVec, ITensor& finishedFinal, ITensor& finishedSum,
+    static void acceptDraftTokensByIds(ITensor const& targetTokenIds, ITensor const& draftTokenIds,
+        ITensor const& contextLengths, ITensor const& numDraftTokens, ITensor& sequenceLengths,
+        ITensor const& finishedVec, ITensor& finishedFinal, ITensor& finishedSum, ITensor const& batchSlots,
         BufferManager::CudaStreamPtr const& stream);
 
-    static void acceptDraftTokensByLogits(ITensor& draftLogits, const ITensor& targetLogits, ITensor& draftProbs,
-        ITensor& targetProbs, const ITensor& numDraftTokens, ITensor& finished, SizeType vocabSize,
-        SizeType vocabSizePadded, bool useRandomAcceptThreshold, float randomAcceptThreshold,
+    static void acceptDraftTokensByLogits(ITensor& draftLogits, ITensor const& targetLogits, ITensor& draftProbs,
+        ITensor& targetProbs, ITensor const& numDraftTokens, ITensor& finished, ITensor const& batchSlots,
+        SizeType32 vocabSize, SizeType32 vocabSizePadded, bool useRandomAcceptThreshold, float randomAcceptThreshold,
         curandState_t* curandState, BufferManager::CudaStreamPtr const& stream);
 
-    static std::unique_ptr<IGptDecoder> create(
-        nvinfer1::DataType dtype, size_t vocabSize, size_t vocabSizePadded, BufferManager::CudaStreamPtr const& stream);
+    static std::unique_ptr<IGptDecoder> create(executor::DecodingMode const& mode, nvinfer1::DataType dtype,
+        size_t maxBatchSize, size_t maxBeamWidth, size_t vocabSize, size_t vocabSizePadded, size_t maxSequenceLength,
+        BufferManager::CudaStreamPtr const& stream,
+        std::shared_ptr<SpeculativeDecodingModule const> speculativeDecodingModule = nullptr);
 };
 
 template <typename T>
@@ -80,42 +88,64 @@ public:
     using CudaStreamPtr = BufferManager::CudaStreamPtr;
     using TensorPtr = std::shared_ptr<ITensor>;
 
-    GptDecoder(size_t vocabSize, size_t vocabSizePadded, CudaStreamPtr const& stream);
+    GptDecoder(executor::DecodingMode const& mode, size_t maxBatchSize, size_t maxBeamWidth, size_t vocabSize,
+        size_t vocabSizePadded, size_t maxSequenceLength, CudaStreamPtr const& stream,
+        std::shared_ptr<SpeculativeDecodingModule const> speculativeDecodingModule = nullptr);
 
-    void setup(SamplingConfig const& samplingConfig, size_t batchSize, SizeType maxSequenceLength) override;
-
-    bool forward(DecodingOutput& output, DecodingInput const& input) override;
+    void setup(SamplingConfig const& samplingConfig, size_t batchSize, TensorConstPtr const& batchSlots,
+        std::optional<DecodingOutput> const& output = std::nullopt,
+        std::optional<std::vector<decoder_batch::Request> const> const& requests = std::nullopt) override;
 
     void forwardAsync(DecodingOutput& output, DecodingInput const& input) override;
 
-    void gatherTree(ITensor& finalOutputIds, DecodingOutput const& decodingOutput, DecodingInput const& decodingInput,
-        BufferManager const& manager) override;
+    void forwardSync(DecodingOutput& output, DecodingInput const& input) override;
 
-    const SamplingConfig& getSamplingConfig() override
+    SamplingConfig const& getSamplingConfig() override
     {
         return mSamplingConfig;
     }
 
 private:
-    BufferManager mManager;
-
-    common::CudaAllocator mAllocator;
+    std::shared_ptr<BufferManager> mManager;
     std::shared_ptr<tensorrt_llm::layers::DynamicDecodeLayer<T>> mDynamicDecodeLayer;
+    std::shared_ptr<tensorrt_llm::runtime::DecodingLayerWorkspace> mDecodingLayerWorkspace;
 
-    TensorPtr mLogProbsTiled; // Buffer used to store the transpose of the logProbs. Needed because the kernels have
-                              // been written to use that shape.
     SamplingConfig mSamplingConfig;
+
+    size_t mMaxBatchSize;
+
+    executor::DecodingMode mDecodingMode;
 };
 
-inline std::unique_ptr<IGptDecoder> IGptDecoder::create(
-    nvinfer1::DataType dtype, size_t vocabSize, size_t vocabSizePadded, BufferManager::CudaStreamPtr const& stream)
+inline std::unique_ptr<IGptDecoder> IGptDecoder::create(executor::DecodingMode const& mode, nvinfer1::DataType dtype,
+    size_t maxBatchSize, size_t maxBeamWidth, size_t vocabSize, size_t vocabSizePadded, size_t maxSequenceLength,
+    BufferManager::CudaStreamPtr const& stream,
+    std::shared_ptr<SpeculativeDecodingModule const> speculativeDecodingModule)
 {
     switch (dtype)
     {
-    case nvinfer1::DataType::kFLOAT: return std::make_unique<GptDecoder<float>>(vocabSize, vocabSizePadded, stream);
-    case nvinfer1::DataType::kHALF: return std::make_unique<GptDecoder<half>>(vocabSize, vocabSizePadded, stream);
-    default: return nullptr;
+    case nvinfer1::DataType::kFLOAT:
+        return std::make_unique<GptDecoder<float>>(mode, maxBatchSize, maxBeamWidth, vocabSize, vocabSizePadded,
+            maxSequenceLength, stream, speculativeDecodingModule);
+    case nvinfer1::DataType::kHALF:
+        return std::make_unique<GptDecoder<half>>(mode, maxBatchSize, maxBeamWidth, vocabSize, vocabSizePadded,
+            maxSequenceLength, stream, speculativeDecodingModule);
+    default:
+        TLLM_THROW("Unsupported decoder data type: %d. Use either kFLOAT or kHALF.", static_cast<int>(dtype));
+        return nullptr;
     }
+}
+
+/// @brief Helper function to produce batch slots [0, 1, ..., batchSize - 1] for paths that do not explicitly provide
+/// batch slots to the decoder.
+inline runtime::ITensor::SharedConstPtr getDefaultBatchSlots(
+    runtime::SizeType32 batchSize, runtime::BufferManager const& bufferManager)
+{
+    auto defaultBatchSlots = bufferManager.pinnedPool(
+        runtime::ITensor::makeShape({batchSize}), runtime::TRTDataType<runtime::SizeType32>::value);
+    auto range = runtime::BufferRange<runtime::SizeType32>(*defaultBatchSlots);
+    std::iota(range.begin(), range.end(), 0);
+    return defaultBatchSlots;
 }
 } // namespace runtime
 } // namespace tensorrt_llm

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,15 +16,15 @@
 from ..._utils import pad_vocab_size
 from ...functional import Tensor
 from ...layers import (MLP, Attention, AttentionMaskType, ColumnLinear,
-                       LayerNorm, PositionEmbeddingType)
+                       Embedding, LayerNorm)
 from ...module import Module
-from ..gpt.model import GPTEmbedding
-from ..modeling_utils import DecoderLayerList, DecoderModelForCausalLM
+from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
+                              PretrainedConfig)
 
 
 class OPTDecoderLayer(Module):
 
-    def __init__(self, config, layer_idx):
+    def __init__(self, config: PretrainedConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
         self.config = config
@@ -38,14 +38,18 @@ class OPTDecoderLayer(Module):
         self.input_layernorm = LayerNorm(normalized_shape=hidden_size,
                                          dtype=dtype)
 
+        layers_range = config.mapping.pp_layers(config.num_hidden_layers)
+        local_layer_idx = layer_idx - layers_range[0]
         self.attention = Attention(
-            hidden_size,
-            config.num_attention_heads,
+            local_layer_idx=local_layer_idx,
+            hidden_size=hidden_size,
+            num_attention_heads=config.num_attention_heads,
             max_position_embeddings=config.max_position_embeddings,
             attention_mask_type=AttentionMaskType.causal,
             dtype=dtype,
             tp_group=tp_group,
-            tp_size=tp_size)
+            tp_size=tp_size,
+            quant_mode=config.quant_mode)
 
         mlp_hidden_size = hidden_size * 4 if config.intermediate_size is None else config.intermediate_size
 
@@ -54,7 +58,8 @@ class OPTDecoderLayer(Module):
                        hidden_act=config.hidden_act,
                        dtype=dtype,
                        tp_group=tp_group,
-                       tp_size=tp_size)
+                       tp_size=tp_size,
+                       quant_mode=config.quant_mode)
         self.post_layernorm = LayerNorm(normalized_shape=hidden_size,
                                         dtype=dtype)
 
@@ -103,26 +108,16 @@ class OPTDecoderLayer(Module):
 
 class OPTModel(Module):
 
-    def __init__(self, config):
+    def __init__(self, config: PretrainedConfig):
         super().__init__()
         self.do_layer_norm_before = config.do_layer_norm_before
-        use_parallel_embedding = config.use_parallel_embedding
-        embedding_sharding_dim = config.embedding_sharding_dim
-        use_prompt_tuning = config.use_prompt_tuning
-        mapping = config.mapping
 
-        self.embedding = GPTEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            config.max_position_embeddings,
-            position_embedding_type=PositionEmbeddingType.learned_absolute,
-            dtype=config.dtype,
-            use_prompt_tuning=use_prompt_tuning,
-            tensor_parallel=mapping.tp_size if use_parallel_embedding else 1,
-            tensor_parallel_group=mapping.tp_group
-            if use_parallel_embedding else None,
-            sharding_dim=embedding_sharding_dim,
-            tp_rank=mapping.tp_rank)
+        self.vocab_embedding = Embedding(config.vocab_size,
+                                         config.hidden_size,
+                                         dtype=config.dtype)
+        self.position_embedding = Embedding(config.max_position_embeddings,
+                                            config.hidden_size,
+                                            dtype=config.dtype)
 
         self.layers = DecoderLayerList(OPTDecoderLayer, config)
 
@@ -141,9 +136,10 @@ class OPTModel(Module):
                 prompt_tasks=None,
                 prompt_vocab_size=None):
 
-        hidden_states = self.embedding(input_ids, position_ids,
-                                       prompt_embedding_table, prompt_tasks,
-                                       prompt_vocab_size)
+        args = [prompt_embedding_table, prompt_tasks, prompt_vocab_size
+                ] if prompt_embedding_table is not None else []
+        hidden_states = self.vocab_embedding(input_ids, *args)
+        hidden_states = hidden_states + self.position_embedding(position_ids)
 
         hidden_states = self.layers(hidden_states,
                                     use_cache=use_cache,
@@ -164,34 +160,21 @@ class OPTModel(Module):
 
 class OPTForCausalLM(DecoderModelForCausalLM):
 
-    def __init__(self, config):
-        use_parallel_embedding = config.use_parallel_embedding
-        embedding_sharding_dim = config.embedding_sharding_dim
-        share_embedding_table = config.share_embedding_table
-        mapping = config.mapping
-
-        if share_embedding_table and mapping.tp_size > 1:
-            if (not use_parallel_embedding) or (use_parallel_embedding and
-                                                embedding_sharding_dim == 1):
-                raise NotImplementedError(
-                    'For multiple-processes cases, sharing the embedding table must set use_parallel_embedding=True and embedding_sharding_dim = 0'
-                )
-
+    def __init__(self, config: PretrainedConfig):
+        self.check_config(config)
         transformer = OPTModel(config)
         vocab_size_padded = pad_vocab_size(config.vocab_size,
                                            config.mapping.tp_size)
-
-        share_weight = None
-        if share_embedding_table:
-            share_weight = transformer.embedding.vocab_embedding.weight
 
         lm_head = ColumnLinear(config.hidden_size,
                                vocab_size_padded,
                                bias=False,
                                dtype=config.dtype,
-                               tp_group=mapping.tp_group,
-                               tp_size=mapping.tp_size,
-                               gather_output=True,
-                               share_weight=share_weight)
+                               tp_group=config.mapping.tp_group,
+                               tp_size=config.mapping.tp_size,
+                               gather_output=True)
 
         super().__init__(config, transformer, lm_head)
+
+    def check_config(self, config):
+        config.set_if_not_exist('do_layer_norm_before', False)

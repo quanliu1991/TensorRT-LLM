@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,15 +15,19 @@
 import collections
 import contextlib
 import hashlib
+import inspect
 import weakref
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, OrderedDict, Set
+from typing import Any, Dict, Iterable, List, Optional, OrderedDict, Set, Tuple
 
 import numpy as np
 import tensorrt as trt
 
+from tensorrt_llm.module import Module
+
 from ._common import set_network
+from ._utils import get_extra_attr, has_extra_attr, set_extra_attr
 from .logger import logger
 from .plugin import PluginConfig
 
@@ -43,13 +47,83 @@ class _UniqueNameGenerator(object):
         return f"{self.prefix}{key}_{tmp}"
 
 
+class PluginInfo:
+    plugin_creator: trt.IPluginCreator
+    plugin_name: str
+    pfc: trt.PluginFieldCollection
+
+    def __init__(self, plugin_creator: trt.IPluginCreator, plugin_name: str,
+                 pfc: trt.PluginFieldCollection):
+        self.plugin_creator = plugin_creator
+        self.plugin_name = plugin_name
+        self.pfc = pfc
+        self._parse_pfc(pfc)
+
+    def _parse_pfc(self, pfc: trt.PluginFieldCollection):
+        self.pfc_as_ndarray = {}
+        self.pfc_as_list = {}
+        for i in range(len(pfc)):
+            name, data = pfc[i].name, pfc[i].data
+            array_data = data
+            self.pfc_as_ndarray[name] = array_data.copy()
+            list_data = array_data.tolist()
+            self.pfc_as_list[name] = list_data
+
+
+def get_plugin_info(trt_network: trt.INetworkDefinition,
+                    layer_name: str) -> PluginInfo:
+    if not has_extra_attr(trt_network, "plugin_infos"):
+        return None
+    plugin_infos = get_extra_attr(trt_network, "plugin_infos")
+    if layer_name not in plugin_infos:
+        return None
+    return plugin_infos[layer_name]
+
+
+def set_plugin_info(trt_network: trt.INetworkDefinition, layer_name: str,
+                    plugin_info: PluginInfo):
+    if not has_extra_attr(trt_network, "plugin_infos"):
+        set_extra_attr(trt_network, "plugin_infos", {})
+    plugin_infos = get_extra_attr(trt_network, "plugin_infos")
+    plugin_infos[layer_name] = plugin_info
+
+
+def delete_plugin_info(trt_network: trt.INetworkDefinition, layer_name: str):
+    if not has_extra_attr(trt_network, "plugin_infos"):
+        return
+    plugin_infos = get_extra_attr(trt_network, "plugin_infos")
+    if layer_name not in plugin_infos:
+        return
+    del plugin_infos[layer_name]
+
+
+# TODO: remove this WAR after https://nvbugs/4359151 fixed.
+def get_np_weight(trt_network: trt.INetworkDefinition,
+                  layer_name: str) -> np.array:
+    if not has_extra_attr(trt_network, "np_weights"):
+        return None
+    np_weights = get_extra_attr(trt_network, "np_weights")
+    if layer_name not in np_weights:
+        return None
+    return np_weights[layer_name]
+
+
+# TODO: remove this WAR after https://nvbugs/4359151 fixed.
+def set_np_weight(trt_network: trt.INetworkDefinition, layer_name: str,
+                  np_weight: np.array):
+    if not has_extra_attr(trt_network, "np_weights"):
+        set_extra_attr(trt_network, "np_weights", {})
+    np_weights = get_extra_attr(trt_network, "np_weights")
+    np_weights[layer_name] = np_weight
+
+
 class Network(object):
 
     def __init__(self, **kwargs):
         # intentionally use **kwargs, user should never call this ctor directly
         # use Builder.create_network() instead
 
-        # Holds the removed layers and disable them in graph rewritings and other phases.
+        # Holds the removed layers and disable them in graph rewriting and other phases.
         # This is a hacky way since INetwork python API doesn't provide a way to remove a layer.
         # TODO: remove this when TensorRT provides a better way to remove a layer
         self._removed_layers: Set[str] = set()
@@ -58,6 +132,7 @@ class Network(object):
 
         from .graph_rewriting import FLayerInfoMemo
         self.flayer_memo = FLayerInfoMemo()  # holds the functional metadata
+        self._parameter_tensors = {}  # holds the parameter tensors
 
     def _init(self, trt_network):
         self._trt_network = trt_network
@@ -71,8 +146,36 @@ class Network(object):
         self._registered_ndarrays = []
         self._strongly_typed = trt.INetworkDefinition.get_flag(
             self._trt_network, trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED)
+        self._unfilled_weights: Dict[str, Tuple[np.array, np.array]] = {}
+        self._auto_parallel_config: Dict[str, Any] = None
 
         return self
+
+    def _register_unfilled_weights(self, layer_name: str, weights: np.array,
+                                   values: np.array):
+        self._unfilled_weights[layer_name] = (weights, values)
+
+    def _fill_weights(self):
+        from tensorrt_llm.parameter import Parameter
+
+        for layer_name in list(self._unfilled_weights.keys()):
+            weights, values = self._unfilled_weights.pop(layer_name)
+            self.register_ndarray(weights)
+            if values is not None:
+                np.copyto(weights, values, casting='no')
+            else:
+                Parameter.xavier_init(weights)
+
+    @property
+    def parameter_tensors(self):
+        return self._parameter_tensors
+
+    def get_parameter_tensor(self, param):
+        return self.parameter_tensors.get(param, None)
+
+    def set_parameter_tensor(self, param, tensor):
+        assert param not in self.parameter_tensors
+        self.parameter_tensors[param] = tensor
 
     @property
     def dtype(self) -> trt.DataType:
@@ -91,9 +194,20 @@ class Network(object):
     def plugin_config(self) -> PluginConfig:
         return self._plugin_config
 
+    @plugin_config.setter
+    def plugin_config(self, cfg: PluginConfig):
+        assert isinstance(
+            cfg,
+            PluginConfig), f"Expecting a PluginConfig object, got {type(cfg)}"
+        self._plugin_config = cfg
+
     @property
     def strongly_typed(self) -> bool:
         return self._strongly_typed
+
+    @property
+    def auto_parallel_config(self) -> Dict[str, Any]:
+        return self._auto_parallel_config
 
     def _add_input(self,
                    tensor,
@@ -107,6 +221,7 @@ class Network(object):
             shape=shape,
             dtype=dtype,
         )
+        assert tensor.trt_tensor is not None, f"Couldn't create TRT tensor for {name} {dtype} {shape}"
         if dim_range is not None:
             logger.debug(
                 f'Add input: {name}, shape: {shape}, dtype: {dtype}, dimension names:{list(dim_range.keys())}'
@@ -120,20 +235,13 @@ class Network(object):
     def _mark_output(self, tensor, name, dtype):
         from .functional import cast
 
-        if self.strongly_typed:
-            if tensor.trt_tensor.dtype != dtype:
-                # If stronglyTyped mode is enabled and inferred output dtype does not match desired dtype, add a cast.
-                cast_output = cast(tensor, dtype)
-                self.trt_network.mark_output(cast_output.trt_tensor)
-                cast_output.trt_tensor.name = name
-            else:
-                # Otherwise, mark the tensor as network output. We should not set tensor dtype in stronglyTyped mode.
-                self.trt_network.mark_output(tensor.trt_tensor)
-                tensor.trt_tensor.name = name
-        else:
-            self.trt_network.mark_output(tensor.trt_tensor)
-            tensor.trt_tensor.name = name
-            tensor.trt_tensor.dtype = dtype
+        # In strongly_typed, if tensor output is not the same, add a cast
+        if dtype is not None and self.strongly_typed:
+            tensor = cast(tensor, dtype)
+        self.trt_network.mark_output(tensor.trt_tensor)
+        tensor.trt_tensor.name = name
+        if not self.strongly_typed:
+            tensor.trt_tensor.dtype = dtype or tensor.trt_tensor.dtype
         logger.debug(f'Mark output: {name}, dtype: {dtype}')
 
     def set_named_parameters(self, named_parameters):
@@ -144,8 +252,25 @@ class Network(object):
         return self._named_parameters
 
     def _set_layer_name(self, layer):
+        original_layer_name = layer.name
         layer_name = str(layer.type).split('.')[-1]
         current_module = self._module_call_stack.get_current_module()
+
+        func_stack = []
+        frame = inspect.currentframe().f_back.f_back
+        while frame:
+            func_name = frame.f_code.co_name
+            line_num = frame.f_lineno
+            if func_name == "forward":
+                break
+            func_stack.insert(0, f"{func_name}_L{line_num}")
+            if len(func_stack) >= 10:
+                # NOTE: TRT error messages has a character limit.
+                #       Limiting to only 10 levels helps retain
+                #       the true error message from TRT.
+                break
+            frame = frame.f_back
+        current_module = f"{current_module}.{'.'.join(func_stack)}"
 
         if layer.type == trt.LayerType.PLUGIN_V2:
             layer_name = '_'.join(
@@ -163,6 +288,16 @@ class Network(object):
             # and does not update tensor names when layer name changed by application, needs to
             # change the tensor name to align with the new layer name for better debugging
             layer.get_output(idx).name = f"{layer.name}_output_{idx}"
+        if original_layer_name != layer.name:
+            if layer.type == trt.LayerType.PLUGIN_V2:
+                plugin_info = get_plugin_info(self.trt_network,
+                                              original_layer_name)
+                if plugin_info is not None:
+                    set_plugin_info(self.trt_network, layer.name, plugin_info)
+                    delete_plugin_info(self.trt_network, original_layer_name)
+
+        # Set layer metadata to the same as the layer name so that it can show up in NVTX.
+        layer.metadata = layer.name
 
     def register_ndarray(self, ndarray: np.ndarray) -> None:
         ''' When the functional APIs need to create local numpy array and use as weights for constant or other layers,
@@ -172,6 +307,32 @@ class Network(object):
             during the TRT network construction and TRT engine building process.
         '''
         self._registered_ndarrays.append(ndarray)
+
+    def _generate_optimization_profiles(self) -> List[trt.IOptimizationProfile]:
+        input_tensors = self._inputs
+        if len(input_tensors) == 0:
+            return []
+        num_profiles = len(list(input_tensors.values())[0].profiles)
+        profiles = []
+        for i in range(num_profiles):
+            logger.debug(f'Adding optimization profile {i+1}/{num_profiles}')
+            profile = self._trt_network.builder.create_optimization_profile()
+            for input_name, input_tensor in input_tensors.items():
+                shape_profile = input_tensor.profiles[i]
+                min_shape = list(shape_profile.min)
+                opt_shape = list(shape_profile.opt)
+                max_shape = list(shape_profile.max)
+                if input_tensor.trt_tensor.is_shape_tensor:
+                    profile.set_shape_input(input_name, min_shape, opt_shape,
+                                            max_shape)
+                else:
+                    profile.set_shape(input_name, min_shape, opt_shape,
+                                      max_shape)
+                logger.debug(
+                    f'{input_name}, min: {min_shape}, opt: {opt_shape}, max: {max_shape}'
+                )
+            profiles.append(profile)
+        return profiles
 
     def get_inputs(self):
         '''
@@ -299,8 +460,10 @@ class Network(object):
             )
             return
 
-        dot = graphviz.Digraph(comment='TensorRT Graph',
-                               format=format if format != 'text' else None)
+        dot = graphviz.Digraph(
+            comment=
+            f'TensorRT Graph of {self._get_network_hash(lightweight=False)}',
+            format=format if format != 'text' else None)
 
         inputs_names = set([x.name for x in self.get_inputs()])
         output_names = set([x.name for x in self.get_outputs()])
@@ -341,10 +504,12 @@ class Network(object):
 
             return tensor_to_alias[tensor]
 
-        def create_tensor_node(tensor: str):
+        def create_tensor_node(tensor: str, dtype=None, shape=None):
             tensor_alias = get_alias(tensor, tensor_id)
             if tensor_alias not in nodes:
-                dot.node(tensor_alias, tensor_alias, **node_style)
+                dot.node(tensor_alias,
+                         str(dtype) + "\n" + tensor_alias + "\n" + str(shape),
+                         **node_style)
                 nodes.add(tensor_alias)
             return tensor_alias
 
@@ -354,18 +519,20 @@ class Network(object):
                 nodes.add(layer)
 
         for tensor, layer in state.tensor_to_producer.items():
-            tensor_alias = create_tensor_node(tensor.name)
+            tensor_alias = create_tensor_node(tensor.name, tensor.dtype,
+                                              tensor.shape)
             create_layer_node(layer.name)
             dot.edge(layer.name, tensor_alias)
         for tensor, layers in state.tensor_to_consumers.items():
-            tensor_alias = create_tensor_node(tensor.name)
+            tensor_alias = create_tensor_node(tensor.name, tensor.dtype,
+                                              tensor.shape)
             for layer in layers:
                 create_layer_node(layer.name)
                 dot.edge(tensor_alias, layer.name)
 
         if format == "text":
             return dot.source
-        dot.render(path)
+        dot.save(path)
 
     def _get_graph(self) -> "Network._GraphState":
         '''
@@ -464,11 +631,12 @@ def net_guard(network):
 
 
 class _TrtLlmModuleCallStack(object):
-    call_stack = []
-    module_name_map = weakref.WeakKeyDictionary()
 
     def __init__(self):
         super().__init__()
+        self.call_stack = []
+        self.module_name_map = weakref.WeakKeyDictionary()
+        self.module_to_layer_range_map: Dict[str, range] = {}
         self.mod_names_set = False
 
     def module_names_set(self):
@@ -494,6 +662,11 @@ class _TrtLlmModuleCallStack(object):
         if mod_obj in self.module_name_map:
             name = self.module_name_map[mod_obj]
         return name
+
+    def set_layer_range(self, mod_obj: Module, layer_range: range):
+        if mod_obj in self.module_name_map:
+            name = self.module_name_map[mod_obj]
+            self.module_to_layer_range_map[name] = layer_range
 
     def get_stack(self):
         return self.call_stack

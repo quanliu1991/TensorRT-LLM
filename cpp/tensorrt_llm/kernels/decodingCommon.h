@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/executor/types.h"
 #include <cstdint>
 #include <curand_kernel.h>
 
@@ -62,7 +63,7 @@ public:
         mState |= kFinishedEos;
     }
 
-    __host__ __device__ bool constexpr isFinishedEOS()
+    __host__ __device__ bool constexpr isFinishedEOS() const
     {
         return anyBitSet(kFinishedEos);
     }
@@ -72,7 +73,7 @@ public:
         mState |= kFinishedStopWords;
     }
 
-    __host__ __device__ bool constexpr isFinishedStopWords()
+    __host__ __device__ bool constexpr isFinishedStopWords() const
     {
         return anyBitSet(kFinishedStopWords);
     }
@@ -82,7 +83,7 @@ public:
         mState |= kFinishedMaxLength;
     }
 
-    __host__ __device__ bool constexpr isFinishedMaxLength()
+    __host__ __device__ bool constexpr isFinishedMaxLength() const
     {
         return anyBitSet(kFinishedMaxLength);
     }
@@ -105,6 +106,23 @@ public:
     __host__ __device__ bool constexpr isSkipDecoding() const
     {
         return anyBitSet(kSkipDecoding);
+    }
+
+    executor::FinishReason toFinishReason() const
+    {
+        if (isFinishedEOS())
+        {
+            return executor::FinishReason::kEND_ID;
+        }
+        if (isFinishedStopWords())
+        {
+            return executor::FinishReason::kSTOP_WORDS;
+        }
+        if (isFinishedMaxLength())
+        {
+            return executor::FinishReason::kLENGTH;
+        }
+        return executor::FinishReason::kNOT_FINISHED;
     }
 
     using UnderlyingType = uint8_t;
@@ -145,40 +163,62 @@ static_assert(FinishedState::finishedMaxLength().isFinishedMaxLength());
 
 //! \brief Initialize batchSize curand states with given seed.
 //!
-//! \param state output buffer [batchSize]. Curand states to be initialized
+//! \param state output buffer [maxBatchSize]. Curand states to be initialized
+//! \param batchSlots input buffer[batchSize], optional. Indices of rows of data in memory pool
 //! \param batchSize number of states to initialize
 //! \param randomSeed seed to initialize states
 //! \param stream stream
 void invokeCurandInitialize(
-    curandState_t* state, const size_t batchSize, unsigned long long randomSeed, cudaStream_t stream);
+    curandState_t* state, int const* batchSlots, const size_t batchSize, uint64_t randomSeed, cudaStream_t stream);
 
 //! \brief Initialize batchSize curand states with given seed per request.
 //!
-//! \param state output buffer [batchSize] of curand states to be initialized
+//! \param state output buffer [maxBatchSize] of curand states to be initialized
+//! \param batchSlots input buffer[batchSize], optional. Indices of rows of data in memory pool
 //! \param batchSize number of states to initialize
-//! \param randomSeeds input buffer [batchSize] with seeds
+//! \param randomSeeds input buffer [maxBatchSize] with seeds
 //! \param stream stream
-void invokeCurandBatchInitialize(
-    curandState_t* states, const size_t batchSize, const unsigned long long* randomSeeds, cudaStream_t stream);
+void invokeCurandBatchInitialize(curandState_t* states, int const* batchSlots, const size_t batchSize,
+    uint64_t const* randomSeeds, cudaStream_t stream);
 
 //! \brief Applies mask, adds bias to logits and computes softmax values.
 //! Sets -MAX_FLT value for tokens in range [vocabSize; vocabSizePadded) to prevent them from being chosen.
 //! If request finished the generation, sets MAX_FLT to endId token and -MAX_FLT to all other tokens forcing to choose
 //! endId token. Otherwise, adds bias per token if bias pointer is not nullptr.
 //!
-//! \param logits input/output buffer [batchSize, vocabSize]. Logits to be modified by mask and bias.
-//! \param probs output buffer [batchSize, vocabSize]. Probabilities of logits compute by softmax.
+//! \param logits input/output buffer [maxBatchSize, vocabSize]. Logits to be modified by mask and bias.
+//! If nullptr, logitsPtrs has to be provided.
+//! \param logitsPtrs input/output buffer [maxBatchSize][vocabSize]. Vector of pointers to the logits.
+//! If nullptr, logits has to be provided.
+//! \param probs output buffer [maxBatchSize, vocabSize]. Probabilities of logits compute by softmax.
 //! Can be the same pointer as logits
 //! \param bias input buffer [vocabSize]. Bias to logit per token. Ignored if nullptr
-//! \param endIds input buffer [batchSize]. EOS token ids per request
-//! \param finished input buffer [batchSize] with flags set to true if request has finished the generation
-//! \param batchSize batch size
+//! \param endIds input buffer [maxBatchSize]. EOS token ids per request
+//! \param finished input buffer [maxBatchSize] with flags set to true if request has finished the generation
+//! \param batchSlots input buffer[batchSize], optional. Indices of rows of data in memory pool
+//! \param batchSize current batch size
+//! \param maxBatchSize max batch size
+//! \param beamWidth beam width
 //! \param vocabSize unpadded vocab size
 //! \param vocabSizePadded padded vocab size
+//! \param skipSoftMax flag to skip softmax computation
+//! \param batchSlotsLogits flag to use batchSlot as index for logits and probs
 //! \param stream stream
 template <typename T>
-void invokeAddBiasSoftMax(T* logits, T* probs, const T* bias, const int* endIds, const FinishedState* finished,
-    const int batchSize, const int vocabSize, const int vocabSizePadded, cudaStream_t stream);
+void invokeAddBiasSoftMax(T* logits, T** logitsPtrs, T* probs, T const* bias, int32_t const* endIds,
+    FinishedState const* finished, int32_t const* batchSlots, int32_t batchSize, int32_t maxBatchSize,
+    int32_t beamWidth, int32_t vocabSize, int32_t vocabSizePadded, bool skipSoftMax, bool batchSlotsLogits,
+    cudaStream_t stream);
+
+//! \brief Distributes values located in src to dst according to the indieces from batchSlots
+//!
+//! \param src input buffer [batchSize].
+//! \param dst output buffer [maxBatchSize].
+//! \param batchSlots input buffer [batchSize], optional. Indices of rows of data in memory pool
+//! \param batchSize batch size
+//! \param stream stream
+template <typename T>
+void invokeScatterDecodingParams(T const* src, T* dst, int const* batchSlots, int batchSize, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm

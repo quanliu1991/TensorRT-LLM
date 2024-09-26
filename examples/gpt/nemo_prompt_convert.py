@@ -1,5 +1,5 @@
 #! /usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,10 +22,9 @@ from pathlib import Path
 import numpy as np
 import torch
 import yaml
-from utils.convert import cpu_map_location
-from utils.nemo import unpack_nemo_ckpt
 
 from tensorrt_llm._utils import torch_to_numpy
+from tensorrt_llm.models.gpt.convert import cpu_map_location, unpack_nemo_ckpt
 
 log_format = "%(asctime)s %(name)s [%(levelname)s] %(message)s"
 logging.basicConfig(format=log_format)

@@ -2,172 +2,218 @@
 
 This document explains how to build the [MPT](https://huggingface.co/mosaicml/mpt-7b) model using TensorRT-LLM and run on a single GPU and a single node with multiple GPUs.
 
+- [MPT](#mpt)
+  - [Overview](#overview)
+  - [Support Matrix](#support-matrix)
+    - [MPT 7B](#mpt-7b)
+      - [1.1 Convert from HF Transformers in FP](#11-convert-from-hf-transformers-in-fp)
+      - [1.2 Convert from HF Transformers with weight-only quantization](#12-convert-from-hf-transformers-with-weight-only-quantization)
+      - [1.3 Convert from HF Transformers with SmoothQuant quantization](#13-convert-from-hf-transformers-with-smoothquant-quantization)
+      - [1.4 Convert from HF Transformers with INT8 KV cache quantization](#14-convert-from-hf-transformers-with-int8-kv-cache-quantization)
+      - [1.5 AWQ weight-only quantization with Modelopt](#15-awq-weight-only-quantization-with-modelopt)
+      - [1.6 FP8 Post-Training Quantization with Modelopt](#16-fp8-post-training-quantization-with-modelopt)
+      - [1.6 Weight-only quantization with Modelopt](#16-weight-only-quantization-with-modelopt)
+      - [1.7 SmoothQuant and INT8 KV cache with Modelopt](#17-smoothquant-and-int8-kv-cache-with-modelopt)
+    - [2.1 Build TensorRT engine(s)](#21-build-tensorrt-engines)
+    - [MPT 30B](#mpt-30b)
+      - [1. Convert weights from HF Transformers to TRTLLM format](#1-convert-weights-from-hf-transformers-to-trtllm-format)
+      - [2. Build TensorRT engine(s)](#2-build-tensorrt-engines)
+      - [3. Run TRT engine to check if the build was correct](#3-run-trt-engine-to-check-if-the-build-was-correct)
+    - [Replit Code V-1.5 3B](#replit-code-v-15-3b)
+      - [1. Convert weights from HF Transformers to TRTLLM format](#1-convert-weights-from-hf-transformers-to-trtllm-format-1)
+      - [2. Build TensorRT engine(s)](#2-build-tensorrt-engines-1)
+      - [3. Run TRT engine to check if the build was correct](#3-run-trt-engine-to-check-if-the-build-was-correct-1)
+
 ## Overview
-Currently we use `tensorrt_llm.models.GPTLMHeadModel` to build TRT engine for MPT models.
-Support for float16, float32 and bfloat16 conversion. Just change `data_type` flags to any.
+
+The TensorRT-LLM MPT implementation can be found in [`tensorrt_llm/models/mpt/model.py`](../../tensorrt_llm/models/mpt/model.py). The TensorRT-LLM MPT example code is located in [`examples/mpt`](./). There is one main file:
+
+* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT-LLM format.
+
+In addition, there are two shared files in the parent folder [`examples`](../) for inference and evaluation:
+
+* [`../run.py`](../run.py) to run the inference on an input text;
+* [`../summarize.py`](../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
 
 ## Support Matrix
   * FP16
-  * FP8
+  * FP8 (with FP8 KV Cache)
   * INT8 & INT4 Weight-Only
-  * FP8 KV CACHE
+  * INT8 Smooth Quant
+  * INT4 AWQ
   * Tensor Parallel
   * MHA, MQA & GQA
   * STRONGLY TYPED
 
-#### MPT 7B
+### MPT 7B
 
-### 1. Convert weights from HF Transformers to FT format
-
-The [`convert_hf_mpt_to_ft.py`](./convert_hf_mpt_to_ft.py) script allows you to convert weights from HF Transformers format to FT format.
+Please install required packages first:
 
 ```bash
-python convert_hf_mpt_to_ft.py -i mosaicml/mpt-7b -o ./ft_ckpts/mpt-7b/fp16/ -t float16
-
-python convert_hf_mpt_to_ft.py -i mosaicml/mpt-7b -o ./ft_ckpts/mpt-7b/fp32/ --tensor_parallelism 4 -t float32
+pip install -r requirements.txt
 ```
 
-`--infer_gpu_num 4` is used to convert to FT format with 4-way tensor parallelism
+The [`convert_checkpoint.py`](./convert_checkpoint.py) script allows you to convert weights from HF Transformers format to TRTLLM checkpoints.
 
-
-### 2. Build TensorRT engine(s)
-
-Examples of build invocations:
+#### 1.1 Convert from HF Transformers in FP
 
 ```bash
-# Build a single-GPU float16 engine using FT weights.
-python3 build.py --model_dir=./ft_ckpts/mpt-7b/fp16/1-gpu \
-                 --max_batch_size 64 \
-                 --use_gpt_attention_plugin \
-                 --use_gemm_plugin \
-                 --output_dir ./trt_engines/mpt-7b/fp16/1-gpu
+# Generate FP16 checkpoints.
+python convert_checkpoint.py --model_dir mosaicml/mpt-7b --output_dir ./ckpts/mpt-7b/fp16/ --dtype float16
 
-# Build 4-GPU MPT-7B float32 engines
-# Enable several TensorRT-LLM plugins to increase runtime performance. It also helps with build time.
-python3 build.py --world_size=4 \
-                 --parallel_build \
-                 --max_batch_size 64 \
-                 --max_input_len 512 \
-                 --max_output_len 64 \
-                 --use_gpt_attention_plugin \
-                 --use_gemm_plugin \
-                 --model_dir ./ft_ckpts/mpt-7b/fp32/4-gpu \
-                 --output_dir=./trt_engines/mpt-7b/fp32/4-gpu
+# Generate FP32 checkpoints with TP=4.
+python convert_checkpoint.py --model_dir mosaicml/mpt-7b --output_dir ./ckpts/mpt-7b/fp32_tp4/ --dtype float32 --tp_size 4
 ```
 
-### 3. Run TRT engine to check if the build was correct
+#### 1.2 Convert from HF Transformers with weight-only quantization
 
 ```bash
-python ../run.py --max_output_len 10 \
-                 --engine_dir ./trt_engines/mpt-7b/fp16/1-gpu/ \
-                 --tokenizer_dir mosaicml/mpt-7b
+# Use int8 weight-only quantization.
+python convert_checkpoint.py --model_dir mosaicml/mpt-7b --output_dir ./ckpts/mpt-7b/int8_wo/ --use_weight_only
 
-# Run 4-GPU MPT7B TRT engine on a sample input prompt
-mpirun -n 4 --allow-run-as-root \
-    python ../run.py --max_output_len 10 \
-                     --engine_dir ./trt_engines/mpt-7b/fp32/4-gpu/ \
-                     --tokenizer_dir mosaicml/mpt-7b
+# Use int4 weight-only quantization.
+python convert_checkpoint.py --model_dir mosaicml/mpt-7b --output_dir ./ckpts/mpt-7b/int4_wo/ --use_weight_only --weight_only_precision int4
 ```
 
-#### MPT 30B
+#### 1.3 Convert from HF Transformers with SmoothQuant quantization
+
+```bash
+# Use int8 smoothquant (weight and activation) quantization.
+python convert_checkpoint.py --model_dir mosaicml/mpt-7b --output_dir ./ckpts/mpt-7b/int8_sq/ --smoothquant 0.5
+```
+
+#### 1.4 Convert from HF Transformers with INT8 KV cache quantization
+
+```bash
+# Use int8 kv cache quantization.
+python convert_checkpoint.py --model_dir mosaicml/mpt-7b --output_dir ./ckpts/mpt-7b/fp16_int8kv/ --dtype float16 --calibrate_kv_cache
+```
+***INT8-KV-cache can be used with SQ and Weight-only at the same time***
+
+
+***We now introduce Modelopt to do all quantization***
+First make sure Modelopt toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
+
+#### 1.5 AWQ weight-only quantization with Modelopt
+
+```bash
+# INT4 AWQ quantization using Modelopt.
+python ../quantization/quantize.py --model_dir mosaicml/mpt-7b --output_dir ./ckpts/mpt-7b/int4_awq/ --qformat int4_awq
+```
+
+#### 1.6 FP8 Post-Training Quantization with Modelopt
+
+```bash
+# FP8 quantization using Modelopt.
+python ../quantization/quantize.py --model_dir mosaicml/mpt-7b --output_dir ./ckpts/mpt-7b/fp8/ --qformat fp8 --kv_cache_dtype fp8
+```
+
+#### 1.6 Weight-only quantization with Modelopt
+
+```bash
+# INT8 Weight-only quantization using Modelopt with TP=2.
+python ../quantization/quantize.py --model_dir mosaicml/mpt-7b --output_dir ./ckpts/mpt-7b/int8_wo/ --qformat int8_wo --tp_size 2
+
+# INT4 Weight-only quantization using Modelopt.
+python ../quantization/quantize.py --model_dir mosaicml/mpt-7b --output_dir ./ckpts/mpt-7b/int4_wo/ --qformat int4_wo
+```
+
+#### 1.7 SmoothQuant and INT8 KV cache with Modelopt
+
+```bash
+# Use int4 awq quantization.
+python ../quantization/quantize.py --model_dir mosaicml/mpt-7b --output_dir ./ckpts/mpt-7b/sq_int8kv/ --qformat int8_sq --kv_cache_dtype int8
+```
+***INT8-KV-cache can also be used with Weight-only at the same time***
+
+
+### 2.1 Build TensorRT engine(s)
+
+All of the checkpoint generated by `convert_checkpoint.py` or `quantize.py` (Modelopt) can share the same building commands.
+
+```bash
+# Build a single-GPU float16 engine using TRTLLM checkpoints.
+trtllm-build --checkpoint_dir=./ckpts/mpt-7b/fp16 \
+             --max_batch_size 32 \
+             --max_input_len 1024 \
+             --max_seq_len 1536 \
+             --gemm_plugin float16 \
+             --workers 1 \
+             --output_dir ./trt_engines/mpt-7b/fp16
+```
+
+### MPT 30B
 
 Same commands can be changed to convert MPT 30B to TRT LLM format. Below is an example to build MPT30B fp16 4-way tensor parallelized TRT engine
 
-### 1. Convert weights from HF Transformers to FT format
+#### 1. Convert weights from HF Transformers to TRTLLM format
 
-The [`convert_hf_mpt_to_ft.py`](./convert_hf_mpt_to_ft.py) script allows you to convert weights from HF Transformers format to FT format.
-
+The [`convert_checkpoint.py`](./convert_checkpoint.py) script allows you to convert weights from HF Transformers format to TRTLLM format.
 
 ```bash
-python convert_hf_mpt_to_ft.py -i mosaicml/mpt-30b -o ./ft_ckpts/mpt-7b/fp16/ --tensor_parallelism 4 -t float16
+python convert_checkpoint.py --model_dir mosaicml/mpt-30b --output_dir ./ckpts/mpt-30b/fp16_tp4/ --tp_szie 4 --dtype float16
 ```
 
-`--infer_gpu_num 4` is used to convert to FT format with 4-way tensor parallelism
-
-
-### 2. Build TensorRT engine(s)
+#### 2. Build TensorRT engine(s)
 
 Examples of build invocations:
 
 ```bash
 # Build 4-GPU MPT-30B float16 engines
-python3 build.py --world_size=4 \
-                 --parallel_build \
-                 --max_batch_size 64 \
-                 --max_input_len 512 \
-                 --max_output_len 64 \
-                 --use_gpt_attention_plugin \
-                 --use_gemm_plugin \
-                 --model_dir ./ft_ckpts/mpt-30b/fp16/4-gpu \
-                 --output_dir=./trt_engines/mpt-30b/fp16/4-gpu
+trtllm-build --checkpoint_dir ./ckpts/mpt-30b/fp16_tp4 \
+             --max_batch_size 32 \
+             --max_input_len 1024 \
+             --max_seq_len 1536 \
+             --gemm_plugin float16 \
+             --workers 4 \
+             --output_dir ./trt_engines/mpt-30b/fp16_tp4
 ```
 
-### 3. Run TRT engine to check if the build was correct
+#### 3. Run TRT engine to check if the build was correct
 
 ```bash
-# Run 4-GPU MPT7B TRT engine on a sample input prompt
+# Run 4-GPU MPT-30B TRT engine on a sample input prompt
 mpirun -n 4 --allow-run-as-root \
     python ../run.py --max_output_len 10 \
-                     --engine_dir ./trt_engines/mpt-30b/fp16/4-gpu/  \
+                     --engine_dir ./trt_engines/mpt-30b/fp16/4-gpu/ \
                      --tokenizer_dir mosaicml/mpt-30b
 ```
 
-#### Replit Code V-1.5 3B
+### Replit Code V-1.5 3B
 Same commands can be changed to convert [Replit Code V-1.5 3B](https://huggingface.co/replit/replit-code-v1_5-3b) to TRT LLM format. Below is an example to build Replit Code V-1.5 3B fp16 2-way tensor parallelized TRT engine.
 
-### 1. Convert weights from HF Transformers to FT format
+#### 1. Convert weights from HF Transformers to TRTLLM format
 
-The [`convert_hf_mpt_to_ft.py`](./convert_hf_mpt_to_ft.py) script allows you to convert weights from HF Transformers format to FT format.
-
+The [`convert_checkpoint.py`](./convert_checkpoint.py) script allows you to convert weights from HF Transformers format to TRTLLM format.
 
 ```bash
-python convert_hf_mpt_to_ft.py -i ./replit-code-v1_5-3b -o ./ft_ckpts/replit-code-v1_5-3b/bf16/ --tensor_parallelism 2 -t bfloat16
+python convert_checkpoint.py --model_dir ./replit-code-v1_5-3b --output_dir ./ckpts/replit-code-v1_5-3b/bf16_tp2/ --tp_size 2 --dtype bfloat16
 ```
 
-`--infer_gpu_num 2` is used to convert to FT format with 2-way tensor parallelism
-
-
-### 2. Build TensorRT engine(s)
+#### 2. Build TensorRT engine(s)
 
 Examples of build invocations:
 
 ```bash
 # Build 2-GPU Replit Code V-1.5 3B bfloat16 engines
-python3 build.py --world_size=2 \
-                 --parallel_build \
-                 --max_batch_size 16 \
-                 --max_input_len 512 \
-                 --max_output_len 64 \
-                 --use_gpt_attention_plugin \
-                 --use_gemm_plugin \
-                 --model_dir ./ft_ckpts/replit-code-v1_5-3b/bf16/2-gpu \
-                 --output_dir=./trt_engines/replit-code-v1_5-3b/bf16/2-gpu
-```
-Here is the partial output of above command.
-
-```bash
-[11/15/2023-02:47:50] [TRT] [I] Total Activation Memory: 738233344
-[11/15/2023-02:47:51] [TRT] [I] Total Weights Memory: 3523622456
-[11/15/2023-02:47:51] [TRT] [I] [MemUsageChange] Init cuBLAS/cuBLASLt: CPU +0, GPU +64, now: CPU 8316, GPU 5721 (MiB)
-[11/15/2023-02:47:51] [TRT] [I] [MemUsageChange] Init cuDNN: CPU +0, GPU +64, now: CPU 8316, GPU 5785 (MiB)
-[11/15/2023-02:47:51] [TRT] [I] [MemUsageStats] Peak memory usage of TRT CPU/GPU memory allocators: CPU 192 MiB, GPU 3361 MiB
-[11/15/2023-02:47:51] [TRT] [I] [MemUsageChange] TensorRT-managed allocation in building engine: CPU +0, GPU +3361, now: CPU 0, GPU 3361 (MiB)
-[11/15/2023-02:47:51] [TRT] [I] [MemUsageStats] Peak memory usage during Engine building and serialization: CPU: 12851 MiB
-[11/15/2023-02:47:51] [TRT-LLM] [I] Total time of building gpt_bfloat16_tp2_rank1.engine: 00:00:04
-[11/15/2023-02:47:51] [TRT-LLM] [I] Serializing engine to trt_engines/replit-code-v1_5-3b/bf16/2-gpu/gpt_bfloat16_tp2_rank1.engine...
-[11/15/2023-02:48:02] [TRT-LLM] [I] Engine serialized. Total time: 00:00:10
-[11/15/2023-02:48:02] [TRT-LLM] [I] Timing cache serialized to model.cache
-[11/15/2023-02:48:02] [TRT-LLM] [I] Total time of building all 2 engines: 00:01:21
+trtllm-build --checkpoint_dir ./ckpts/replit-code-v1_5-3b/bf16_tp2 \
+             --max_batch_size 32 \
+             --max_input_len 1024 \
+             --max_seq_len 1536 \
+             --gpt_attention_plugin bfloat16 \
+             --gemm_plugin bfloat16 \
+             --workers 2 \
+             --output_dir ./trt_engines/replit-code-v1_5-3b/bf16_tp2
 ```
 
-### 3. Run TRT engine to check if the build was correct
+#### 3. Run TRT engine to check if the build was correct
 
 ```bash
 # Run 2-GPU Replit Code V-1.5 3B TRT engine on a sample input prompt
 mpirun -n 2 --allow-run-as-root \
     python ../run.py --max_output_len 64 \
                      --input_text "def fibonacci" \
-                     --engine_dir ./trt_engines/replit-code-v1_5-3b/bf16/2-gpu/ \
+                     --engine_dir ./trt_engines/replit-code-v1_5-3b/bf16_tp2 \
                      --tokenizer_dir ./replit-code-v1_5-3b/
 ```
 
@@ -183,30 +229,4 @@ Output: "(n):
         return fibonacci(n-1) + fibonacci(n-2)
 
 print(fibonacci(10))"
-```
-#### FP8 Post-Training Quantization
-
-The example below uses the NVIDIA AMMO (AlgorithMic Model Optimization) toolkit for the model quantization process.
-
-First make sure AMMO toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
-
-After successfully running the script, the output should be in .npz format, e.g. `quantized_fp8/llama_tp_1_rank0.npz`,
-where FP8 scaling factors are stored.
-
-```bash
-# Quantize MPT 7B into FP8 and export a single-rank checkpoint
-python examples/quantization/quantize.py --model_dir .mosaicml/mpt-7b \
-                                         --dtype float16 \
-                                         --qformat fp8 \
-                                         --export_path ./quantized_fp8
-
-# Build MPT 7B TP using binary checkpoint + PTQ scaling factors from the single-rank checkpoint
-python build.py --model_dir ft_ckpts/mpt-7b/fp16 \
-                --quantized_fp8_model_path ./quantized_fp8/mpt_tp1_rank0.npz \
-                --use_gpt_attention_plugin \
-                --use_gemm_plugin \
-                --output_dir trt_engines/mpt-7b/fp8/1-gpu/ \
-                --remove_input_padding \
-                --enable_fp8 \
-                --fp8_kv_cache
 ```

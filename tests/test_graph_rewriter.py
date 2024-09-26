@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,7 +27,8 @@ import tensorrt_llm
 import tensorrt_llm as tllm
 from tensorrt_llm import Tensor, net_guard
 from tensorrt_llm._utils import torch_to_numpy
-from tensorrt_llm.functional import PositionEmbeddingType, gpt_attention
+from tensorrt_llm.functional import (PositionEmbeddingType, RopeEmbeddingUtils,
+                                     gpt_attention)
 from tensorrt_llm.graph_rewriting import (AnalysisPatternManager,
                                           FLayerInfoMemo,
                                           FuseAttentionWithBiasPass, Layer,
@@ -54,8 +55,10 @@ def create_gpt_attention_network(attention_type='gpt2_attention',
 
         # construct trt network
         builder = tensorrt_llm.Builder()
+        builder.strongly_typed = False  # Test need to run in weekly typed mode
         net = builder.create_network()
-        net.plugin_config.set_gpt_attention_plugin(dtype)
+        net.plugin_config.to_legacy_setting()
+        net.plugin_config.gpt_attention_plugin = dtype
         net.plugin_config.remove_input_padding = True
 
         head_size = hidden_size // num_heads
@@ -78,6 +81,10 @@ def create_gpt_attention_network(attention_type='gpt2_attention',
             host_max_attention_window_sizes_tensor = Tensor(
                 name='host_max_attention_window_sizes',
                 shape=shape_dict['host_max_attention_window_sizes'],
+                dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+            host_sink_token_length_tensor = Tensor(
+                name='host_sink_token_length',
+                shape=shape_dict['host_sink_token_length'],
                 dtype=tensorrt_llm.str_dtype_to_trt('int32'))
             context_lengths_tensor = Tensor(
                 name='context_lengths',
@@ -121,6 +128,16 @@ def create_gpt_attention_network(attention_type='gpt2_attention',
                 position_embedding_type = PositionEmbeddingType.rope_gptj
             else:
                 position_embedding_type = PositionEmbeddingType.learned_absolute
+            rotary_inv_freq_cache, embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
+                1024, rotary_embedding_dim)
+            if position_embedding_type.is_rope():
+                rotary_inv_freq = tensorrt_llm.functional.constant(
+                    rotary_inv_freq_cache)
+                rotary_cos_sin = tensorrt_llm.functional.constant(
+                    embed_positions_for_gpt_attention)
+            else:
+                rotary_inv_freq = None
+                rotary_cos_sin = None
             outputs = tensorrt_llm.functional.gpt_attention(
                 qkv=qkv,
                 past_key_value=past_key_value_tensor,
@@ -128,9 +145,11 @@ def create_gpt_attention_network(attention_type='gpt2_attention',
                 host_past_key_value_lengths=host_past_key_value_lengths_tensor,
                 host_max_attention_window_sizes=
                 host_max_attention_window_sizes_tensor,
+                host_sink_token_length=host_sink_token_length_tensor,
                 context_lengths=context_lengths_tensor,
                 cache_indirection=cache_indirection_tensor,
                 host_request_types=host_request_types_tensor,
+                layer_idx=0,
                 num_heads=num_heads,
                 num_kv_heads=1 if enable_multi_query_attention else num_heads,
                 hidden_size_per_head=head_size,
@@ -138,11 +157,13 @@ def create_gpt_attention_network(attention_type='gpt2_attention',
                 max_context_length=in_len,
                 rotary_embedding_dim=rotary_embedding_dim,
                 position_embedding_type=position_embedding_type,
+                rotary_inv_freq=rotary_inv_freq,
+                rotary_cos_sin=rotary_cos_sin,
                 kv_orig_quant_scale=None,
                 kv_quant_orig_scale=None,
                 kv_cache_quant_mode=QuantMode.from_description(
                     use_int8_kv_cache=False),
-                kv_cache_block_pointers=None,
+                kv_cache_block_offsets=None,
                 host_context_lengths=host_context_lengths_tensor)
 
             net._mark_output(outputs[0],
@@ -178,7 +199,8 @@ def create_gpt_attention_network(attention_type='gpt2_attention',
         'input': (batch_size, in_len, hidden_size),
         'output': (batch_size, in_len, hidden_size),
         'host_past_key_value_lengths': (batch_size, ),
-        'host_max_attention_window_sizes': (1, )
+        'host_max_attention_window_sizes': (1, ),
+        'host_sink_token_length': (1, )
     }
 
     weight = torch.randn(shape_dict['weight'],
@@ -284,7 +306,7 @@ class NaivePatternRewriter_ReplaceAddWithSub(PatternRewriter):
     def __init__(self):
         super().__init__('replace_add_with_sub',
                          root_layer={trt.LayerType.ELEMENTWISE},
-                         seperate_match_rewrite=True)
+                         separate_match_rewrite=True)
         self.rewrite_count = 0
 
     def match(self, layer: Layer):

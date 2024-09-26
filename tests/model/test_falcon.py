@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,13 +24,15 @@ from transformers import FalconConfig, FalconForCausalLM
 import tensorrt_llm
 from tensorrt_llm import Builder
 from tensorrt_llm._utils import str_dtype_to_torch
+from tensorrt_llm.bindings import KVCacheType
+from tensorrt_llm.models.falcon.convert import load_weights_from_hf_model
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.runtime import ModelConfig, SamplingConfig
 from tensorrt_llm.runtime.generation import _prepare_attention_mask
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-from examples.falcon.weight import load_from_hf_falcon  # isort:skip
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.util import unittest_name_func
 
 
 class TestFalcon(unittest.TestCase):
@@ -90,41 +92,31 @@ class TestFalcon(unittest.TestCase):
                            dtype: str, batch_size: int, beam_width: int,
                            input_len: int, output_len: int,
                            tensor_parallel: int, rank: int):
+        hf_config.max_position_embeddings = (input_len + output_len)
+        config = tensorrt_llm.models.FalconConfig.from_hugging_face(
+            hf_config,
+            dtype=dtype,
+            mapping={
+                'world_size': tensor_parallel,
+                'tp_size': tensor_parallel,
+                'rank': rank,
+            })
+        trtllm_model = tensorrt_llm.models.FalconForCausalLM(config)
+        weights = load_weights_from_hf_model(hf_model, config)
+        trtllm_model.load(weights)
+
         with net_guard(network):
             # Initialize model
-            trtllm_model = tensorrt_llm.models.FalconForCausalLM(
-                num_layers=hf_config.num_hidden_layers,
-                num_heads=hf_config.num_attention_heads,
-                hidden_size=hf_config.hidden_size,
-                vocab_size=hf_config.vocab_size,
-                hidden_act='gelu',
-                use_alibi=hf_config.alibi,
-                bias=hf_config.bias,
-                parallel_attention=hf_config.parallel_attn,
-                new_decoder_architecture=hf_config.new_decoder_architecture,
-                max_position_embeddings=input_len + output_len,
-                dtype=dtype,
-                mapping=tensorrt_llm.Mapping(world_size=tensor_parallel,
-                                             rank=rank,
-                                             tp_size=tensor_parallel),
-                num_kv_heads=hf_config.num_kv_heads)
             network.set_named_parameters(trtllm_model.named_parameters())
-
-            inputs = trtllm_model.prepare_inputs(batch_size,
-                                                 input_len,
-                                                 output_len,
-                                                 use_cache=True,
-                                                 max_beam_width=beam_width)
-            load_from_hf_falcon(trtllm_model,
-                                hf_model,
-                                mapping=tensorrt_llm.Mapping(
-                                    world_size=tensor_parallel,
-                                    rank=rank,
-                                    tp_size=tensor_parallel),
-                                dtype=dtype)
-
+            inputs = trtllm_model.prepare_inputs(
+                max_batch_size=batch_size,
+                max_input_len=input_len,
+                max_seq_len=input_len + output_len,
+                max_num_tokens=batch_size * input_len,
+                use_cache=True,
+                max_beam_width=beam_width)
             # Prepare
-            trtllm_model(*inputs)
+            trtllm_model(**inputs)
 
     def generate_trtllm_runtime(self,
                                 model_name: str,
@@ -155,16 +147,17 @@ class TestFalcon(unittest.TestCase):
             use_alibi=hf_config.alibi,
             parallel_attention=hf_config.parallel_attn,
             use_refit=use_refit,
-            strongly_typed=(dtype == "float16"),
+            strongly_typed=True,
         )
 
         network = builder.create_network()
+        network.plugin_config.to_legacy_setting()
         if use_gpt_attengion_plugin:
-            network.plugin_config.set_gpt_attention_plugin(dtype)
+            network.plugin_config.gpt_attention_plugin = dtype
         if use_gemm_plugin:
-            network.plugin_config.set_gemm_plugin(dtype)
+            network.plugin_config.gemm_plugin = dtype
         if enable_remove_input_padding:
-            network.plugin_config.enable_remove_input_padding()
+            network.plugin_config.remove_input_padding = True
         if world_size > 1:
             network.plugin_config.set_nccl_plugin(dtype)
         network.plugin_config.set_context_fmha(context_fmha_type)
@@ -201,10 +194,10 @@ class TestFalcon(unittest.TestCase):
              ContextFMHAType.disabled, 'float16'),
             ('MQA', False, True, False, False, True, True, False,
              ContextFMHAType.disabled, 'float32'),
-            # TC for Falcon-40B arch: GQA + RoPE + new_decoder_architecture
-            ('GQA', False, False, True, False, True, True, False,
+            # TC for Falcon-40B arch: GQA + RoPE + parallel_attention + new_decoder_architecture
+            ('GQA', False, True, True, False, True, True, False,
              ContextFMHAType.disabled, 'float16'),
-            ('GQA', False, False, True, False, True, True, False,
+            ('GQA', False, True, True, False, True, True, False,
              ContextFMHAType.disabled, 'float32'),
         ]
         return test_cases
@@ -244,25 +237,13 @@ class TestFalcon(unittest.TestCase):
                        new_decoder_architecture, use_refit,
                        use_gpt_attengion_plugin, use_gemm_plugin,
                        remove_input_padding, context_fmha_type, dtype):
-        print(' Test Case Parameters')
-        print(' - query_type', query_type)
-        print(' - use_alibi', use_alibi)
-        print(' - parallel_attention', parallel_attention)
-        print(' - new_decoder_architecture', new_decoder_architecture)
-        print(' - use_refit', use_refit)
-        print(' - use_gpt_attengion_plugin', use_gpt_attengion_plugin)
-        print(' - use_gemm_plugin', use_gemm_plugin)
-        print(' - remove_input_padding', remove_input_padding)
-        print(' - context_fmha_type', context_fmha_type)
-        print(' - dtype', dtype)
-
         # Skip unsupported cases.
         if use_alibi and use_gpt_attengion_plugin:
             self.skipTest('ALiBi needs use_gpt_attengion_plugin = False')
         if not use_alibi and not use_gpt_attengion_plugin:
             self.skipTest('RoPE needs use_gpt_attengion_plugin = True')
 
-    @parameterized.expand(load_test_cases())
+    @parameterized.expand(load_test_cases(), name_func=unittest_name_func)
     def test_falcon(self, query_type, use_alibi, parallel_attention,
                     new_decoder_architecture, use_refit,
                     use_gpt_attengion_plugin, use_gemm_plugin,
@@ -310,6 +291,7 @@ class TestFalcon(unittest.TestCase):
         kv_dtype = dtype
         device = hf_model.device
         pad_id = hf_config.pad_token_id
+        num_layers = hf_config.num_hidden_layers
 
         # 1. Check the correctness of context computation.
 
@@ -347,8 +329,14 @@ class TestFalcon(unittest.TestCase):
         # past kv length: (length, is_context)
         host_past_key_value_lengths = torch.tensor([0] * batch_size,
                                                    dtype=torch.int32)
-        host_max_attention_window_sizes = torch.tensor([total_length],
+        host_max_attention_window_sizes = torch.tensor([total_length] *
+                                                       num_layers,
                                                        dtype=torch.int32)
+        host_sink_token_length = torch.tensor([0], dtype=torch.int32)
+
+        perf_knob_tensor_size = 16
+        context_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
+                                                  dtype=torch.int64)
 
         ctx_buffer = {
             'input_ids': ctx_input_ids.contiguous(),
@@ -361,6 +349,8 @@ class TestFalcon(unittest.TestCase):
             'sequence_length': sequence_length.contiguous(),
             'host_past_key_value_lengths':
             host_past_key_value_lengths.contiguous(),
+            'host_sink_token_length': host_sink_token_length,
+            'host_runtime_perf_knobs': context_runtime_perf_knobs,
         }
         if remove_input_padding:
             ctx_buffer['host_context_lengths'] = ctx_context_lengths.cpu()
@@ -374,9 +364,11 @@ class TestFalcon(unittest.TestCase):
             past_kv_shape = (batch_size, 2, num_kv_heads, 0, head_dim)
             present_kv_shape = (batch_size, 2, num_kv_heads, input_len,
                                 head_dim)
-        for i in range(hf_config.num_hidden_layers):
+        ctx_shape[f'host_max_attention_window_sizes'] = (num_layers, )
+        ctx_buffer[
+            f'host_max_attention_window_sizes'] = host_max_attention_window_sizes
+        for i in range(num_layers):
             ctx_shape[f'past_key_value_{i}'] = past_kv_shape
-            ctx_shape[f'host_max_attention_window_size_{i}'] = (1, )
             ctx_buffer[f'present_key_value_{i}'] = torch.zeros(
                 present_kv_shape,
                 dtype=str_dtype_to_torch(kv_dtype),
@@ -384,8 +376,6 @@ class TestFalcon(unittest.TestCase):
             if use_gpt_attengion_plugin:
                 ctx_buffer[f'past_key_value_{i}'] = ctx_buffer[
                     f'present_key_value_{i}']
-                ctx_buffer[
-                    f'host_max_attention_window_size_{i}'] = host_max_attention_window_sizes
             else:
                 ctx_buffer[f'past_key_value_{i}'] = torch.zeros(
                     (1, ), dtype=str_dtype_to_torch(kv_dtype), device=device)
@@ -435,6 +425,9 @@ class TestFalcon(unittest.TestCase):
         # For step 1, the sequence_lengths = context_lengths + 1.
         sequence_length = torch.add(sequence_length, 1)
 
+        gen_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
+                                              dtype=torch.int64)
+
         step1_buffer = {
             'input_ids': gen_id,
             'context_lengths': gen_context_lengths.contiguous(),
@@ -446,17 +439,20 @@ class TestFalcon(unittest.TestCase):
             'sequence_length': sequence_length.contiguous(),
             'host_past_key_value_lengths':
             host_past_key_value_lengths.contiguous(),
+            'host_sink_token_length': host_sink_token_length,
+            'host_runtime_perf_knobs': gen_runtime_perf_knobs,
         }
         if remove_input_padding:
             step1_buffer['host_context_lengths'] = gen_context_lengths.cpu()
+        if use_gpt_attengion_plugin:
+            step1_buffer[
+                f'host_max_attention_window_sizes'] = host_max_attention_window_sizes
         for i in range(hf_config.num_hidden_layers):
             kv_cache = ctx_buffer[f'present_key_value_{i}']
             step1_buffer[f'past_key_value_{i}'] = kv_cache
             if use_gpt_attengion_plugin:
                 # gpt_attention_plugin shares past/present cache.
                 step1_buffer[f'present_key_value_{i}'] = kv_cache
-                step1_buffer[
-                    f'host_max_attention_window_size_{i}'] = host_max_attention_window_sizes
         step1_shape = {k: v.shape for k, v in step1_buffer.items()}
 
         context = runtime.context_1
@@ -482,7 +478,7 @@ class TestFalcon(unittest.TestCase):
 
         torch.testing.assert_close(ref, res, atol=1e-2, rtol=1e-1)
 
-    @parameterized.expand(load_test_cases())
+    @parameterized.expand(load_test_cases(), name_func=unittest_name_func)
     def test_greedy_search(self, query_type, use_alibi, parallel_attention,
                            new_decoder_architecture, use_refit,
                            use_gpt_attengion_plugin, use_gemm_plugin,
@@ -529,8 +525,11 @@ class TestFalcon(unittest.TestCase):
         device = hf_model.device
 
         model_config = ModelConfig(
+            max_batch_size=batch_size,
+            max_beam_width=beam_width,
             model_name=model_name,
             vocab_size=hf_config.vocab_size,
+            kv_cache_type=KVCacheType.CONTINUOUS,
             num_layers=hf_config.num_hidden_layers,
             num_heads=hf_config.num_attention_heads,
             num_kv_heads=hf_config.num_kv_heads,

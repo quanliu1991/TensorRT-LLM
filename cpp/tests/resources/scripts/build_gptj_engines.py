@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,20 +21,42 @@ import platform as _pf
 import sys as _sys
 import typing as _tp
 
-from build_engines_utils import run_command, wincopy
+from build_engines_utils import init_model_spec_module, run_command, wincopy
+
+init_model_spec_module()
+import model_spec
+
+import tensorrt_llm.bindings as _tb
 
 
-def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, *args):
-    build_args = [_sys.executable, "examples/gptj/build.py"] + (
-        ['--model_dir', str(weight_dir)] if weight_dir else []) + [
+def get_ckpt_without_quatization(model_dir, output_dir):
+    build_args = [_sys.executable, "examples/gptj/convert_checkpoint.py"] + [
+        '--model_dir={}'.format(model_dir),
+        '--output_dir={}'.format(output_dir),
+    ]
+    run_command(build_args)
+
+
+def get_ckpt_with_modelopt_quant(model_dir, output_dir, model_cache):
+    build_args = [_sys.executable, "examples/quantization/quantize.py"] + [
+        '--model_dir={}'.format(model_dir),
+        '--output_dir={}'.format(output_dir), '--qformat=fp8',
+        '--kv_cache_dtype=fp8',
+        f'--calib_dataset={model_cache}/datasets/cnn_dailymail'
+    ]
+    run_command(build_args)
+
+
+def build_engine(checkpoint_dir: _pl.Path, engine_dir: _pl.Path, *args):
+    build_args = ["trtllm-build"] + (
+        ['--checkpoint_dir', str(checkpoint_dir)] if checkpoint_dir else []) + [
             '--output_dir',
             str(engine_dir),
-            '--dtype=float16',
             '--logits_dtype=float16',
-            '--use_gemm_plugin=float16',
+            '--gemm_plugin=float16',
             '--max_batch_size=32',
             '--max_input_len=40',
-            '--max_output_len=20',
+            '--max_seq_len=60',
             '--max_beam_width=2',
             '--log_level=error',
         ] + list(args)
@@ -81,7 +103,7 @@ def build_engines(model_cache: _tp.Optional[str] = None, only_fp8=False):
                     cwd=hf_dir)
         else:
             run_command([
-                "rsync", "-av",
+                "rsync", "-rlptD",
                 str(_pl.Path(model_cache) / model_name / model_file_name), "."
             ],
                         cwd=hf_dir)
@@ -97,6 +119,7 @@ def build_engines(model_cache: _tp.Optional[str] = None, only_fp8=False):
     tp_size = 1
     pp_size = 1
     tp_pp_dir = f"tp{tp_size}-pp{pp_size}-gpu"
+    input_file = 'input_tokens.npy'
 
     if only_fp8:
         # with ifb, new plugin
@@ -105,26 +128,47 @@ def build_engines(model_cache: _tp.Optional[str] = None, only_fp8=False):
         )
         # TODO: use dummy scales atm; to re-enable when data is uploaded to the model cache
         # quantized_fp8_model_arg = '--quantized_fp8_model_path=' + \
-        #     str(_pl.Path(model_cache) / 'fp8-quantized-ammo' / 'gptj_tp1_rank0.npz')
-        build_engine(hf_dir, engine_dir / 'fp8-plugin' / tp_pp_dir,
-                     '--use_gpt_attention_plugin=float16', '--enable_fp8',
-                     '--fp8_kv_cache', '--use_inflight_batching',
-                     '--paged_kv_cache', '--remove_input_padding')
+        #     str(_pl.Path(model_cache) / 'fp8-quantized-modelopt' / 'gptj_tp1_rank0.npz')
+        fp8_ckpt_path = engine_dir / 'fp8' / tp_pp_dir
+        get_ckpt_with_modelopt_quant(hf_dir, fp8_ckpt_path, model_cache)
+        model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.FP8)
+        model_spec_obj.use_gpt_plugin()
+        model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
+        model_spec_obj.use_packed_input()
+        build_engine(fp8_ckpt_path,
+                     engine_dir / model_spec_obj.get_model_path() / tp_pp_dir,
+                     '--gpt_attention_plugin=float16',
+                     '--paged_kv_cache=enable', '--remove_input_padding=enable',
+                     "--context_fmha=disable")
     else:
+        fp16_ckpt_path = engine_dir / 'fp16' / tp_pp_dir
+        get_ckpt_without_quatization(hf_dir, fp16_ckpt_path)
         print("\nBuilding fp16-plugin engine")
-        build_engine(hf_dir, engine_dir / 'fp16-plugin' / tp_pp_dir,
-                     '--use_gpt_attention_plugin=float16')
+        model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.HALF)
+        model_spec_obj.use_gpt_plugin()
+        model_spec_obj.set_kv_cache_type(_tb.KVCacheType.CONTINUOUS)
+
+        build_engine(fp16_ckpt_path,
+                     engine_dir / model_spec_obj.get_model_path() / tp_pp_dir,
+                     '--gpt_attention_plugin=float16',
+                     '--paged_kv_cache=disable',
+                     '--remove_input_padding=disable', "--context_fmha=disable")
 
         print("\nBuilding fp16-plugin-packed engine")
-        build_engine(hf_dir, engine_dir / 'fp16-plugin-packed' / tp_pp_dir,
-                     '--use_gpt_attention_plugin=float16',
-                     '--remove_input_padding')
+        model_spec_obj.use_packed_input()
+        build_engine(fp16_ckpt_path,
+                     engine_dir / model_spec_obj.get_model_path() / tp_pp_dir,
+                     '--gpt_attention_plugin=float16',
+                     '--paged_kv_cache=disable',
+                     '--remove_input_padding=enable', "--context_fmha=disable")
 
         print("\nBuilding fp16-plugin-packed-paged engine")
-        build_engine(hf_dir,
-                     engine_dir / 'fp16-plugin-packed-paged' / tp_pp_dir,
-                     '--use_gpt_attention_plugin=float16',
-                     '--use_inflight_batching')
+        model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
+        build_engine(fp16_ckpt_path,
+                     engine_dir / model_spec_obj.get_model_path() / tp_pp_dir,
+                     '--gpt_attention_plugin=float16',
+                     '--paged_kv_cache=enable', '--remove_input_padding=enable',
+                     "--context_fmha=disable")
         print("Done.")
 
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,40 +14,56 @@
  * limitations under the License.
  */
 #include "bufferManager.h"
+#include "cudaMemPool.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tllmBuffers.h"
 
 #include <cstring>
 #include <cuda_runtime_api.h>
-#include <limits>
 #include <memory>
-#include <unordered_set>
-
-using namespace tensorrt_llm::runtime;
 
 namespace tc = tensorrt_llm::common;
 
-BufferManager::BufferManager(CudaStreamPtr stream)
+namespace tensorrt_llm::runtime
+{
+
+BufferManager::BufferManager(CudaStreamPtr stream, bool trimPool)
     : mStream{std::move(stream)}
+    , mTrimPool{trimPool}
 {
     TLLM_CHECK_WITH_INFO(static_cast<bool>(mStream), "Undefined CUDA stream");
-    thread_local static std::unordered_set<int> initializedDevices(8);
-    auto const device = mStream->getDevice();
-    if (initializedDevices.find(device) == initializedDevices.end())
-    {
-        initializedDevices.insert(device);
-        initMemoryPool(device);
-    }
+    mPool = CudaMemPool::getPrimaryPoolForDevice(mStream->getDevice());
 }
 
 BufferManager::IBufferPtr BufferManager::gpu(std::size_t size, nvinfer1::DataType type) const
 {
-    return std::make_unique<DeviceBuffer>(size, type, CudaAllocatorAsync{mStream});
+    if (static_cast<bool>(mPool))
+    {
+        return std::make_unique<DeviceBuffer>(size, type, CudaAllocatorAsync{mStream, mPool});
+    }
+    // When memory pools are not supported, fallback to synchronous memory allocations.
+    return gpuSync(size, type);
 }
 
 BufferManager::ITensorPtr BufferManager::gpu(nvinfer1::Dims dims, nvinfer1::DataType type) const
 {
-    return std::make_unique<DeviceTensor>(dims, type, CudaAllocatorAsync{mStream});
+    if (static_cast<bool>(mPool))
+    {
+        return std::make_unique<DeviceTensor>(dims, type, CudaAllocatorAsync{mStream, mPool});
+    }
+    // When memory pools are not supported, fallback to synchronous memory allocations.
+    return gpuSync(dims, type);
+}
+
+BufferManager::IBufferPtr BufferManager::gpuSync(std::size_t size, nvinfer1::DataType type)
+{
+    return std::make_unique<StaticDeviceBuffer>(size, type, CudaAllocator{});
+}
+
+BufferManager::ITensorPtr BufferManager::gpuSync(nvinfer1::Dims dims, nvinfer1::DataType type)
+{
+    return std::make_unique<StaticDeviceTensor>(dims, type, CudaAllocator{});
 }
 
 BufferManager::IBufferPtr BufferManager::cpu(std::size_t size, nvinfer1::DataType type)
@@ -70,15 +86,40 @@ BufferManager::ITensorPtr BufferManager::pinned(nvinfer1::Dims dims, nvinfer1::D
     return std::make_unique<PinnedTensor>(dims, type);
 }
 
+BufferManager::IBufferPtr BufferManager::pinnedPool(std::size_t size, nvinfer1::DataType type)
+{
+    return std::make_unique<PinnedPoolBuffer>(size, type);
+}
+
+BufferManager::ITensorPtr BufferManager::pinnedPool(nvinfer1::Dims dims, nvinfer1::DataType type)
+{
+    return std::make_unique<PinnedPoolTensor>(dims, type);
+}
+
+BufferManager::IBufferPtr BufferManager::managed(std::size_t size, nvinfer1::DataType type)
+{
+    return std::make_unique<UVMBuffer>(size, type);
+}
+
+BufferManager::ITensorPtr BufferManager::managed(nvinfer1::Dims dims, nvinfer1::DataType type)
+{
+    return std::make_unique<UVMTensor>(dims, type);
+}
+
 void BufferManager::setZero(IBuffer& buffer) const
+{
+    setMem(buffer, 0);
+}
+
+void BufferManager::setMem(IBuffer& buffer, int32_t value) const
 {
     if (buffer.getMemoryType() == MemoryType::kGPU)
     {
-        TLLM_CUDA_CHECK(cudaMemsetAsync(buffer.data(), 0, buffer.getSizeInBytes(), mStream->get()));
+        TLLM_CUDA_CHECK(cudaMemsetAsync(buffer.data(), value, buffer.getSizeInBytes(), mStream->get()));
     }
     else
     {
-        std::memset(buffer.data(), 0, buffer.getSizeInBytes());
+        std::memset(buffer.data(), value, buffer.getSizeInBytes());
     }
 }
 
@@ -129,8 +170,11 @@ BufferManager::IBufferPtr BufferManager::allocate(
     case MemoryType::kCPU: return cpu(size, type);
     case MemoryType::kGPU: return gpu(size, type);
     case MemoryType::kPINNED: return pinned(size, type);
-    default: TLLM_THROW("Unknown memory type");
+    case MemoryType::kUVM: return managed(size, type);
+    case MemoryType::kPINNEDPOOL: return pinnedPool(size, type);
     }
+
+    TLLM_THROW("Unknown memory type");
 }
 
 BufferManager::ITensorPtr BufferManager::allocate(
@@ -141,8 +185,11 @@ BufferManager::ITensorPtr BufferManager::allocate(
     case MemoryType::kCPU: return cpu(dims, type);
     case MemoryType::kGPU: return gpu(dims, type);
     case MemoryType::kPINNED: return pinned(dims, type);
-    default: TLLM_THROW("Unknown memory type");
+    case MemoryType::kUVM: return managed(dims, type);
+    case MemoryType::kPINNEDPOOL: return pinnedPool(dims, type);
     }
+
+    TLLM_THROW("Unknown memory type");
 }
 
 BufferManager::IBufferPtr BufferManager::copyFrom(IBuffer const& src, MemoryType memoryType) const
@@ -164,78 +211,50 @@ CudaStream const& BufferManager::getStream() const
     return *mStream;
 }
 
-void BufferManager::initMemoryPool(int device)
-{
-    auto const deviceCount = tc::getDeviceCount();
-    ::cudaMemPool_t memPool;
-    TLLM_CUDA_CHECK(cudaDeviceGetDefaultMemPool(&memPool, device));
-    for (auto peerDevice = 0; peerDevice < deviceCount; ++peerDevice)
-    {
-        if (peerDevice == device)
-        {
-            continue;
-        }
-        int peerAccessAvailable = 0;
-        TLLM_CUDA_CHECK(cudaDeviceCanAccessPeer(&peerAccessAvailable, device, peerDevice));
-        if (!peerAccessAvailable)
-        {
-            TLLM_LOG_WARNING("Device " + std::to_string(device) + " peer access Device " + std::to_string(peerDevice)
-                + " is not available.");
-            continue;
-        }
-        ::cudaMemAccessDesc desc{};
-        desc.location.type = cudaMemLocationTypeDevice;
-        desc.location.id = peerDevice;
-        desc.flags = cudaMemAccessFlagsProtReadWrite;
-        TLLM_CUDA_CHECK(cudaMemPoolSetAccess(memPool, &desc, 1));
-    }
-    // set memory pool threshold to avoid shrinking the pool
-    auto maxThreshold = std::numeric_limits<std::uint64_t>::max();
-    TLLM_CUDA_CHECK(cudaMemPoolSetAttribute(memPool, cudaMemPoolAttrReleaseThreshold, &maxThreshold));
-}
-
-std::size_t BufferManager::memoryPoolReserved(int device)
-{
-    ::cudaMemPool_t memPool;
-    TLLM_CUDA_CHECK(cudaDeviceGetDefaultMemPool(&memPool, device));
-    std::size_t reserved = 0;
-    TLLM_CUDA_CHECK(cudaMemPoolGetAttribute(memPool, cudaMemPoolAttrReservedMemCurrent, &reserved));
-    return reserved;
-}
-
-std::size_t BufferManager::memoryPoolUsed(int device)
-{
-    ::cudaMemPool_t memPool;
-    TLLM_CUDA_CHECK(cudaDeviceGetDefaultMemPool(&memPool, device));
-    std::size_t used = 0;
-    TLLM_CUDA_CHECK(cudaMemPoolGetAttribute(memPool, cudaMemPoolAttrUsedMemCurrent, &used));
-    return used;
-}
-
-void BufferManager::memoryPoolTrimTo(int device, std::size_t size)
-{
-    ::cudaMemPool_t memPool;
-    TLLM_CUDA_CHECK(cudaDeviceGetDefaultMemPool(&memPool, device));
-    TLLM_CUDA_CHECK(cudaMemPoolTrimTo(memPool, size));
-}
-
 std::size_t BufferManager::memoryPoolReserved() const
 {
-    return memoryPoolReserved(mStream->getDevice());
+    if (!static_cast<bool>(mPool))
+    {
+        TLLM_LOG_TRACE(
+            "Operation '%s' trivially returns zero on systems without memory pool support.", __PRETTY_FUNCTION__);
+        return 0;
+    }
+    mStream->synchronize();
+    return mPool->memoryPoolReserved();
 }
 
 std::size_t BufferManager::memoryPoolUsed() const
 {
-    return memoryPoolUsed(mStream->getDevice());
+    if (!static_cast<bool>(mPool))
+    {
+        TLLM_LOG_TRACE(
+            "Operation '%s' trivially returns zero on systems without memory pool support.", __PRETTY_FUNCTION__);
+        return 0;
+    }
+    mStream->synchronize();
+    return mPool->memoryPoolUsed();
 }
 
 std::size_t BufferManager::memoryPoolFree() const
 {
-    return memoryPoolFree(mStream->getDevice());
+    if (!static_cast<bool>(mPool))
+    {
+        TLLM_LOG_TRACE(
+            "Operation '%s' trivially returns zero on systems without memory pool support.", __PRETTY_FUNCTION__);
+        return 0;
+    }
+    mStream->synchronize();
+    return mPool->memoryPoolReserved() - mPool->memoryPoolUsed();
 }
 
 void BufferManager::memoryPoolTrimTo(std::size_t size)
 {
-    mStream->synchronize();
-    memoryPoolTrimTo(mStream->getDevice(), size);
+    if (!static_cast<bool>(mPool))
+    {
+        TLLM_LOG_TRACE("Operation '%s' does not do anything on this system as it does not support memory pools.",
+            __PRETTY_FUNCTION__);
+        return;
+    }
+    mPool->memoryPoolTrimTo(size);
 }
+} // namespace tensorrt_llm::runtime

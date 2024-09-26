@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -50,17 +50,34 @@ def main(args):
 
     build_args = [
         sys.executable,
-        str(example_path / "build.py"), "--model_dir",
-        str(args.model_dir), "--quant_ckpt_path",
-        str(args.quant_ckpt_path), "--dtype", "float16", "--log_level", "info",
-        "--use_gpt_attention_plugin", "float16", "--use_gemm_plugin", "float16",
-        "--enable_context_fmha", "--use_weight_only", "--weight_only_precision",
-        "int4_gptq", "--per_group", "--max_input_len",
-        str(input_seqlen), "--max_output_len",
-        str(output_seqlen), "--n_positions",
-        str(input_seqlen + output_seqlen + 1), "--max_batch_size",
-        str(batch_size), "--output_dir",
-        str(args.engine_dir)
+        str(example_path / "build.py"),
+        "--model_dir",
+        str(args.model_dir),
+        "--quant_ckpt_path",
+        str(args.quant_ckpt_path),
+        "--dtype",
+        "float16",
+        "--log_level",
+        "info",
+        "--use_gpt_attention_plugin",
+        "float16",
+        "--use_gemm_plugin",
+        "float16",
+        "--enable_context_fmha",
+        "--use_weight_only",
+        "--weight_only_precision",
+        "int4_gptq",
+        "--per_group",
+        "--max_input_len",
+        str(input_seqlen),
+        "--max_seq_len",
+        str(output_seqlen + input_seqlen),
+        "--n_positions",
+        str(input_seqlen + output_seqlen + 1),
+        "--max_batch_size",
+        str(batch_size),
+        "--output_dir",
+        str(args.engine_dir),
     ]
     benchmark_args = [
         sys.executable,
