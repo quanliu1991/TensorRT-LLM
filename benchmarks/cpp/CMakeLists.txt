@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -19,23 +19,17 @@ set(TOP_LEVEL_DIR "${PROJECT_SOURCE_DIR}/..")
 
 add_custom_target(benchmarks)
 
-set(CXXOPTS_SRC_DIR ${PROJECT_SOURCE_DIR}/../3rdparty/cxxopts)
-add_subdirectory(${CXXOPTS_SRC_DIR} ${CMAKE_CURRENT_BINARY_DIR}/cxxopts)
+if(NOT TARGET cxxopts::cxxopts)
+  add_subdirectory(${CMAKE_BINARY_DIR}/_deps/cxxopts-src
+                   ${CMAKE_CURRENT_BINARY_DIR}/cxxopts)
+endif()
 
 function(add_benchmark test_name test_src)
-  add_executable(${test_name} ${test_src})
+  add_executable(${test_name} ${test_src} utils/utils.cpp)
 
-  if(NOT WIN32) # Linux
-    target_link_libraries(
-      ${test_name} PUBLIC ${SHARED_TARGET} nvinfer_plugin_tensorrt_llm
-                          cxxopts::cxxopts)
-  else()
-    # Use STATIC_TARGET on Windows because MSVC is picky about duplicate symbols
-    # if the shared and static libs both get linked
-    target_link_libraries(
-      ${test_name} PUBLIC ${STATIC_TARGET} nvinfer_plugin_tensorrt_llm
-                          cxxopts::cxxopts)
-  endif()
+  target_link_libraries(
+    ${test_name} PUBLIC ${SHARED_TARGET} nvinfer_plugin_tensorrt_llm
+                        cxxopts::cxxopts)
 
   target_compile_features(${test_name} PRIVATE cxx_std_17)
   target_compile_definitions(${test_name}
@@ -43,6 +37,6 @@ function(add_benchmark test_name test_src)
   add_dependencies(benchmarks ${test_name})
 endfunction()
 
-add_benchmark(gptSessionBenchmark gptSessionBenchmark.cpp)
 add_benchmark(bertBenchmark bertBenchmark.cpp)
 add_benchmark(gptManagerBenchmark gptManagerBenchmark.cpp)
+add_benchmark(disaggServerBenchmark disaggServerBenchmark.cpp)

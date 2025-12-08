@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/tensorView.h"
+#include "tensorrt_llm/runtime/tllmBuffers.h"
 
 #include <initializer_list>
 #include <memory>
@@ -30,7 +31,45 @@ namespace tc = tensorrt_llm::common;
 
 ITensor::UniquePtr ITensor::slice(SharedPtr tensor, std::size_t offset, std::size_t size)
 {
+    TLLM_CHECK(tensor);
     return std::make_unique<TensorView>(std::move(tensor), offset, size);
+}
+
+ITensor::UniquePtr ITensor::slice(SharedPtr tensor, Shape const& offsetDims, ITensor::DimType64 size)
+{
+    auto shape = tensor->getShape();
+    TLLM_CHECK(offsetDims.nbDims >= 0);
+    TLLM_CHECK(shape.nbDims >= offsetDims.nbDims);
+    TLLM_CHECK(size >= 0);
+
+    Shape strides = ITensor::strides(shape);
+    DimType64 offset{0};
+    for (SizeType32 di = 0; di < offsetDims.nbDims - 1; di++)
+    {
+        TLLM_CHECK(0 <= offsetDims.d[di] && offsetDims.d[di] < shape.d[di]);
+        offset += offsetDims.d[di] * strides.d[di];
+    }
+
+    if (TLLM_LIKELY(offsetDims.nbDims > 0))
+    {
+        TLLM_CHECK(offsetDims.d[offsetDims.nbDims - 1] + size <= shape.d[offsetDims.nbDims - 1]);
+        offset += offsetDims.d[offsetDims.nbDims - 1] * strides.d[offsetDims.nbDims - 1];
+    }
+    else
+    {
+        TLLM_CHECK(size >= 0 && size <= 1);
+        TLLM_CHECK(shape.nbDims == 0 ? size == 0 : true);
+    }
+
+    Shape dims;
+    dims.nbDims = shape.nbDims - offsetDims.nbDims + 1;
+    dims.d[0] = size;
+    for (SizeType32 di = 1; di < dims.nbDims; di++)
+    {
+        dims.d[di] = shape.d[di - 1 + offsetDims.nbDims];
+    }
+
+    return std::make_unique<TensorView>(std::move(tensor), offset, volume(dims), dims);
 }
 
 ITensor::UniquePtr ITensor::view(IBuffer::SharedPtr buffer, nvinfer1::Dims const& dims)
@@ -39,7 +78,7 @@ ITensor::UniquePtr ITensor::view(IBuffer::SharedPtr buffer, nvinfer1::Dims const
     return std::make_unique<TensorView>(std::move(buffer), 0, size, dims);
 }
 
-nvinfer1::Dims ITensor::makeShape(std::initializer_list<SizeType> const& dims)
+nvinfer1::Dims ITensor::makeShape(std::initializer_list<ITensor::DimType64> const& dims)
 {
     TLLM_CHECK_WITH_INFO(dims.size() <= nvinfer1::Dims::MAX_DIMS, "Number of dimensions is too large");
     nvinfer1::Dims shape{};
@@ -71,12 +110,16 @@ ITensor::UniquePtr ITensor::wrap(void* data, nvinfer1::DataType type, nvinfer1::
     auto memoryType = IBuffer::memoryType(data);
 
     ITensor::UniquePtr result;
-    auto const capacityInBytes = capacity * BufferDataType(type).getSize();
+    auto const capacityInBytes = capacity * BufferDataType(type).getSizeInBits() / 8;
     switch (memoryType)
     {
     case MemoryType::kPINNED:
         result.reset(new GenericTensor<PinnedBorrowingAllocator>( // NOLINT(modernize-make-unique)
             shape, capacity, type, PinnedBorrowingAllocator(data, capacityInBytes)));
+        break;
+    case MemoryType::kPINNEDPOOL:
+        result.reset(new GenericTensor<PinnedPoolBorrowingAllocator>( // NOLINT(modernize-make-unique)
+            shape, capacity, type, PinnedPoolBorrowingAllocator(data, capacityInBytes)));
         break;
     case MemoryType::kCPU:
         result.reset( // NOLINT(modernize-make-unique)
@@ -88,31 +131,36 @@ ITensor::UniquePtr ITensor::wrap(void* data, nvinfer1::DataType type, nvinfer1::
             new GenericTensor<GpuBorrowingAllocator>(
                 shape, capacity, type, GpuBorrowingAllocator(data, capacityInBytes)));
         break;
-    default: TLLM_THROW("Unknown memory type");
+    case MemoryType::kUVM:
+        result.reset( // NOLINT(modernize-make-unique)
+            new GenericTensor<ManagedBorrowingAllocator>(
+                shape, capacity, type, ManagedBorrowingAllocator(data, capacityInBytes)));
+        break;
+    default: TLLM_THROW("Invalid memory type."); break;
     }
     return result;
 }
 
-ITensor::Shape ITensor::squeeze(Shape const& shape, SizeType dim)
+ITensor::Shape ITensor::squeeze(Shape const& shape, SizeType32 dim)
 {
     TLLM_CHECK_WITH_INFO(0 < shape.nbDims, "Cannot squeeze 1-dimensional tensor");
     TLLM_CHECK_WITH_INFO(
         dim < shape.nbDims, tc::fmtstr("Invalid index %d, tensor has %d dimensions", dim, shape.nbDims));
     TLLM_CHECK_WITH_INFO(shape.d[dim] == 1, "Can only squeeze dimension of size 1");
 
-    Shape newDims{shape.nbDims - 1};
+    Shape newDims{shape.nbDims - 1, {}};
     std::copy(shape.d, shape.d + dim, newDims.d);
     std::copy(shape.d + dim + 1, shape.d + shape.nbDims, newDims.d + dim);
     return newDims;
 }
 
-ITensor::Shape ITensor::unsqueeze(Shape const& shape, SizeType dim)
+ITensor::Shape ITensor::unsqueeze(Shape const& shape, SizeType32 dim)
 {
     TLLM_CHECK_WITH_INFO(shape.nbDims < Shape::MAX_DIMS, "Too many dimensions to unsqueeze");
     TLLM_CHECK_WITH_INFO(
         0 <= dim && dim <= shape.nbDims, common::fmtstr("Invalid dim %d, tensor has %d dimensions", dim, shape.nbDims));
 
-    Shape newDims{shape.nbDims + 1};
+    Shape newDims{shape.nbDims + 1, {}};
     std::copy(shape.d, shape.d + dim, newDims.d);
     newDims.d[dim] = 1;
     std::copy(shape.d + dim, shape.d + shape.nbDims, newDims.d + dim + 1);
@@ -121,7 +169,7 @@ ITensor::Shape ITensor::unsqueeze(Shape const& shape, SizeType dim)
 
 namespace
 {
-template <typename T>
+template <typename T, typename TOutput = T>
 void printTensor(ITensor const& tensor, std::ostream& out)
 {
     TLLM_CHECK_WITH_INFO(tensor.getDataType() == TRTDataType<typename std::remove_cv<T>::type>::value,
@@ -146,8 +194,6 @@ void printTensor(ITensor const& tensor, std::ostream& out)
         hostData = bufferCast<T>(tensor);
     }
 
-    using TOutput
-        = std::conditional_t<std::is_same_v<T, std::int8_t> || std::is_same_v<T, std::uint8_t>, std::int32_t, T>;
     if (shape.nbDims > 3)
     {
         out << "Not printing elements for more than 3 dims\n";
@@ -185,14 +231,17 @@ std::ostream& tensorrt_llm::runtime::operator<<(std::ostream& out, ITensor const
     switch (tensor.getDataType())
     {
     case nvinfer1::DataType::kFLOAT: printTensor<float>(tensor, out); break;
-    case nvinfer1::DataType::kHALF: printTensor<half>(tensor, out); break;
+    case nvinfer1::DataType::kHALF: printTensor<half, float>(tensor, out); break;
     case nvinfer1::DataType::kBOOL: printTensor<bool>(tensor, out); break;
-    case nvinfer1::DataType::kINT8: printTensor<std::int8_t>(tensor, out); break;
+    case nvinfer1::DataType::kINT8: printTensor<std::int8_t, std::int32_t>(tensor, out); break;
     case nvinfer1::DataType::kINT32: printTensor<std::int32_t>(tensor, out); break;
     case nvinfer1::DataType::kINT64: printTensor<std::int64_t>(tensor, out); break;
-    case nvinfer1::DataType::kUINT8: printTensor<std::uint8_t>(tensor, out); break;
+    case nvinfer1::DataType::kUINT8: printTensor<std::uint8_t, std::int32_t>(tensor, out); break;
 #ifdef ENABLE_BF16
-    case nvinfer1::DataType::kBF16: printTensor<__nv_bfloat16>(tensor, out); break;
+    case nvinfer1::DataType::kBF16: printTensor<__nv_bfloat16, float>(tensor, out); break;
+#endif
+#ifdef ENABLE_FP8
+    case nvinfer1::DataType::kFP8: printTensor<__nv_fp8_e4m3, float>(tensor, out); break;
 #endif
     default: TLLM_THROW("Unsupported data type");
     }

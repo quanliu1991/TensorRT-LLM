@@ -3,35 +3,31 @@ set(TRTLLM_PYBIND_MODULE
     ${TRTLLM_PYBIND_MODULE}
     PARENT_SCOPE)
 
-if(NOT BUILD_PYT)
-  message(
-    FATAL_ERROR
-      "Python bindings for C++ runtime require PyTorch. Please enable BUILD_PYT"
-  )
-endif()
-
-execute_process(
-  COMMAND ${Python3_EXECUTABLE} "-c"
-          "import pybind11 as pb11; print(pb11.get_cmake_dir(),end='');"
-  RESULT_VARIABLE PYBIND_CMAKE_DIR_RET
-  OUTPUT_VARIABLE PYBIND_CMAKE_DIR)
-
-if(PYBIND_CMAKE_DIR_RET MATCHES 0)
-  list(APPEND CMAKE_PREFIX_PATH "${PYBIND_CMAKE_DIR}")
-else()
-  message(ERROR "pybind11 CMake directory not found.")
-endif()
-
-find_package(pybind11 REQUIRED)
-
 set(SRCS
-    bindings.cpp
-    batch_manager/gptManager.cpp
+    batch_manager/algorithms.cpp
+    batch_manager/bindings.cpp
+    batch_manager/buffers.cpp
+    batch_manager/cacheTransceiver.cpp
+    batch_manager/kvCacheConnector.cpp
+    batch_manager/kvCacheManager.cpp
     batch_manager/llmRequest.cpp
-    batch_manager/inferenceRequest.cpp
-    batch_manager/namedTensor.cpp
-    runtime/generationInput.cpp
-    runtime/generationOutput.cpp)
+    executor/bindings.cpp
+    executor/executor.cpp
+    executor/executorConfig.cpp
+    executor/request.cpp
+    process_group/bindings.cpp
+    runtime/bindings.cpp
+    runtime/hostfunc.cpp
+    common/tllmExceptions.cpp
+    testing/modelSpecBinding.cpp
+    runtime/moeBindings.cpp
+    testing/modelSpecBinding.cpp
+    userbuffers/bindings.cpp
+    ../runtime/ipcNvlsMemory.cu
+    thop/bindings.cpp
+    bindings.cpp)
+
+include_directories(${PROJECT_SOURCE_DIR}/include)
 
 pybind11_add_module(${TRTLLM_PYBIND_MODULE} ${SRCS})
 
@@ -40,9 +36,36 @@ set_property(TARGET ${TRTLLM_PYBIND_MODULE} PROPERTY POSITION_INDEPENDENT_CODE
 
 target_link_directories(${TRTLLM_PYBIND_MODULE} PUBLIC
                         "${TORCH_INSTALL_PREFIX}/lib")
+
+if(ENABLE_NVSHMEM)
+  target_link_libraries(${TRTLLM_PYBIND_MODULE} PUBLIC nvshmem::nvshmem_host
+                                                       nvshmem::nvshmem_device)
+endif()
+
 target_link_libraries(
   ${TRTLLM_PYBIND_MODULE}
-  PUBLIC ${STATIC_TARGET} ${Python3_LIBRARIES} ${TORCH_LIBRARIES} torch_python
-         ${UNDEFINED_FLAG})
-target_compile_definitions(${TRTLLM_PYBIND_MODULE}
-                           PUBLIC TRTLLM_PYBIND_MODULE=${TRTLLM_PYBIND_MODULE})
+  PUBLIC ${SHARED_TARGET}
+         ${Python3_LIBRARIES}
+         ${TORCH_LIBRARIES}
+         torch_python
+         ${CUDA_DRV_LIB}
+         ${CUDA_NVML_LIB}
+         th_common
+         pg_utils)
+target_compile_definitions(
+  ${TRTLLM_PYBIND_MODULE} PUBLIC TRTLLM_PYBIND_MODULE=${TRTLLM_PYBIND_MODULE}
+                                 PYBIND11_DETAILED_ERROR_MESSAGES=1)
+
+if(NOT WIN32)
+  set(TRTLLM_PYBIND_MODULE_RPATH_LIST
+      "$ORIGIN/libs" # TRTLLM libraries
+      "$ORIGIN/../../.." # Shared libraries under $PREFIX/lib
+      "$ORIGIN/../nvidia/nccl/lib" # NCCL libraries
+  )
+  set_target_properties(
+    ${TRTLLM_PYBIND_MODULE} PROPERTIES BUILD_RPATH
+                                       "${TRTLLM_PYBIND_MODULE_RPATH_LIST}")
+  set_target_properties(
+    ${TRTLLM_PYBIND_MODULE} PROPERTIES LINK_FLAGS
+                                       "${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
+endif()

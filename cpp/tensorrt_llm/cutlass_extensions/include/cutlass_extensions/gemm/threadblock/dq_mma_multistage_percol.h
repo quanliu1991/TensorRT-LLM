@@ -1,33 +1,20 @@
-/***************************************************************************************************
- * Copyright (c) 2017 - 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: BSD-3-Clause
+/*
+ * Copyright (c) 2017-2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * 1. Redistributions of source code must retain the above copyright notice, this
- * list of conditions and the following disclaimer.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- * this list of conditions and the following disclaimer in the documentation
- * and/or other materials provided with the distribution.
- *
- * 3. Neither the name of the copyright holder nor the names of its
- * contributors may be used to endorse or promote products derived from
- * this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
- * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- **************************************************************************************************/
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 /*! \file
     \brief Template for a double-buffered threadblock-scoped GEMM kernel.
 */
@@ -80,13 +67,13 @@ template <
     typename SmemIteratorB_,
     /// Cache operation for operand B
     cutlass::arch::CacheOperation::Kind CacheOpB,
-    /// Data type for the scales
+    /// Iterators over scales in global memory
     typename IteratorScale_,
     /// Iterators over scales in shared memory
     typename SmemIteratorScale_,
     /// Data type of accumulator matrix
     typename ElementC_,
-    /// Data type of accumulator matrix
+    /// Layout of accumulator matrix
     typename LayoutC_,
     /// Policy describing tuning details (concept: MmaPolicy)
     typename Policy_,
@@ -190,8 +177,9 @@ private:
     using WarpFragmentB = typename Operator::FragmentB;
     Dequantizer warp_dequantizer_;
 
+    using ElementA = typename IteratorA::Element;
     using ElementB = typename IteratorB::Element;
-    using LayoutDetailsForB = kernel::LayoutDetailsB<ElementB, ArchTag>;
+    using LayoutDetailsForB = kernel::LayoutDetailsB<ElementA, ElementB, ArchTag>;
 
     static constexpr bool RequiresTileInterleave
         = layout::IsColumnMajorTileInterleave<typename LayoutDetailsForB::Layout>::value;
@@ -219,7 +207,7 @@ public:
         ///< Shared storage needed for internal use by threadblock-scoped GEMM
         typename Base::SharedStorage& shared_storage,
         ///< Group size for quantization. Not used by this main loop since it assumes per-column
-        const int group_size,
+        int const group_size,
         ///< ID within the threadblock
         int thread_idx,
         ///< ID of warp
@@ -482,7 +470,7 @@ public:
             }
         }
 
-        // Waits until kStages-2 stages have committed.
+        // Wait until we have at least one committed global fetch stage. (#uncommitted = Base::kStages - 1 - #committed)
         cutlass::arch::cp_async_wait<Base::kStages - 2>();
         __syncthreads();
 
@@ -534,8 +522,8 @@ public:
                 this->warp_tile_iterator_A_.load(warp_frag_A[(warp_mma_k + 1) % 2]);
                 ++this->warp_tile_iterator_A_;
 
-                const int warp_tileB_k_compute_offset = warp_mma_k % Base::kNumKIterationsPerWarpBLoad;
-                const int warp_tileB_k_load_offset = warp_mma_k / Base::kNumKIterationsPerWarpBLoad;
+                int const warp_tileB_k_compute_offset = warp_mma_k % Base::kNumKIterationsPerWarpBLoad;
+                int const warp_tileB_k_load_offset = warp_mma_k / Base::kNumKIterationsPerWarpBLoad;
                 if (warp_tileB_k_compute_offset == Base::kNumKIterationsPerWarpBLoad - 1)
                 {
                     this->warp_tile_iterator_B_.set_kgroup_index(
@@ -548,8 +536,17 @@ public:
                     = lds_converter(warp_frag_B[warp_tileB_k_load_offset % 2]);
                 warp_dequantizer_.dequantize(converted_frag_B, warp_frag_scales);
 
-                run_warp_mma(
-                    warp_mma, accum, warp_frag_A[warp_mma_k % 2], converted_frag_B, accum, warp_tileB_k_compute_offset);
+                using FragmentOperandB = cutlass::Array<ElementA, Operator::FragmentB::kElements>;
+                constexpr cutlass::FloatRoundStyle RoundStyle = cutlass::FloatRoundStyle::round_to_nearest;
+                constexpr int ConversionVectorWidth = TransformBAfterLDS::result_type::kElements;
+                static_assert(ConversionVectorWidth == FragmentOperandB::kElements);
+
+                using Converter
+                    = cutlass::NumericArrayConverter<ElementA, ElementScale, ConversionVectorWidth, RoundStyle>;
+
+                FragmentOperandB converted_frag_B_operand = Converter::convert(converted_frag_B);
+                warp_mma(
+                    accum, warp_frag_A[warp_mma_k % 2], converted_frag_B_operand, accum, warp_tileB_k_compute_offset);
 
                 // Issue global->shared copies for the this stage
                 if (warp_mma_k < Base::kWarpGemmIterations - 1)
@@ -573,7 +570,8 @@ public:
                     // Inserts a memory fence between stages of cp.async instructions.
                     cutlass::arch::cp_async_fence();
 
-                    // Waits until kStages-2 stages have committed.
+                    // Wait until we have at least one committed global fetch stage. (#uncommitted = Base::kStages - 1 -
+                    // #committed)
                     arch::cp_async_wait<Base::kStages - 2>();
                     __syncthreads();
 

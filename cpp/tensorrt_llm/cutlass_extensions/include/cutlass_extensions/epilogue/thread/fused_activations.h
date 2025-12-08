@@ -1,33 +1,20 @@
-/***************************************************************************************************
- * Copyright (c) 2017 - 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: BSD-3-Clause
+/*
+ * Copyright (c) 2017-2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * 1. Redistributions of source code must retain the above copyright notice, this
- * list of conditions and the following disclaimer.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- * this list of conditions and the following disclaimer in the documentation
- * and/or other materials provided with the distribution.
- *
- * 3. Neither the name of the copyright holder nor the names of its
- * contributors may be used to endorse or promote products derived from
- * this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
- * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- **************************************************************************************************/
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 /*! \file
   \brief Functor performing linear combination with a maximum operation used by epilogues.
 */
@@ -65,36 +52,34 @@ __forceinline__ __device__ float copysignf_pos(float a, float b)
 __forceinline__ __device__ float tanh_opt(float x)
 {
 #if (__CUDACC_VER_MAJOR__ < 11) || (__CUDA_ARCH__ < 750)
-    const float exp_val = -1.f * fabs(2 * x);
+    float const exp_val = -1.f * fabs(2 * x);
     return copysignf_pos((1.0f - __expf(exp_val)) / (__expf(exp_val) + 1.0f), x);
 #else
     return fast_tanh(x);
 #endif
 }
 
-/////////////////////////////////////////////////////////////////////////////////////////////////
-template <>
-struct GELU_taylor<float>
+template <typename T>
+struct Relu2
 {
-    static const bool kIsHeavy = true;
+    static bool const kIsHeavy = false;
 
-    CUTLASS_DEVICE
-    float operator()(float const& z) const
+    CUTLASS_HOST_DEVICE
+    T operator()(T threshold, T value) const
     {
-
-        float k0 = float(0.7978845608028654);
-        float k1 = float(0.044715);
-
-        return float(cutlass::constants::half<float>() * z
-            * (cutlass::constants::one<float>() + tanh_opt(k0 * z * (cutlass::constants::one<float>() + k1 * z * z))));
+        ReLu<T> relu_op;
+        multiplies<T> mul;
+        T val = relu_op(threshold, value);
+        return mul(val, val);
     }
 
-    using Params = LinearCombinationGenericParams<float>;
-
-    CUTLASS_DEVICE
-    float operator()(float const& scalar, Params const& params_) const
+    CUTLASS_HOST_DEVICE
+    T operator()(T value) const
     {
-        return this->operator()(scalar);
+        ReLu<T> relu_op;
+        multiplies<T> mul;
+        T val = relu_op(value);
+        return mul(val, val);
     }
 };
 

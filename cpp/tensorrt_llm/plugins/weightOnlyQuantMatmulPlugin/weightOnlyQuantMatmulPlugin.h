@@ -41,9 +41,12 @@ enum class WeightTypeId
     INT4 = 2,
 };
 
+constexpr int32_t FP16_BITS = 16;
 constexpr int32_t INT8_BITS = 8;
 constexpr int32_t INT4_BITS = 4;
 constexpr int32_t INT8_INT4_RATIO = INT8_BITS / INT4_BITS;
+constexpr int32_t FP16_INT4_RATIO = FP16_BITS / INT4_BITS;
+constexpr int32_t FP16_INT8_RATIO = FP16_BITS / INT8_BITS;
 
 inline int32_t getWeightTypeMultiplier(WeightTypeId weightTypeId)
 {
@@ -52,6 +55,7 @@ inline int32_t getWeightTypeMultiplier(WeightTypeId weightTypeId)
 
 using WeightOnlyGemmRunner = tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunnerInterface;
 using WeightOnlyGemmRunnerPtr = std::shared_ptr<WeightOnlyGemmRunner>;
+using KernelType = tensorrt_llm::kernels::weight_only::KernelType;
 
 class WeightOnlyQuantGemmPluginProfiler : public GemmPluginProfiler<tensorrt_llm::cutlass_extensions::CutlassGemmConfig,
                                               WeightOnlyGemmRunnerPtr, GemmIdCore, GemmIdCoreHash>
@@ -64,15 +68,25 @@ public:
         mWeightTypeId = weightId;
     }
 
-protected:
-    void runTactic(int m, int n, int k, const Config& tactic, char* workspace, const cudaStream_t& stream) override;
+    void setCudaKernelType(KernelType cudaKernelType, int arch)
+    {
+        mCudaKernelType = cudaKernelType;
+        mArch = arch;
+    }
 
-    void computeTmpSize(int maxM, int n, int k) override;
+protected:
+    void runTactic(int m, int n, int k, Config const& tactic, char* workspace, cudaStream_t const& stream) override;
+
+    void computeTmpSize(size_t maxM, size_t n, size_t k) override;
 
     std::vector<Config> getTactics(int m, int n, int k) const override;
 
+    bool checkTactic(int m, int n, int k, Config const& tactic) const override;
+
 private:
     WeightTypeId mWeightTypeId;
+    KernelType mCudaKernelType;
+    int mArch;
 };
 
 class WeightOnlyQuantMatmulPlugin : public BasePlugin
@@ -81,32 +95,32 @@ public:
     using PluginProfilerPtr = std::shared_ptr<WeightOnlyQuantGemmPluginProfiler>;
     WeightOnlyQuantMatmulPlugin() = delete;
 
-    WeightOnlyQuantMatmulPlugin(nvinfer1::DataType type, WeightTypeId weightTypeId, const PluginProfilerPtr& profiler);
+    WeightOnlyQuantMatmulPlugin(nvinfer1::DataType type, WeightTypeId weightTypeId, PluginProfilerPtr const& profiler);
 
-    WeightOnlyQuantMatmulPlugin(const void* data, size_t length, const PluginProfilerPtr& profiler);
+    WeightOnlyQuantMatmulPlugin(void const* data, size_t length, PluginProfilerPtr const& profiler);
 
     ~WeightOnlyQuantMatmulPlugin() override = default;
 
     // IPluginV2DynamicExt Methods
     nvinfer1::IPluginV2DynamicExt* clone() const noexcept override;
-    nvinfer1::DimsExprs getOutputDimensions(int outputIndex, const nvinfer1::DimsExprs* inputs, int nbInputs,
+    nvinfer1::DimsExprs getOutputDimensions(int outputIndex, nvinfer1::DimsExprs const* inputs, int nbInputs,
         nvinfer1::IExprBuilder& exprBuilder) noexcept override;
     bool supportsFormatCombination(
-        int pos, const nvinfer1::PluginTensorDesc* inOut, int nbInputs, int nbOutputs) noexcept override;
-    void configurePlugin(const nvinfer1::DynamicPluginTensorDesc* in, int nbInputs,
-        const nvinfer1::DynamicPluginTensorDesc* out, int nbOutputs) noexcept override;
-    size_t getWorkspaceSize(const nvinfer1::PluginTensorDesc* inputs, int nbInputs,
-        const nvinfer1::PluginTensorDesc* outputs, int nbOutputs) const noexcept override;
-    int enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const nvinfer1::PluginTensorDesc* outputDesc,
-        const void* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept override;
+        int pos, nvinfer1::PluginTensorDesc const* inOut, int nbInputs, int nbOutputs) noexcept override;
+    void configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int nbInputs,
+        nvinfer1::DynamicPluginTensorDesc const* out, int nbOutputs) noexcept override;
+    size_t getWorkspaceSize(nvinfer1::PluginTensorDesc const* inputs, int nbInputs,
+        nvinfer1::PluginTensorDesc const* outputs, int nbOutputs) const noexcept override;
+    int enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
+        void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept override;
 
     // IPluginV2Ext Methods
     nvinfer1::DataType getOutputDataType(
-        int index, const nvinfer1::DataType* inputTypes, int nbInputs) const noexcept override;
+        int index, nvinfer1::DataType const* inputTypes, int nbInputs) const noexcept override;
 
     // IPluginV2 Methods
-    const char* getPluginType() const noexcept override;
-    const char* getPluginVersion() const noexcept override;
+    char const* getPluginType() const noexcept override;
+    char const* getPluginVersion() const noexcept override;
     int getNbOutputs() const noexcept override;
     int initialize() noexcept override;
     void terminate() noexcept override;
@@ -127,10 +141,8 @@ private:
     nvinfer1::DataType mType;
     WeightTypeId mWeightTypeId;
     bool mCudaKernelEnabled;
-
-    // When M is smaller than this value, we trigger a fast path
-    // I.e. a tailored kernel instead of cutlass.
-    static constexpr int SMALL_M_FAST_PATH = 5;
+    tensorrt_llm::kernels::weight_only::KernelType mCudaKernelType;
+    int mArch;
 
     GemmDims mDims{};
     GemmIdCore mGemmId{};
@@ -143,16 +155,16 @@ class WeightOnlyQuantMatmulPluginCreator : public BaseCreator
 public:
     WeightOnlyQuantMatmulPluginCreator();
 
-    const char* getPluginName() const noexcept override;
+    char const* getPluginName() const noexcept override;
 
-    const char* getPluginVersion() const noexcept override;
+    char const* getPluginVersion() const noexcept override;
 
-    const nvinfer1::PluginFieldCollection* getFieldNames() noexcept override;
+    nvinfer1::PluginFieldCollection const* getFieldNames() noexcept override;
 
-    nvinfer1::IPluginV2* createPlugin(const char* name, const nvinfer1::PluginFieldCollection* fc) noexcept override;
+    nvinfer1::IPluginV2* createPlugin(char const* name, nvinfer1::PluginFieldCollection const* fc) noexcept override;
 
     nvinfer1::IPluginV2* deserializePlugin(
-        const char* name, const void* serialData, size_t serialLength) noexcept override;
+        char const* name, void const* serialData, size_t serialLength) noexcept override;
 
 private:
     GemmPluginProfilerManager<WeightOnlyQuantGemmPluginProfiler> gemmPluginProfileManager;

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 
 #include "tensorrt_llm/common/cudaFp8Utils.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include <algorithm>
 #include <cstdio>
@@ -40,6 +41,10 @@ __inline__ __device__ float scale(float a, float b)
 template <QuantizeMode QUANTIZE_MODE, bool QUANTIZE, typename T_OUT, typename T_S, typename T_IN>
 __global__ void scaleMatrix(T_OUT* output, T_S const* input_scale, T_IN const* input, int64_t numel, int64_t lda)
 {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.wait;");
+#endif
+
     for (int64_t i = threadIdx.x + blockIdx.x * blockDim.x; i < numel; i += blockDim.x * gridDim.x)
     {
 
@@ -56,6 +61,9 @@ __global__ void scaleMatrix(T_OUT* output, T_S const* input_scale, T_IN const* i
             output[i] = T_OUT(scale<QUANTIZE>(static_cast<float>(input[i]), static_cast<float>(input_scale[0])));
         }
     }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
 }
 
 template <typename T_OUT, typename T_S, typename T_IN>
@@ -64,20 +72,32 @@ void invokeQuantizeMatrix(T_OUT* output, T_S const* input_scale, T_IN const* inp
 {
     dim3 grid(1024);
     dim3 block(CTA_SIZE);
+    cudaLaunchConfig_t config;
+    config.gridDim = grid;
+    config.blockDim = block;
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    config.numAttrs = 1;
+    config.attrs = attrs;
     if (quantize_mode == QuantizeMode::PER_CHANNEL)
     {
-        scaleMatrix<QuantizeMode::PER_CHANNEL, true>
-            <<<grid, block, 0, stream>>>(output, input_scale, input, numel, lda);
+        cudaLaunchKernelEx(&config, scaleMatrix<QuantizeMode::PER_CHANNEL, true, T_OUT, T_S, T_IN>, output, input_scale,
+            input, numel, lda);
     }
     else if (quantize_mode == QuantizeMode::PER_TOKEN)
     {
-        scaleMatrix<QuantizeMode::PER_TOKEN, true><<<grid, block, 0, stream>>>(output, input_scale, input, numel, lda);
+        cudaLaunchKernelEx(&config, scaleMatrix<QuantizeMode::PER_TOKEN, true, T_OUT, T_S, T_IN>, output, input_scale,
+            input, numel, lda);
     }
     else if (quantize_mode == QuantizeMode::PER_TENSOR)
     {
-        scaleMatrix<QuantizeMode::PER_TENSOR, true><<<grid, block, 0, stream>>>(output, input_scale, input, numel, lda);
+        cudaLaunchKernelEx(&config, scaleMatrix<QuantizeMode::PER_TENSOR, true, T_OUT, T_S, T_IN>, output, input_scale,
+            input, numel, lda);
     }
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 template <typename T_OUT, typename T_S, typename T_IN>
@@ -86,21 +106,32 @@ void invokeDequantizeMatrix(T_OUT* output, T_S const* input_scale, T_IN const* i
 {
     dim3 grid(1024);
     dim3 block(CTA_SIZE);
+    cudaLaunchConfig_t config;
+    config.gridDim = grid;
+    config.blockDim = block;
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    config.numAttrs = 1;
+    config.attrs = attrs;
     if (quantize_mode == QuantizeMode::PER_CHANNEL)
     {
-        scaleMatrix<QuantizeMode::PER_CHANNEL, false>
-            <<<grid, block, 0, stream>>>(output, input_scale, input, numel, lda);
+        cudaLaunchKernelEx(&config, scaleMatrix<QuantizeMode::PER_CHANNEL, false, T_OUT, T_S, T_IN>, output,
+            input_scale, input, numel, lda);
     }
     else if (quantize_mode == QuantizeMode::PER_TOKEN)
     {
-        scaleMatrix<QuantizeMode::PER_TOKEN, false><<<grid, block, 0, stream>>>(output, input_scale, input, numel, lda);
+        cudaLaunchKernelEx(&config, scaleMatrix<QuantizeMode::PER_TOKEN, false, T_OUT, T_S, T_IN>, output, input_scale,
+            input, numel, lda);
     }
     else if (quantize_mode == QuantizeMode::PER_TENSOR)
     {
-        scaleMatrix<QuantizeMode::PER_TENSOR, false>
-            <<<grid, block, 0, stream>>>(output, input_scale, input, numel, lda);
+        cudaLaunchKernelEx(&config, scaleMatrix<QuantizeMode::PER_TENSOR, false, T_OUT, T_S, T_IN>, output, input_scale,
+            input, numel, lda);
     }
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 template <typename T_FAKE, typename T_OUT, typename T_IN>
@@ -117,20 +148,20 @@ template <typename T_FAKE, typename T_OUT, typename T_IN>
 void invokeFakeQuantize(T_OUT* dst, const T_IN* src, const int64_t numel, cudaStream_t stream)
 {
     fakeQuantize<T_FAKE><<<1024, CTA_SIZE, 0, stream>>>(dst, src, numel);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 template void invokeFakeQuantize<__nv_fp8_e4m3, float, float>(
-    float* dst, const float* src, const int64_t numel, cudaStream_t stream);
+    float* dst, float const* src, const int64_t numel, cudaStream_t stream);
 template void invokeFakeQuantize<float, float, __nv_fp8_e4m3>(
-    float* dst, const __nv_fp8_e4m3* src, const int64_t numel, cudaStream_t stream);
+    float* dst, __nv_fp8_e4m3 const* src, const int64_t numel, cudaStream_t stream);
 template void invokeFakeQuantize<__nv_fp8_e4m3, half, half>(
-    half* dst, const half* src, const int64_t numel, cudaStream_t stream);
+    half* dst, half const* src, const int64_t numel, cudaStream_t stream);
 template void invokeFakeQuantize<__nv_fp8_e4m3, __nv_bfloat16, __nv_bfloat16>(
-    __nv_bfloat16* dst, const __nv_bfloat16* src, const int64_t numel, cudaStream_t stream);
+    __nv_bfloat16* dst, __nv_bfloat16 const* src, const int64_t numel, cudaStream_t stream);
 
 template void invokeFakeQuantize<float, half, float>(
-    half* dst, const float* src, const int64_t numel, cudaStream_t stream);
+    half* dst, float const* src, const int64_t numel, cudaStream_t stream);
 
 __device__ float atomicMaxExtd(float* address, float val)
 {
@@ -146,7 +177,7 @@ inline __device__ T atomicMaxExtdV2(T* address, T val)
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     static_assert(std::is_same_v<T, half> | std::is_same_v<T, __nv_bfloat16>, "T needs to be either half or bfloat16");
     // The address in 64 bits.
-    uint64_t address_u64 = reinterpret_cast<const uint64_t&>(address);
+    uint64_t address_u64 = reinterpret_cast<uint64_t const&>(address);
 
     // Pack the input value into 32 bits.
     union
@@ -155,7 +186,7 @@ inline __device__ T atomicMaxExtdV2(T* address, T val)
         uint16_t u[2];
     } old, tmp = {};
 
-    const int loc = (address_u64 & 0x2) >> 1;
+    int const loc = (address_u64 & 0x2) >> 1;
     tmp.v[loc] = val;
 
     // 4B aligned pointer.
@@ -206,6 +237,10 @@ __device__ __nv_bfloat16 atomicMaxExtd(__nv_bfloat16* address, __nv_bfloat16 val
     }
 
     return __ushort_as_bfloat16(old);
+#else
+    assert(0);
+    asm volatile("brkpt;\n" ::);
+    return __nv_bfloat16(0);
 #endif
 }
 
@@ -223,7 +258,7 @@ __global__ void computeFP8QuantizeScale(T_S* quant_ptr, const T_W* weights, cons
                 auto val = fabs(static_cast<float>(weights[i]));
                 max = max > val ? max : val;
             }
-            const auto scale = (T_S) std::max(max / FP8_E4M3_MAX, min_scaling_factor);
+            auto const scale = (T_S) std::max(max / FP8_E4M3_MAX, min_scaling_factor);
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
             if constexpr (std::is_same_v<T_S, float>)
             {
@@ -231,7 +266,7 @@ __global__ void computeFP8QuantizeScale(T_S* quant_ptr, const T_W* weights, cons
             }
             else
             {
-                const auto address_u64 = reinterpret_cast<uint64_t>(quant_ptr + col);
+                auto const address_u64 = reinterpret_cast<uint64_t>(quant_ptr + col);
                 if ((col == 0 && address_u64 % 4 != 0) || (col == n - 1 && address_u64 % 4 == 0))
                     atomicMaxExtd(quant_ptr + col, scale);
                 else
@@ -244,7 +279,7 @@ __global__ void computeFP8QuantizeScale(T_S* quant_ptr, const T_W* weights, cons
     }
     else if (QUANTIZE_MODE == QuantizeMode::PER_TOKEN)
     {
-        const auto nrows = size / n;
+        auto const nrows = size / n;
         for (int64_t row = blockIdx.x; row < nrows; row += gridDim.x)
         {
             float max = 0.f;
@@ -256,7 +291,7 @@ __global__ void computeFP8QuantizeScale(T_S* quant_ptr, const T_W* weights, cons
             max = blockReduceMax<float>(max);
             if (threadIdx.x == 0)
             {
-                const auto scale = (T_S) std::max(max / FP8_E4M3_MAX, min_scaling_factor);
+                auto const scale = (T_S) std::max(max / FP8_E4M3_MAX, min_scaling_factor);
                 quant_ptr[row] = scale;
             }
         }
@@ -272,7 +307,7 @@ __global__ void computeFP8QuantizeScale(T_S* quant_ptr, const T_W* weights, cons
         max = blockReduceMax<float>(max);
         if (threadIdx.x == 0)
         {
-            const auto scale = (T_S) std::max(max / FP8_E4M3_MAX, min_scaling_factor);
+            auto const scale = (T_S) std::max(max / FP8_E4M3_MAX, min_scaling_factor);
             atomicMaxExtd(quant_ptr, scale);
         }
     }
@@ -293,7 +328,7 @@ void invokeComputeFP8QuantizeScale(T_S* quant_ptr, const T_W* weights, const int
         dim3 block(CTA_SIZE);
         dim3 grid((lda + CTA_SIZE - 1) / CTA_SIZE);
         cudaMemsetAsync(quant_ptr, 0, lda * sizeof(T_S), stream);
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
         computeFP8QuantizeScale<QuantizeMode::PER_CHANNEL><<<grid, block, 0, stream>>>(quant_ptr, weights, numel, lda);
     }
     else if (quantize_mode == QuantizeMode::PER_TENSOR)
@@ -301,10 +336,10 @@ void invokeComputeFP8QuantizeScale(T_S* quant_ptr, const T_W* weights, const int
         dim3 block(1024);
         dim3 grid(1024);
         cudaMemsetAsync(quant_ptr, 0, sizeof(T_S), stream);
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
         computeFP8QuantizeScale<QuantizeMode::PER_TENSOR><<<grid, block, 0, stream>>>(quant_ptr, weights, numel, lda);
     }
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 #define DEFINE_INVOKE_COMPUTE_FP8_QUANTIZE_SCALE(type_scale, type_in)                                                  \
@@ -326,19 +361,19 @@ __global__ void dynamicQuantizeMatrixPerToken(
     extern __shared__ __align__(sizeof(float)) char _shmem[];
     T_IN* shmem = reinterpret_cast<T_IN*>(_shmem);
     constexpr float min_scaling_factor = 1.0f / (FP8_E4M3_MAX * 512.f);
-    const auto nrows = numel / lda;
+    auto const nrows = numel / lda;
     for (int64_t row = blockIdx.x; row < nrows; row += gridDim.x)
     {
         float max = 0.f;
         for (int64_t i = threadIdx.x; i < lda; i += blockDim.x)
         {
-            const auto in = input[row * lda + i];
+            auto const in = input[row * lda + i];
             shmem[i] = in;
             auto val = fabs(static_cast<float>(in));
             max = max > val ? max : val;
         }
         max = blockAllReduceMax<float>(max); // __syncthreads() called so we can read shmem
-        const auto s = (T_S) std::max(max / FP8_E4M3_MAX, min_scaling_factor);
+        auto const s = (T_S) std::max(max / FP8_E4M3_MAX, min_scaling_factor);
         for (int64_t i = threadIdx.x; i < lda; i += blockDim.x)
         {
             // true means we are quantizing
@@ -359,7 +394,7 @@ void invokeComputeScalesAndQuantizeMatrix(T_OUT* output, T_S* quant_ptr, const T
     {
         dim3 grid(numel / lda);
         bool use_shmem = true;
-        const auto shmem_size = lda * sizeof(T_IN);
+        auto const shmem_size = lda * sizeof(T_IN);
         if (shmem_size >= (48 << 10))
         {
             cudaError_t ret = cudaFuncSetAttribute(dynamicQuantizeMatrixPerToken<T_OUT, T_S, T_IN>,
@@ -376,7 +411,7 @@ void invokeComputeScalesAndQuantizeMatrix(T_OUT* output, T_S* quant_ptr, const T
         {
             dim3 block(CTA_SIZE);
             computeFP8QuantizeScale<QuantizeMode::PER_TOKEN><<<grid, block, 0, stream>>>(quant_ptr, input, numel, lda);
-            sync_check_cuda_error();
+            sync_check_cuda_error(stream);
             invokeQuantizeMatrix(output, quant_ptr, input, numel, lda, quantize_mode, stream);
         }
     }
@@ -385,9 +420,9 @@ void invokeComputeScalesAndQuantizeMatrix(T_OUT* output, T_S* quant_ptr, const T
         dim3 block(CTA_SIZE);
         dim3 grid((lda + CTA_SIZE - 1) / CTA_SIZE);
         cudaMemsetAsync(quant_ptr, 0, lda * sizeof(T_S), stream);
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
         computeFP8QuantizeScale<QuantizeMode::PER_CHANNEL><<<grid, block, 0, stream>>>(quant_ptr, input, numel, lda);
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
         invokeQuantizeMatrix(output, quant_ptr, input, numel, lda, quantize_mode, stream);
     }
     else if (quantize_mode == QuantizeMode::PER_TENSOR)
@@ -395,12 +430,12 @@ void invokeComputeScalesAndQuantizeMatrix(T_OUT* output, T_S* quant_ptr, const T
         dim3 block(1024);
         dim3 grid(1024);
         cudaMemsetAsync(quant_ptr, 0, sizeof(T_S), stream);
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
         computeFP8QuantizeScale<QuantizeMode::PER_TENSOR><<<grid, block, 0, stream>>>(quant_ptr, input, numel, lda);
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
         invokeQuantizeMatrix(output, quant_ptr, input, numel, lda, quantize_mode, stream);
     }
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 #define DEFINE_INVOKE_QUANTIZE_MATRIX(type_out, type_scale, type_in)                                                   \
@@ -422,8 +457,10 @@ DEFINE_INVOKE_QUANTIZE_MATRIX(half, half, __nv_fp8_e4m3);
 DEFINE_INVOKE_QUANTIZE_MATRIX(float, float, __nv_fp8_e4m3);
 DEFINE_INVOKE_QUANTIZE_MATRIX(half, float, __nv_fp8_e4m3);
 #ifdef ENABLE_BF16
+DEFINE_INVOKE_QUANTIZE_MATRIX(__nv_fp8_e4m3, float, __nv_bfloat16);
 DEFINE_INVOKE_QUANTIZE_MATRIX(__nv_fp8_e4m3, __nv_bfloat16, __nv_bfloat16);
 DEFINE_INVOKE_QUANTIZE_MATRIX(__nv_bfloat16, __nv_bfloat16, __nv_fp8_e4m3);
+DEFINE_INVOKE_QUANTIZE_MATRIX(__nv_bfloat16, float, __nv_fp8_e4m3);
 #endif
 #endif
 

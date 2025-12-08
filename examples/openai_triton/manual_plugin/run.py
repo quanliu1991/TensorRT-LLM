@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -72,14 +72,15 @@ def run(engine_dir,
     ])
     logger.debug(f'output info {output_info}')
     outputs = {
-        t.name: torch.empty(tuple(t.shape),
-                            dtype=trt_dtype_to_torch(t.dtype),
-                            device='cuda')
+        t.name:
+        torch.empty(tuple(t.shape),
+                    dtype=trt_dtype_to_torch(t.dtype),
+                    device='cuda')
         for t in output_info
     }
 
     # Execute model inference
-    stream = torch.cuda.current_stream()
+    stream = torch.cuda.Stream()
     ok = session.run(inputs=inputs, outputs=outputs, stream=stream.cuda_stream)
     assert ok, 'Engine execution failed'
 

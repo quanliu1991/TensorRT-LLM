@@ -22,10 +22,9 @@ using namespace nvinfer1;
 using nvinfer1::plugin::[[ plugin_name ]]Creator;
 using nvinfer1::plugin::[[ plugin_name ]];
 
-[[ plugin_common_source ]]
-
 PluginFieldCollection [[ plugin_name ]]Creator::mFC{};
 std::vector<PluginField> [[ plugin_name ]]Creator::mPluginAttributes;
+static bool triton_kernels_loaded = false;
 
 // constructor
 [[ plugin_name ]]::[[ plugin_name ]]( [[ construct_arg_list ]] )
@@ -44,7 +43,7 @@ std::vector<PluginField> [[ plugin_name ]]Creator::mPluginAttributes;
     {% for arg in params -%}
     read(d, [[arg.name]]);
     {% endfor %}
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 }
 
 
@@ -160,12 +159,20 @@ int [[ plugin_name ]]::getNbOutputs() const noexcept
 
 int [[ plugin_name ]]::initialize() noexcept
 {
-    load_[[kernel_name]]();
-    return 0;
+  if (triton_kernels_loaded) {
+      return 0;
+  }
+  load_[[kernel_name]]();
+  triton_kernels_loaded = true;
+  return 0;
 }
 
 void [[ plugin_name ]]::terminate() noexcept {
+  if (!triton_kernels_loaded) {
+      return;
+  }
   unload_[[kernel_name]]();
+  triton_kernels_loaded = false;
 }
 
 size_t [[ plugin_name ]]::getSerializationSize() const noexcept
@@ -188,7 +195,7 @@ void [[ plugin_name ]]::serialize(void* buffer) const noexcept
     {% for arg in params -%}
     write(d, [[arg.name]]);
     {% endfor %}
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 
 }
 
@@ -216,7 +223,7 @@ const char* [[ plugin_name ]]::getPluginNamespace() const noexcept
     mPluginAttributes.clear();
 
     {% for arg in params %}
-    mPluginAttributes.emplace_back(PluginField("[[arg.name]]", nullptr, PluginFieldType::[[arg.dtype.dtype.to('trt_plugin')]], 0));
+    mPluginAttributes.emplace_back(PluginField("[[arg.name]]", nullptr, PluginFieldType::[[arg.dtype.dtype.to('trt_plugin')]]));
     {% endfor %}
 
     mFC.nbFields = mPluginAttributes.size();

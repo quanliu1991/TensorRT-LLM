@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,7 +27,7 @@ namespace torch_ext
 class NcclCommunicatorOp : public th::jit::CustomClassHolder
 {
 public:
-    NcclCommunicatorOp(int64_t tpSize, int64_t ppSize, int64_t rank);
+    NcclCommunicatorOp(int64_t worldSize, int64_t rank);
 
     void send(th::Tensor tensor, int64_t toRank) const;
     void recv(th::Tensor& tensor, int64_t fromRank) const;

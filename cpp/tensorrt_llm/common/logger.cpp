@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,6 +15,8 @@
  */
 
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/common/tllmException.h"
 #include <cuda_runtime.h>
 
@@ -26,38 +28,35 @@ Logger::Logger()
     char* isFirstRankOnlyChar = std::getenv("TLLM_LOG_FIRST_RANK_ONLY");
     bool isFirstRankOnly = (isFirstRankOnlyChar != nullptr && std::string(isFirstRankOnlyChar) == "ON");
 
-    int deviceId;
-    cudaGetDevice(&deviceId);
-
-    char* levelName = std::getenv("TLLM_LOG_LEVEL");
+    auto const* levelName = std::getenv("TLLM_LOG_LEVEL");
     if (levelName != nullptr)
     {
-        std::map<std::string, Level> nameToLevel = {
-            {"TRACE", TRACE},
-            {"DEBUG", DEBUG},
-            {"INFO", INFO},
-            {"WARNING", WARNING},
-            {"ERROR", ERROR},
-        };
-        auto level = nameToLevel.find(levelName);
+        auto level = [levelName]()
+        {
+            std::string levelNameCap(levelName);
+            toUpper(levelNameCap);
+            if (levelNameCap == "TRACE")
+                return TRACE;
+            if (levelNameCap == "VERBOSE" || levelNameCap == "DEBUG")
+                return DEBUG;
+            if (levelNameCap == "INFO")
+                return INFO;
+            if (levelNameCap == "WARNING")
+                return WARNING;
+            if (levelNameCap == "ERROR")
+                return ERROR;
+            TLLM_THROW("Invalid log level: %s", levelName);
+        }();
         // If TLLM_LOG_FIRST_RANK_ONLY=ON, set LOG LEVEL of other device to ERROR
-        if (isFirstRankOnly && deviceId != 0)
+        if (isFirstRankOnly)
         {
-            level = nameToLevel.find("ERROR");
+            auto const deviceId = getDevice();
+            if (deviceId != 1)
+            {
+                level = ERROR;
+            }
         }
-        if (level != nameToLevel.end())
-        {
-            setLevel(level->second);
-        }
-        else
-        {
-            fprintf(stderr,
-                "[TensorRT-LLM][WARNING] Invalid logger level TLLM_LOG_LEVEL=%s. "
-                "Ignore the environment variable and use a default "
-                "logging level.\n",
-                levelName);
-            levelName = nullptr;
-        }
+        setLevel(level);
     }
 }
 
@@ -71,5 +70,4 @@ Logger* Logger::getLogger()
     thread_local Logger instance;
     return &instance;
 }
-
 } // namespace tensorrt_llm::common

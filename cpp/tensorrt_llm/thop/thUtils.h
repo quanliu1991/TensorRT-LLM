@@ -15,20 +15,21 @@
  */
 
 #pragma once
-#include "tensorrt_llm/common/tensor.h"
-#include "torch/csrc/cuda/Stream.h"
-#include "torch/extension.h"
+
+#include "tensorrt_llm/runtime/iTensor.h"
+
 #include <ATen/cuda/CUDAContext.h>
-#include <cstdio>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include <iostream>
-#include <nvToolsExt.h>
+#include <nvtx3/nvToolsExt.h>
 #include <torch/custom_class.h>
+#include <torch/extension.h>
 #include <torch/script.h>
-#include <vector>
 
-#define CHECK_TYPE(x, st) TORCH_CHECK(x.scalar_type() == st, "Inconsistency of Tensor type: " #x)
+#include <cstdio>
+
+#define CHECK_TYPE(x, st)                                                                                              \
+    TORCH_CHECK(x.scalar_type() == st, #x " dtype is ", x.scalar_type(), ", while ", st, " is expected")
 #define CHECK_TH_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CPU(x) TORCH_CHECK(!x.is_cuda(), #x " must be a CPU tensor")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
@@ -56,6 +57,13 @@
 namespace torch_ext
 {
 
+// TODO: switch to use torch native fp4 dtype when ready
+constexpr auto FLOAT4_E2M1X2 = torch::ScalarType::Byte; // uint8_t
+constexpr auto SF_DTYPE = torch::ScalarType::Byte;      // uint8_t
+
+constexpr auto FP8_BLOCK_SCALING_SF_DTYPE = torch::ScalarType::Float;
+constexpr auto FP8_ROWWISE_SF_DTYPE = torch::ScalarType::Float;
+
 template <typename T>
 inline T* get_ptr(torch::Tensor& t)
 {
@@ -69,14 +77,19 @@ inline T get_val(torch::Tensor& t, int idx)
     return reinterpret_cast<T*>(t.data_ptr())[idx];
 }
 
-std::vector<size_t> convert_shape(torch::Tensor tensor);
+tensorrt_llm::runtime::ITensor::Shape convert_shape(torch::Tensor tensor);
 
 template <typename T>
-tensorrt_llm::common::Tensor convert_tensor(torch::Tensor tensor);
-
-template <typename T>
-tensorrt_llm::common::Tensor convert_tensor(torch::Tensor tensor, tensorrt_llm::common::MemoryType memory_type);
+tensorrt_llm::runtime::ITensor::UniquePtr convert_tensor(torch::Tensor tensor);
 
 size_t sizeBytes(torch::Tensor tensor);
+
+// from: cpp/tensorrt_llm/plugins/common/gemmPluginProfiler.h
+int nextPowerOfTwo(int v);
+
+// from: cpp/tensorrt_llm/plugins/lowLatencyGemmPlugin/lowLatencyGemmPlugin.cpp
+std::optional<float> getFloatEnv(char const* name);
+
+cudaDataType_t convert_torch_dtype(torch::ScalarType dtype);
 
 } // namespace torch_ext

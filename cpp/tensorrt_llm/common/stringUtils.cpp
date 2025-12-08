@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,38 +20,57 @@
 #include <cerrno>
 #include <cstdarg>
 #include <cstring>
+#include <iostream>
 #include <string>
 
 namespace tensorrt_llm::common
 {
 
-namespace
-{
-std::string vformat(char const* fmt, va_list args)
+void fmtstr_(char const* format, fmtstr_allocator alloc, void* target, va_list args)
 {
     va_list args0;
     va_copy(args0, args);
-    auto const size = vsnprintf(nullptr, 0, fmt, args0);
-    if (size <= 0)
-        return "";
 
-    std::string stringBuf(size, char{});
-    auto const size2 = std::vsnprintf(&stringBuf[0], size + 1, fmt, args);
+    size_t constexpr init_size = 2048;
+    char fixed_buffer[init_size];
+    auto const size = std::vsnprintf(fixed_buffer, init_size, format, args0);
+    va_end(args0);
 
-    TLLM_CHECK_WITH_INFO(size2 == size, std::string(std::strerror(errno)));
+    TLLM_CHECK_WITH_INFO(size >= 0, std::string(std::strerror(errno)));
+    if (size == 0)
+    {
+        return;
+    }
 
-    return stringBuf;
+    auto* memory = alloc(target, size);
+
+    if (static_cast<size_t>(size) < init_size)
+    {
+        std::memcpy(memory, fixed_buffer, size + 1);
+    }
+    else
+    {
+        auto const size2 = std::vsnprintf(memory, size + 1, format, args);
+        TLLM_CHECK_WITH_INFO(size2 == size, std::string(std::strerror(errno)));
+    }
 }
 
-} // namespace
-
-std::string fmtstr(char const* format, ...)
+std::unordered_set<std::string> str2set(std::string const& input, char delimiter)
 {
-    va_list args;
-    va_start(args, format);
-    std::string result = vformat(format, args);
-    va_end(args);
-    return result;
+    std::unordered_set<std::string> values;
+    if (!input.empty())
+    {
+        std::stringstream valStream(input);
+        std::string val;
+        while (std::getline(valStream, val, delimiter))
+        {
+            if (!val.empty())
+            {
+                values.insert(val);
+            }
+        }
+    }
+    return values;
 };
 
 } // namespace tensorrt_llm::common

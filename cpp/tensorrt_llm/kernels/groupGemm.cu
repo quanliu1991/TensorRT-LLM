@@ -33,36 +33,59 @@ namespace tensorrt_llm
 namespace kernels
 {
 
-template <int M1, int N1, int K1, int M2, int N2, int K2>
-void run_cutlass_(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vector<void*> ptrA, std::vector<void*> ptrB,
-    std::vector<void*> ptrC, std::vector<void*> ptrD, void* workspace, int64_t workSpaceSize, void* cublasWorkSpace,
-    int64_t cublasWorkspaceSize, cudaStream_t stream)
+int64_t inline getGemmCoordSize(int64_t problemCount)
 {
-    using ElementA = cutlass::half_t;
-    using ElementB = cutlass::half_t;
-    using ElementOutput = cutlass::half_t;
+    return (int64_t) (tensorrt_llm::common::divUp(problemCount * sizeof(cutlass::gemm::GemmCoord), 16) * 16);
+}
+
+int64_t inline getPtrSize(int64_t problemCount)
+{
+    return (int64_t) (tensorrt_llm::common::divUp(problemCount * sizeof(half*), 16) * 16);
+}
+
+int64_t inline getLddSize(int64_t problemCount)
+{
+    return (int64_t) (tensorrt_llm::common::divUp(problemCount * sizeof(int64_t), 16) * 16);
+}
+
+int64_t getGroupedGemmParamsWorkSpaceSize(int64_t problemCount)
+{
+    auto gemm_coord_size = getGemmCoordSize(problemCount);
+    auto ptr_size = 4 * getPtrSize(problemCount);
+    auto ldd_size = 4 * getLddSize(problemCount);
+
+    return gemm_coord_size + ptr_size + ldd_size;
+}
+
+template <int M1, int N1, int K1, int M2, int N2, int K2, typename cutlassType, int kAlignmentAB, int kAlignmentC,
+    int kStages>
+void groupedGemm_(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vector<void*> const& ptrA,
+    std::vector<void*> const& ptrB, std::vector<void*> const& ptrC, std::vector<void*> const& ptrD,
+    void* gemmParamsWorkSpace, int64_t gemmParamsWorkSpaceSize, void* gemmWorkSpace, int64_t gemmWorkspaceSize,
+    nvinfer1::DataType dataType, cudaStream_t stream)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    using ElementA = cutlassType;
+    using ElementB = cutlassType;
+    using ElementOutput = cutlassType;
     using ElementAccumulator = float;
 
     using LayoutA = cutlass::layout::RowMajor;
     using LayoutB = cutlass::layout::ColumnMajor;
     using LayoutC = cutlass::layout::RowMajor;
 
-    const int kAlignmentA = 8;
-    const int kAlignmentB = 8;
-
-    int problem_count = problem_sizes.size();
+    int problemCount = problem_sizes.size();
 
     using GemmKernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<ElementA, LayoutA,
-        cutlass::ComplexTransform::kNone, kAlignmentA, ElementB, LayoutB, cutlass::ComplexTransform::kNone, kAlignmentB,
-        ElementOutput, LayoutC, ElementAccumulator, cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
+        cutlass::ComplexTransform::kNone, kAlignmentAB, ElementB, LayoutB, cutlass::ComplexTransform::kNone,
+        kAlignmentAB, ElementOutput, LayoutC, ElementAccumulator, cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
         cutlass::gemm::GemmShape<M1, N1, K1>, cutlass::gemm::GemmShape<M2, N2, K2>, cutlass::gemm::GemmShape<16, 8, 16>,
-        cutlass::epilogue::thread::LinearCombination<ElementOutput, 128 / cutlass::sizeof_bits<ElementOutput>::value,
-            ElementAccumulator, ElementAccumulator>,
+        cutlass::epilogue::thread::LinearCombination<ElementOutput, kAlignmentC, ElementAccumulator,
+            ElementAccumulator>,
         // NOTE: Threadblock swizzling is currently not supported by CUTLASS's grouped kernels.
         // This parameter is passed in at present to match the APIs of other kernels. The parameter
         // is unused within the kernel.
-        cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle,
-        4, // kStages
+        cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle, kStages,
         cutlass::gemm::kernel::GroupScheduleMode::kDeviceOnly>::GemmKernel;
 
     using Gemm = cutlass::gemm::device::GemmGrouped<GemmKernel>;
@@ -71,11 +94,11 @@ void run_cutlass_(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vect
     float beta = 0.0f;
     typename Gemm::EpilogueOutputOp::Params epilogue_op(alpha, beta);
 
-    auto gemm_coord_size = tensorrt_llm::common::divUp(problem_count * sizeof(cutlass::gemm::GemmCoord), 16) * 16;
-    auto ptr_size = tensorrt_llm::common::divUp(problem_count * sizeof(half*), 16) * 16;
-    auto ldd_size = tensorrt_llm::common::divUp(problem_count * sizeof(int64_t), 16) * 16;
+    auto gemm_coord_size = getGemmCoordSize(problemCount);
+    auto ptr_size = getPtrSize(problemCount);
+    auto ldd_size = getLddSize(problemCount);
 
-    char* host_workspace = (char*) std::malloc(workSpaceSize);
+    char* host_workspace = (char*) std::malloc(gemmParamsWorkSpaceSize);
     cutlass::gemm::GemmCoord* problem_sizes_host = reinterpret_cast<cutlass::gemm::GemmCoord*>(host_workspace);
     ElementA** ptr_A_host = reinterpret_cast<ElementA**>(host_workspace + gemm_coord_size);
     ElementB** ptr_B_host = reinterpret_cast<ElementB**>(host_workspace + gemm_coord_size + ptr_size);
@@ -86,7 +109,7 @@ void run_cutlass_(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vect
     int64_t* ldc_host = reinterpret_cast<int64_t*>(host_workspace + gemm_coord_size + 4 * ptr_size + 2 * ldd_size);
     int64_t* ldd_host = reinterpret_cast<int64_t*>(host_workspace + gemm_coord_size + 4 * ptr_size + 3 * ldd_size);
 
-    for (int32_t i = 0; i < problem_count; ++i)
+    for (int32_t i = 0; i < problemCount; ++i)
     {
         problem_sizes_host[i] = problem_sizes.at(i);
         ptr_A_host[i] = (ElementA*) ptrA.at(i);
@@ -96,36 +119,47 @@ void run_cutlass_(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vect
 
         auto problem = problem_sizes.at(i);
         lda_host[i] = LayoutA::packed({problem.m(), problem.k()}).stride(0);
+        TLLM_CHECK(lda_host[i] % kAlignmentAB == 0);
         ldb_host[i] = LayoutB::packed({problem.k(), problem.n()}).stride(0);
+        TLLM_CHECK(ldb_host[i] % kAlignmentAB == 0);
         ldc_host[i] = LayoutC::packed({problem.m(), problem.n()}).stride(0);
+        TLLM_CHECK(ldc_host[i] % kAlignmentC == 0);
         ldd_host[i] = LayoutC::packed({problem.m(), problem.n()}).stride(0);
+        TLLM_CHECK(ldd_host[i] % kAlignmentC == 0);
     }
 
-    cutlass::gemm::GemmCoord* problem_sizes_device = reinterpret_cast<cutlass::gemm::GemmCoord*>(workspace);
-    ElementA** ptr_A = reinterpret_cast<ElementA**>((char*) workspace + gemm_coord_size);
-    ElementB** ptr_B = reinterpret_cast<ElementB**>((char*) workspace + gemm_coord_size + ptr_size);
-    ElementOutput** ptr_C = reinterpret_cast<ElementOutput**>((char*) workspace + gemm_coord_size + 2 * ptr_size);
-    ElementOutput** ptr_D = reinterpret_cast<ElementOutput**>((char*) workspace + gemm_coord_size + 3 * ptr_size);
-    int64_t* lda = reinterpret_cast<int64_t*>((char*) workspace + gemm_coord_size + 4 * ptr_size + 0 * ldd_size);
-    int64_t* ldb = reinterpret_cast<int64_t*>((char*) workspace + gemm_coord_size + 4 * ptr_size + 1 * ldd_size);
-    int64_t* ldc = reinterpret_cast<int64_t*>((char*) workspace + gemm_coord_size + 4 * ptr_size + 2 * ldd_size);
-    int64_t* ldd = reinterpret_cast<int64_t*>((char*) workspace + gemm_coord_size + 4 * ptr_size + 3 * ldd_size);
+    cutlass::gemm::GemmCoord* problem_sizes_device = reinterpret_cast<cutlass::gemm::GemmCoord*>(gemmParamsWorkSpace);
+    ElementA** ptr_A = reinterpret_cast<ElementA**>((char*) gemmParamsWorkSpace + gemm_coord_size);
+    ElementB** ptr_B = reinterpret_cast<ElementB**>((char*) gemmParamsWorkSpace + gemm_coord_size + ptr_size);
+    ElementOutput** ptr_C
+        = reinterpret_cast<ElementOutput**>((char*) gemmParamsWorkSpace + gemm_coord_size + 2 * ptr_size);
+    ElementOutput** ptr_D
+        = reinterpret_cast<ElementOutput**>((char*) gemmParamsWorkSpace + gemm_coord_size + 3 * ptr_size);
+    int64_t* lda
+        = reinterpret_cast<int64_t*>((char*) gemmParamsWorkSpace + gemm_coord_size + 4 * ptr_size + 0 * ldd_size);
+    int64_t* ldb
+        = reinterpret_cast<int64_t*>((char*) gemmParamsWorkSpace + gemm_coord_size + 4 * ptr_size + 1 * ldd_size);
+    int64_t* ldc
+        = reinterpret_cast<int64_t*>((char*) gemmParamsWorkSpace + gemm_coord_size + 4 * ptr_size + 2 * ldd_size);
+    int64_t* ldd
+        = reinterpret_cast<int64_t*>((char*) gemmParamsWorkSpace + gemm_coord_size + 4 * ptr_size + 3 * ldd_size);
 
-    TLLM_CHECK(((char*) ldc_host - (char*) host_workspace) == ((char*) ldc - (char*) workspace));
-    tensorrt_llm::common::cudaAutoCpy((int8_t*) workspace, (int8_t*) host_workspace, workSpaceSize, stream);
+    TLLM_CHECK(((char*) ldc_host - (char*) host_workspace) == ((char*) ldc - (char*) gemmParamsWorkSpace));
+    tensorrt_llm::common::cudaAutoCpy(
+        (int8_t*) gemmParamsWorkSpace, (int8_t*) host_workspace, gemmParamsWorkSpaceSize, stream);
 
-    int threadblock_count = Gemm::sufficient(problem_sizes.data(), problem_count);
+    int threadblock_count = Gemm::sufficient(problem_sizes.data(), problemCount);
 
-    typename Gemm::Arguments args(problem_sizes_device, problem_count, threadblock_count, epilogue_op, ptr_A, ptr_B,
+    typename Gemm::Arguments args(problem_sizes_device, problemCount, threadblock_count, epilogue_op, ptr_A, ptr_B,
         ptr_C, ptr_D, lda, ldb, ldc, ldd, problem_sizes.data());
 
     // Initialize the GEMM object
     Gemm gemm;
 
     size_t workspace_size = gemm.get_workspace_size(args);
-    TLLM_CHECK(gemm.get_workspace_size(args) <= cublasWorkspaceSize);
+    TLLM_CHECK(gemm.get_workspace_size(args) <= gemmWorkspaceSize);
 
-    cutlass::Status status = gemm.initialize(args, cublasWorkSpace);
+    cutlass::Status status = gemm.initialize(args, gemmWorkSpace);
 
     TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess, "Failed to initialize CUTLASS Grouped GEMM kernel.");
 
@@ -133,26 +167,94 @@ void run_cutlass_(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vect
     status = gemm.run(stream);
 
     TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess, "Failed to run CUTLASS Grouped GEMM kernel.");
+    sync_check_cuda_error(stream);
 
     std::free(host_workspace);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void run_cutlass_1(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vector<void*> ptrA,
-    std::vector<void*> ptrB, std::vector<void*> ptrC, std::vector<void*> ptrD, void* workspace, int64_t workSpaceSize,
-    void* cublasWorkSpace, int64_t cublasWorkspaceSize, cudaStream_t stream)
+template <int M1, int N1, int K1, int M2, int N2, int K2, int kAlignmentAB, int kAlignmentC, int kStages>
+void groupedGemmType_(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vector<void*> const& ptrA,
+    std::vector<void*> const& ptrB, std::vector<void*> const& ptrC, std::vector<void*> const& ptrD,
+    void* gemmParamsWorkSpace, int64_t gemmParamsWorkSpaceSize, void* gemmWorkSpace, int64_t gemmWorkspaceSize,
+    nvinfer1::DataType dataType, cudaStream_t stream)
 {
-    // For lora in, which has smaller N
-    run_cutlass_<128, 32, 32, 32, 32, 32>(
-        problem_sizes, ptrA, ptrB, ptrC, ptrD, workspace, workSpaceSize, cublasWorkSpace, cublasWorkspaceSize, stream);
+    if (dataType == nvinfer1::DataType::kHALF)
+    {
+        groupedGemm_<M1, N1, K1, M2, N2, K2, cutlass::half_t, kAlignmentAB, kAlignmentC, kStages>(problem_sizes, ptrA,
+            ptrB, ptrC, ptrD, gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize, dataType,
+            stream);
+    }
+    else if (dataType == nvinfer1::DataType::kFLOAT)
+    {
+        TLLM_CHECK_WITH_INFO(false, "not support float input/output");
+    }
+#ifdef ENABLE_BF16
+    else if (dataType == nvinfer1::DataType::kBF16)
+    {
+        groupedGemm_<M1, N1, K1, M2, N2, K2, cutlass::bfloat16_t, kAlignmentAB, kAlignmentC, kStages>(problem_sizes,
+            ptrA, ptrB, ptrC, ptrD, gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize,
+            dataType, stream);
+    }
+#endif
 }
 
-void run_cutlass_2(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vector<void*> ptrA,
-    std::vector<void*> ptrB, std::vector<void*> ptrC, std::vector<void*> ptrD, void* workspace, int64_t workSpaceSize,
-    void* cublasWorkSpace, int64_t cublasWorkspaceSize, cudaStream_t stream)
+void groupedGemm(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vector<void*> const& ptrA,
+    std::vector<void*> const& ptrB, std::vector<void*> const& ptrC, std::vector<void*> const& ptrD,
+    void* gemmParamsWorkSpace, int64_t gemmParamsWorkSpaceSize, void* gemmWorkSpace, int64_t gemmWorkspaceSize,
+    bool isLoraIn, nvinfer1::DataType dataType, int minKN, cudaStream_t stream)
 {
-    // For lora out, which has larger N
-    run_cutlass_<128, 128, 32, 64, 64, 32>(
-        problem_sizes, ptrA, ptrB, ptrC, ptrD, workspace, workSpaceSize, cublasWorkSpace, cublasWorkspaceSize, stream);
+    TLLM_LOG_TRACE("%s start, isLoraIn: %d, minKN = %d", __PRETTY_FUNCTION__, static_cast<int>(isLoraIn), minKN);
+    if (isLoraIn)
+    {
+        // K >> N, like K = 1024, N = 8
+        // Use larger K tile and smaller N tile
+        if (minKN >= 8)
+        {
+            groupedGemmType_<16, 32, 64, 16, 32, 64, 8, 8, 4>(problem_sizes, ptrA, ptrB, ptrC, ptrD,
+                gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize, dataType, stream);
+        }
+        else if (minKN >= 4)
+        {
+            groupedGemmType_<16, 32, 64, 16, 32, 64, 8, 4, 4>(problem_sizes, ptrA, ptrB, ptrC, ptrD,
+                gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize, dataType, stream);
+        }
+        else if (minKN >= 2)
+        {
+            groupedGemmType_<16, 32, 64, 16, 32, 64, 8, 2, 2>(problem_sizes, ptrA, ptrB, ptrC, ptrD,
+                gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize, dataType, stream);
+        }
+        else if (minKN >= 1)
+        {
+            groupedGemmType_<16, 32, 64, 16, 32, 64, 8, 1, 2>(problem_sizes, ptrA, ptrB, ptrC, ptrD,
+                gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize, dataType, stream);
+        }
+    }
+    else
+    {
+        // N >> K, like K = 8, N = 1024
+        // User larger N tile and smaller K tile
+        if (minKN >= 8)
+        {
+            groupedGemmType_<32, 128, 32, 32, 32, 32, 8, 8, 4>(problem_sizes, ptrA, ptrB, ptrC, ptrD,
+                gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize, dataType, stream);
+        }
+        else if (minKN >= 4)
+        {
+            groupedGemmType_<32, 128, 32, 32, 32, 32, 4, 8, 4>(problem_sizes, ptrA, ptrB, ptrC, ptrD,
+                gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize, dataType, stream);
+        }
+        else if (minKN >= 2)
+        {
+            groupedGemmType_<32, 128, 32, 32, 32, 32, 2, 8, 2>(problem_sizes, ptrA, ptrB, ptrC, ptrD,
+                gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize, dataType, stream);
+        }
+        else
+        {
+            groupedGemmType_<32, 128, 32, 32, 32, 32, 1, 8, 2>(problem_sizes, ptrA, ptrB, ptrC, ptrD,
+                gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize, dataType, stream);
+        }
+    }
 }
 
 } // namespace kernels

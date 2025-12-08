@@ -2,6 +2,12 @@
 
 set -ex
 
-RELEASE_URL_PG=https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/secure/9.0.1/tars/polygraphy-0.48.1-py2.py3-none-any.whl
-pip uninstall -y polygraphy
-pip install ${RELEASE_URL_PG}
+if [ -n "${GITHUB_MIRROR}" ]; then
+  export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
+fi
+pip3 install polygraphy==0.49.9
+
+# Clean up pip cache and temporary files
+pip3 cache purge
+rm -rf ~/.cache/pip
+rm -rf /tmp/*

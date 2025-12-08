@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass
+from math import prod
 from typing import Any, Dict, List, Optional
 
 # isort: off
@@ -23,7 +24,7 @@ import torch
 import tensorrt as trt
 # isort: on
 
-from .._utils import trt_dtype_to_torch
+from .._utils import torch_dtype_to_trt, trt_dtype_to_torch
 from ..logger import logger
 
 
@@ -46,7 +47,37 @@ class TensorInfo:
     name: str
     dtype: trt.DataType
     shape: tuple
+
     # add more info like strides, formats if needed
+
+    def numel(self):
+        return prod(self.shape)
+
+    def view(self, *shape):
+        assert set(map(type, shape)) == {int}
+        n_unknown = len(tuple(filter(lambda l: l < 0, shape)))
+        new_shape = list(shape)
+        if n_unknown == 0:
+            assert prod(shape) == self.numel()
+        elif n_unknown == 1:
+            n_known_elements = prod(filter(lambda l: l >= 0, shape))
+            for i, l in enumerate(new_shape):
+                if l == -1:
+                    assert self.numel() % n_known_elements == 0
+                    new_shape[i] = self.numel() // n_known_elements
+                    break
+        else:
+            raise ValueError('More than one dimensions need to be inferred!')
+        return TensorInfo(self.name, self.dtype, tuple(new_shape))
+
+    def __len__(self):
+        return self.shape[0]
+
+    def squeeze(self, dim=0):
+        if self.shape[dim] != 1:
+            raise ValueError(f"dim {dim} is {self.shape[dim]} instead of 1!")
+        return TensorInfo(self.name, self.dtype,
+                          self.shape[:dim] + self.shape[dim + 1:])
 
 
 class Session(object):
@@ -64,10 +95,17 @@ class Session(object):
         self._runtime = trt.Runtime(logger.trt_logger)
         if engine_buffer is not None:
             self._engine = self.runtime.deserialize_cuda_engine(engine_buffer)
+
+        self._context = None
+        if not self.engine.streamable_weights_size:
+            self.__prepare_execution_contexts()
+        return self
+
+    def __prepare_execution_contexts(self):
         self._context = self.engine.create_execution_context()
+        assert self._context is not None, "Failed to create an execution context!"
         with _scoped_stream() as stream:
             self._context.set_optimization_profile_async(0, stream)
-        return self
 
     @staticmethod
     def from_serialized_engine(engine) -> Session:
@@ -111,16 +149,20 @@ class Session(object):
         '''
         return self._context
 
+    @property
+    def context_mem_size(self) -> int:
+        return self.engine.device_memory_size_v2
+
     def _print_engine_info(self):
         '''print engine info for debug purpose, internal use only.
         '''
-        refitable = self.engine.refittable
+        refittable = self.engine.refittable
         num_layers = self.engine.num_layers
-        device_memory_size = self.engine.device_memory_size
+        device_memory_size = self.engine.device_memory_size_v2
         name = self.engine.name
         nb_profiles = self.engine.num_optimization_profiles
         logger.info(
-            f"Engine:{name=:}, {refitable=:}, {num_layers=:}, {device_memory_size=:}, {nb_profiles=:}"
+            f"Engine:{name=:}, {refittable=:}, {num_layers=:}, {device_memory_size=:}, {nb_profiles=:}"
         )
         self._print_io_info()
 
@@ -156,7 +198,7 @@ class Session(object):
                 if not ok:
                     raise ValueError(
                         f"Couldn't assign {name} with shape {tensor_dict[name].shape}, "
-                        f"engine supports [min, opt, max] = {self.engine.get_profile_shape(context.active_optimization_profile, name)}"
+                        f"engine supports [min, opt, max] = {self.engine.get_tensor_profile_shape(name, context.active_optimization_profile)}"
                     )
 
     def infer_shapes(
@@ -193,6 +235,35 @@ class Session(object):
                 dtype = self.engine.get_tensor_dtype(name)
                 outputs.append(TensorInfo(name, dtype, shape))
         return outputs
+
+    def _set_weight_streaming(self, gpu_weights_percent):
+        if not self.engine.streamable_weights_size:
+            assert gpu_weights_percent == 1, "Engine built without weight streaming. Cannot set gpu_weights_percent to a value other than 1."
+            return
+
+        assert self.engine is not None
+
+        self._context = None
+
+        min = 0
+        max = self.engine.streamable_weights_size
+        budget = int(gpu_weights_percent * max)
+
+        self.engine.weight_streaming_budget_v2 = budget
+        assert self.engine.weight_streaming_budget_v2 == budget, "Failed to set weight streaming budget!"
+        logger.info(
+            f"Set gpu weights percent to {gpu_weights_percent}, which is {budget} bytes. Valid range: {min} bytes ~ {max} bytes."
+        )
+
+        try:
+            self.__prepare_execution_contexts()
+        except:
+            free_mem = torch.cuda.mem_get_info()[0]
+            if free_mem < budget:
+                raise torch.cuda.OutOfMemoryError(
+                    f"Out of Memory: Memory budget is {budget} bytes but only {free_mem} bytes are available on the GPU."
+                )
+            raise
 
     def run(self,
             inputs: Dict[str, Any],
@@ -232,20 +303,17 @@ class Session(object):
         '''Run the engine enqueue with allocated output tensors, for debug purpose, since it is a sync call and slower than run
         '''
         import torch
-        torch_dtype_to_trt = {
-            torch.float16: trt.float16,
-            torch.float32: trt.float32,
-            torch.int32: trt.int32
-        }
+
         inputs_info = [
-            TensorInfo(name, torch_dtype_to_trt[tensor.dtype], tensor.shape)
+            TensorInfo(name, torch_dtype_to_trt(tensor.dtype), tensor.shape)
             for name, tensor in inputs.items()
         ]
         outputs_info = self.infer_shapes(inputs_info)
         outputs = {
-            t.name: torch.empty(tuple(t.shape),
-                                dtype=trt_dtype_to_torch(t.dtype),
-                                device='cuda')
+            t.name:
+            torch.empty(tuple(t.shape),
+                        dtype=trt_dtype_to_torch(t.dtype),
+                        device='cuda')
             for t in outputs_info
         }
         with _scoped_stream() as stream:

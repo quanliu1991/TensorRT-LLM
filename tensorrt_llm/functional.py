@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,20 +20,21 @@ from functools import partial
 from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
+import torch
 
 # isort: off
-import torch
 import tensorrt as trt
 # isort: on
 
 from . import graph_rewriting as gw
 from ._common import default_net, default_trtnet, precision
-from ._utils import (bf16_array, dim_resolve_negative, dim_to_trt_axes,
-                     fp16_array, fp32_array, int32_array, np_dtype_to_trt,
-                     str_dtype_to_np, str_dtype_to_trt, torch_to_numpy,
-                     trt_dtype_to_torch)
-from .logger import logger
-from .plugin import TRT_LLM_PLUGIN_NAMESPACE
+from ._utils import (QuantModeWrapper, bf16_array, bool_array,
+                     dim_resolve_negative, dim_to_trt_axes, dims_array,
+                     fp16_array, fp32_array, get_sm_version, int32_array,
+                     int64_array, np_dtype_to_trt, str_dtype_to_trt,
+                     trt_dtype_to_np, trt_dtype_to_str)
+from .network import PluginInfo, set_np_weight, set_plugin_info
+from .plugin import TRT_LLM_PLUGIN_NAMESPACE, current_all_reduce_helper
 from .quantization import QuantMode
 
 
@@ -44,7 +45,7 @@ class DimRange(object):
             self.min = [dim 0 min, dim 1 min]
             self.opt = [dim 0 opt, dim 1 opt]
             self.max = [dim 0 max, dim 1 max]
-        For static dimension, it has min==opt==max, thus the \p shape param in the ctor can be an integer
+        For static dimension, it has min==opt==max, thus the shape param in the ctor can be an integer
     '''
 
     def __init__(self, shape: List[Union[int, List[int], Tuple[int, int, int]]],
@@ -179,6 +180,8 @@ class Tensor(object):
 
         # So from the dim_range arg to self.profiles conversion, there is a layout transpose
         # dim_range arg is: {M dimension x N profiles}, while self.profiles layout is {N profiles x M dimensions}
+        if isinstance(dtype, str):
+            dtype = str_dtype_to_trt(dtype)
 
         self.profiles = []
 
@@ -197,6 +200,7 @@ class Tensor(object):
         # using strong reference will likely cause significant peak memory increase, since Network objects
         # holds the weights data.
         self._network = weakref.ref(default_net())
+        self.is_network_input = is_network_input
         if is_network_input:
             if dim_range is not None:
                 assert isinstance(dim_range, OrderedDict)
@@ -292,7 +296,9 @@ class Tensor(object):
         if location is not None:
             self.trt_tensor.location = location
 
-    def mark_output(self, name, dtype):
+    def mark_output(self,
+                    name: Optional[str] = None,
+                    dtype: Optional[Union[str, trt.DataType]] = None):
         '''
         Mark a tensor as a network output.
 
@@ -301,11 +307,13 @@ class Tensor(object):
         allocating buffers to store the output tensors when preparing the
         execution of the TensorRT engine.
         '''
+        if name is None:
+            name = self.name
+
         if isinstance(dtype, str):
             dtype = str_dtype_to_trt(dtype)
-        else:
-            assert isinstance(dtype, trt.DataType)
 
+        assert dtype is None or isinstance(dtype, trt.DataType)
         default_net()._mark_output(self, name, dtype)
 
     def __add__(self, b):
@@ -350,6 +358,18 @@ class Tensor(object):
         '''
         return div(self, b)
 
+    def __floordiv__(self, b):
+        '''
+        See functional.floordiv.
+        '''
+        return floordiv(self, b)
+
+    def __mod__(self, b):
+        '''
+        See functional.floordiv.
+        '''
+        return modulo(self, b)
+
     def __lt__(self, b):
         '''
         See functional.lt.
@@ -391,6 +411,12 @@ class Tensor(object):
         '''
         return view(self, shape, zero_is_placeholder)
 
+    def flatten(self, start_dim=0, end_dim=-1):
+        '''
+        See functional.flatten.
+        '''
+        return flatten(self, start_dim, end_dim)
+
     def permute(self, dims):
         '''
         See functional.permute.
@@ -427,6 +453,24 @@ class Tensor(object):
         '''
         return sqrt(self)
 
+    def squeeze(self, dim, zero_is_placeholder):
+        '''
+        See functional.squeeze.
+        '''
+        return squeeze(self, dim, zero_is_placeholder)
+
+    def unsqueeze(self, dim):
+        '''
+        See functional.squeeze.
+        '''
+        return unsqueeze(self, dim)
+
+    def log(self):
+        '''
+        See functional.log.
+        '''
+        return log(self)
+
     def cast(self, dtype):
         '''
         See functional.cast.
@@ -462,6 +506,24 @@ class Tensor(object):
         See functional.split.
         '''
         return split(self, split_size_or_sections, dim)
+
+    def select(self, dim, index):
+        '''
+        See functional.select.
+        '''
+        return select(self, dim, index)
+
+    def unbind(self, dim=0):
+        '''
+        See functional.unbind.
+        '''
+        return unbind(self, dim)
+
+    def repeat(self, sizes):
+        '''
+        See functional.repeat
+        '''
+        return repeat(self, sizes)
 
     def is_dynamic(self, dim=None):
         '''
@@ -527,11 +589,22 @@ class Tensor(object):
         else:
             return id(None)
 
+    def __repr__(self):
+        return f"TensorRT LLM Tensor: {self.name=} {self.dtype=} {self.shape=}"
 
-def _create_tensor(trt_tensor: trt.ITensor,
-                   producer: trt.ILayer = None) -> Tensor:
+    def __xor__(self, b):
+        '''
+        Maps to functional.gt or functional.eq.
+        '''
+        print(f"self.shape: {self.shape}, b.shape: {b.shape}")
+        a, b = broadcast_helper(self, b)
+        print(f"a.shape: {a.shape}, b.shape: {b.shape}")
+        return op_xor(a, b)
+
+
+def _create_tensor(trt_tensor: trt.ITensor, producer: trt.ILayer) -> Tensor:
     '''
-    A helper function to create a TensorRT-LLM Tensor object that encapsulates
+    A helper function to create a TensorRT LLM Tensor object that encapsulates
     the connection between the TensorRT tensor (trt.ITensor) and the layer
     (trt.ILayer) that produces it.
 
@@ -549,16 +622,25 @@ def _create_tensor(trt_tensor: trt.ITensor,
         trt_tensor : trt.ITensor
             The TensorRT tensor to connect to its producer (the layer).
 
-        producer : trt.ILayer = None
+        producer : trt.ILayer
             The producer.
 
     Returns:
-        The TensorRT-LLM tensor (functional.Tensor) that encapsulates the
+        The TensorRT LLM tensor (functional.Tensor) that encapsulates the
         TensorRT tensor and the layer that produces it. The former is
         accessible through the attribute 'trt_tensor' and the latter using the
         attribute 'producer'.
     '''
     assert trt_tensor is not None
+    assert producer is not None
+
+    # Set the layer name since this is the only
+    # centralized location to pass the name from
+    # module space to the TRT IR
+    default_net()._set_layer_name(producer)
+
+    assert trt_tensor.shape.__len__(
+    ) >= 0, f"tensor {trt_tensor.name} has an invalid shape"
     tensor = Tensor(name=trt_tensor.name,
                     dtype=trt_tensor.dtype,
                     shape=trt_tensor.shape,
@@ -566,14 +648,11 @@ def _create_tensor(trt_tensor: trt.ITensor,
     tensor.trt_tensor = trt_tensor
     tensor.producer = producer
 
-    # Set the layer name since this is the only
-    # centralized location to pass the name from
-    # module space to the TRT IR
-    default_net()._set_layer_name(producer)
+    # tb.print_stack(limit=10) # FOR DEBUGGING: filter producer.name if needed
     if default_net().dtype is not None and not default_net().strongly_typed:
         if producer.type not in [
-                trt.LayerType.CONSTANT, trt.LayerType.GATHER,
-                trt.LayerType.CONCATENATION
+                trt.LayerType.SHAPE, trt.LayerType.CONSTANT,
+                trt.LayerType.GATHER, trt.LayerType.CONCATENATION
         ]:
             producer.precision = default_net().dtype
     assert tensor is not None
@@ -584,26 +663,55 @@ def _create_tensor(trt_tensor: trt.ITensor,
     return tensor
 
 
+def _add_plugin_info(layer, plugin_creator: trt.IPluginCreator,
+                     plugin_name: str, pfc: trt.PluginFieldCollection) -> None:
+    plugin_info = PluginInfo(plugin_creator, plugin_name, pfc)
+    set_plugin_info(default_net().trt_network, layer.name, plugin_info)
+
+
 class RotaryScalingType(IntEnum):
     none = 0
     linear = 1
     dynamic = 2
+    longrope = 3
+    llama3 = 4
+    yarn = 5
+    mrope = 6
+
+    @staticmethod
+    def from_string(s):
+        try:
+            return RotaryScalingType[s]
+        except KeyError:
+            raise ValueError(f'Unsupported rotary scaling type: {s}')
 
 
 class PositionEmbeddingType(IntEnum):
     learned_absolute = 0
     rope_gptj = 1
     rope_gpt_neox = 2
-    alibi = 3
-    alibi_with_scale = 4
-    relative = 5
-    chatglm = 6
+    long_rope = 3
+    alibi = 4
+    alibi_with_scale = 5
+    relative = 6
+    chatglm = 7
+    yarn = 8
+    mrope = 9
+    deferred = 10  # Apply customized positional embedding by using an external embedder. K will be cached before embedding.
 
     def is_rope(self) -> bool:
-        return self in [self.rope_gptj, self.rope_gpt_neox]
+        return self in [
+            self.rope_gptj, self.rope_gpt_neox, self.long_rope, self.mrope
+        ]
+
+    def is_mrope(self) -> bool:
+        return self in [self.mrope]
 
     def is_alibi(self) -> bool:
         return self in [self.alibi, self.alibi_with_scale]
+
+    def is_deferred(self) -> bool:
+        return self in [self.deferred]
 
     @staticmethod
     def choices() -> List[str]:
@@ -623,8 +731,11 @@ class PositionEmbeddingType(IntEnum):
 class AttentionMaskType(IntEnum):
     padding = 0
     causal = 1
-    bidirectional = 2
-    bidirectionalglm = 3  # TODO: merge this mask into bidirectional
+    sliding_window_causal = 2
+    bidirectional = 3
+    bidirectionalglm = 4  # TODO: merge this mask into bidirectional
+    blocksparse = 5
+    custom_mask = 6
 
 
 class LayerNormType(IntEnum):
@@ -642,6 +753,15 @@ class MLPType(IntEnum):
     MLP = 0
     GatedMLP = 1
     FusedGatedMLP = 2
+
+
+class SliceInputType(IntEnum):
+    data = 0
+    start = 1
+    size = 2
+    stride = 3
+    fill_value = 4
+    axes = 5
 
 
 def activation(input: Tensor, act_type: trt.ActivationType) -> Tensor:
@@ -666,6 +786,13 @@ def activation(input: Tensor, act_type: trt.ActivationType) -> Tensor:
     '''
     layer = default_trtnet().add_activation(input.trt_tensor, act_type)
     return _create_tensor(layer.get_output(0), layer)
+
+
+def int_clip(input: Tensor, lower: int, upper: int) -> Tensor:
+    assert lower <= upper, f"Lower bound must be less than or equal to upper bound i.e. {lower} <= {upper}"
+    res = minimum(input, upper)
+    res = maximum(res, lower)
+    return res
 
 
 def clip(input: Tensor, alpha: float, beta: float) -> Tensor:
@@ -717,7 +844,7 @@ def swiglu(input: Tensor) -> Tensor:
 
     That function takes a tensor, splits it into two halves along the last
     dimension, applies SiLU to the second half and multiply the results. The
-    behaviour is undefined if the last dimension is not even.
+    behavior is undefined if the last dimension is not even.
 
     Parameters:
         input : Tensor
@@ -775,14 +902,19 @@ def cast(input: Tensor, dtype: Union[str, trt.DataType]):
     else:
         raise TypeError("%s is not supported" % type(dtype))
 
+    if input.dtype == cvt_dtype:
+        # If input type and cast dtype are the same, do nothing
+        return input
+
     layer = default_trtnet().add_cast(input.trt_tensor, cvt_dtype)
     if not default_net().strongly_typed:
         layer.set_output_type(0, cvt_dtype)
     output = _create_tensor(layer.get_output(0), layer)
-    if input.dtype == str_dtype_to_trt('int8'):
-        layer.get_input(0).set_dynamic_range(-127, 127)
-    if cvt_dtype == str_dtype_to_trt('int8'):
-        layer.get_output(0).set_dynamic_range(-127, 127)
+    if not default_net().strongly_typed:
+        if input.dtype == str_dtype_to_trt('int8'):
+            layer.get_input(0).set_dynamic_range(-127, 127)
+        if cvt_dtype == str_dtype_to_trt('int8'):
+            layer.get_output(0).set_dynamic_range(-127, 127)
 
     return output
 
@@ -924,7 +1056,8 @@ def interpolate(input: Tensor,
 def matmul(input: Tensor,
            mat2: Tensor,
            transa: bool = False,
-           transb: bool = False) -> Tensor:
+           transb: bool = False,
+           use_fp32_acc: bool = True) -> Tensor:
     '''
     Add a matrix multiplication.
 
@@ -947,18 +1080,18 @@ def matmul(input: Tensor,
             Is the second input transposed? Set to 'True' if you want the
             second input to be transposed, 'False' otherwise.
 
+        use_fp32_acc: bool
+            Set to 'True' if for accuracy reason, this fp16 matmul needs to use
+            fp32 accumulation. This can be a per model and per matmul decision.
     Returns:
         The tensor produced by the inserted layer.
     '''
+    # This option is only supported for fp16, but not bf16 or any other precisions.
+    use_fp32_acc = use_fp32_acc and input.dtype == trt.DataType.HALF and mat2.dtype == trt.DataType.HALF
 
-    # MatMul with fp32 accumulation in strongly typed mode will cause engine building failed.
-    # Will be fixed it in TRT 10.0.
-    matmul_fp32_acc = False
-    if (input.dtype == trt.DataType.HALF or mat2.dtype
-            == trt.DataType.HALF) and not default_net()._strongly_typed:
+    if use_fp32_acc:
         input = cast(input, 'float32')
         mat2 = cast(mat2, 'float32')
-        matmul_fp32_acc = True
 
     input, mat2 = broadcast_helper(input, mat2)
     op0 = trt.MatrixOperation.TRANSPOSE if transa \
@@ -967,13 +1100,90 @@ def matmul(input: Tensor,
         else trt.MatrixOperation.NONE
     layer = default_trtnet().add_matrix_multiply(input.trt_tensor, op0,
                                                  mat2.trt_tensor, op1)
-    if matmul_fp32_acc:
-        return cast(_create_tensor(layer.get_output(0), layer), 'float16')
+    output = _create_tensor(layer.get_output(0), layer)
+    if use_fp32_acc:
+        output = cast(output, "float16")
+
+    return output
+
+
+def gemm_swiglu(input: Tensor,
+                weight: Tensor,
+                bias: Optional[Tensor] = None,
+                scale_d0: float = 1.0,
+                scale_d1: float = 1.0,
+                scale_output: float = 1.0) -> Tensor:
+    '''
+    Add a matrix multiplication, followed by SwiGLU (`x * SiLU(gate)`) operation.
+
+    The second SwiGLU operation takes the preceding tensor, splits it into two halves
+    along the last dimension, applies SiLU to the second half and multiply the results. The
+    behaviour is undefined if the last dimension is not even.
+
+        Parameters:
+        input : Tensor
+            The first tensor (often called A).
+
+        weight : Tensor
+            The second tensor (often called B).
+
+        bias : Optional[Tensor]
+            The per-channel bias. The plugin with fp8 dtype does not support bias yet.
+
+        scale_d0 : float
+            The scale for dequantizing x, used for fp8
+
+        scale_d1 : float
+            The scale for dequantizing gate, used for fp8
+
+        scale_output : float
+            The scale for quantizing output, used for fp8
+
+                Returns:
+        The tensor produced by the inserted layer.
+    '''
+    plg_creator = trt.get_plugin_registry().get_plugin_creator(
+        'GemmSwiglu', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert plg_creator is not None
+
+    p_dtype = default_net().plugin_config.gemm_swiglu_plugin
+    if p_dtype == "fp8":
+        assert bias is None, "fp8 gemm_swiglu does not support bias yet"
+
+    pf_type = trt.PluginField(
+        "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
+        trt.PluginFieldType.INT32)
+    pf_has_bias = trt.PluginField(
+        "has_bias", np.array(np.int8(0 if bias is None else 1), np.int8),
+        trt.PluginFieldType.INT8)
+    pf_scale_d0 = trt.PluginField("scale_d0",
+                                  np.array(scale_d0, dtype=np.float32),
+                                  trt.PluginFieldType.FLOAT32)
+    pf_scale_d1 = trt.PluginField("scale_d1",
+                                  np.array(scale_d1, dtype=np.float32),
+                                  trt.PluginFieldType.FLOAT32)
+    pf_scale_output = trt.PluginField("scale_output",
+                                      np.array(scale_output, dtype=np.float32),
+                                      trt.PluginFieldType.FLOAT32)
+
+    pfc = trt.PluginFieldCollection(
+        [pf_type, pf_has_bias, pf_scale_d0, pf_scale_d1, pf_scale_output])
+    gemm_swiglu_plug = plg_creator.create_plugin("gemm_swiglu", pfc)
+
+    # TODO(anchengc) pass nullptr when no bias
+    if bias is None:
+        bias = constant(
+            np.zeros([weight.shape[0]], dtype=trt_dtype_to_np(input.dtype)))
+    plug_inputs = [input.trt_tensor, weight.trt_tensor, bias.trt_tensor]
+
+    layer = default_trtnet().add_plugin_v2(plug_inputs, gemm_swiglu_plug)
 
     return _create_tensor(layer.get_output(0), layer)
 
 
-def constant(ndarray: np.ndarray) -> Tensor:
+def constant(ndarray: np.ndarray,
+             as_dtype: trt.DataType | None = None,
+             as_shape=None) -> Tensor:
     '''
     Add a constant layer.
 
@@ -989,14 +1199,22 @@ def constant(ndarray: np.ndarray) -> Tensor:
     Returns:
         The tensor produced by the inserted layer.
     '''
-    weights = trt.Weights(np_dtype_to_trt(ndarray.dtype), ndarray.ctypes.data,
-                          ndarray.size)
+    trt_dtype = np_dtype_to_trt(ndarray.dtype) if as_dtype is None else as_dtype
+    trt_shape = trt.Dims(
+        ndarray.shape) if as_shape is None else trt.Dims(as_shape)
+    trt_count = 1
+    for i in range(len(trt_shape)):
+        trt_count *= trt_shape[i]
+    weights = trt.Weights(trt_dtype, ndarray.ctypes.data, trt_count)
     # Prevent underlying numpy array from going out of scope
     default_net().register_ndarray(ndarray)
-    layer = default_trtnet().add_constant(trt.Dims(ndarray.shape), weights)
-    if not default_net()._strongly_typed:
-        layer.set_output_type(0, np_dtype_to_trt(ndarray.dtype))
-    return _create_tensor(layer.get_output(0), layer)
+    layer = default_trtnet().add_constant(trt_shape, weights)
+    if not default_net().strongly_typed:
+        layer.set_output_type(0, trt_dtype)
+    tensor = _create_tensor(layer.get_output(0), layer)
+    # TODO: remove this WAR after https://nvbugs/4359151 fixed.
+    set_np_weight(default_trtnet(), layer.name, ndarray)
+    return tensor
 
 
 # TODO: TensorRT uses sizes of the output dimensions.
@@ -1004,7 +1222,9 @@ def constant(ndarray: np.ndarray) -> Tensor:
 def slice(input: Tensor,
           starts: Union[Tensor, Sequence[int]],
           sizes: Union[Tensor, Sequence[int]],
-          strides: Union[Tensor, Sequence[int]] = None) -> Tensor:
+          strides: Union[Tensor, Sequence[int]] = None,
+          mode: trt.SampleMode = None,
+          fill_value: Union[float, Tensor] = None) -> Tensor:
     '''
     Add an operation to extract a slice from a tensor.
 
@@ -1030,7 +1250,7 @@ def slice(input: Tensor,
     the 2nd row (because start[0] == 1) and two columns (size[1] == 2) starting
     from the 1st column (because start[1] == 0).
 
-    In pseudo-code the behaviour of that operation can be described as follows
+    In pseudo-code the behavior of that operation can be described as follows
     for a 2D tensor (and easily be extended to more dimensions):
 
         output = Tensor(shape=sizes)
@@ -1059,6 +1279,9 @@ def slice(input: Tensor,
         strides : Union[Tensor, Sequence[int]]
             The step be taken from start, in input tensor.
 
+        mode : trt.SampleMode
+            The mode that controls how the slice operation handles out of bounds coordinates.
+
     Returns:
         The tensor produced by the slice layer.
     '''
@@ -1076,10 +1299,15 @@ def slice(input: Tensor,
     if isinstance(strides, Tensor) or strides is None:
         trt_strides = [1 for _ in range(input_ndim)]
 
+    if fill_value is not None and isinstance(fill_value, float):
+        fill_value = constant(fp32_array(fill_value))
+
     layer = default_trtnet().add_slice(input.trt_tensor,
                                        start=trt_starts,
                                        shape=trt_sizes,
                                        stride=trt_strides)
+    if mode is not None:
+        layer.mode = mode
 
     if isinstance(starts, Tensor):
         layer.set_input(1, starts.trt_tensor)
@@ -1090,7 +1318,180 @@ def slice(input: Tensor,
     if isinstance(strides, Tensor):
         layer.set_input(3, strides.trt_tensor)
 
+    if mode is trt.SampleMode.FILL and isinstance(fill_value, Tensor):
+        layer.set_input(4, fill_value.trt_tensor)
+
     return _create_tensor(layer.get_output(0), layer)
+
+
+def pad(input: Tensor,
+        pad: Union[Sequence[int], Tensor],
+        mode: str = 'constant',
+        value: Optional[float] = None) -> Tensor:
+    '''
+    Add a pad layer.
+
+    The padding layer adds zero-padding at the start and end of the input tensor. And the
+    padding size by which to pad some dimensions of input are described starting from the
+    last dimension and moving forward.
+
+    `[len(pad) / 2]` dimensions of input will be padded. For example, to pad only the last
+    dimension of the input tensor, then pad has the form [padding_left, padding_right]; to
+    pad the last 2 dimensions of the input tensor, then use [padding_left, padding_right,
+    padding_top, padding_bottom]; to pad the last 3 dimensions, use [padding_left,
+    padding_right, padding_top, padding_bottom, padding_front, padding_back].
+
+    Parameters:
+        input : Tensor
+            The input tensor on which the padding_2d is performed.
+        pad : sequence of int
+            An m-elements tuple for padding, where its length m meets the requirement that
+            m <= 2*input dimensions, and m is even.
+        mode : str
+            Only \'constant\' is supported.
+        value : float
+            Fill value for 'constant' padding. Default: 0.
+
+    Returns:
+        The tensor produced by the inserted layer.
+    '''
+    assert mode == "constant", "Only `'constant'` is supported now."
+
+    if isinstance(pad, list) or isinstance(pad, tuple):
+        assert (
+            len(pad) % 2 == 0 and len(pad) <= 2 * input.ndim()
+        ), "The length of `pad` should be even and less than 2*input.ndim"
+        pad = constant(np.array(pad).astype(np.int32)).view([-1, 2])
+    elif isinstance(pad, Tensor):
+        pad = pad.flatten()
+        assert (
+            pad.size(0) % 2 == 0 and pad.size(0) <= 2 * input.ndim()
+        ), "The length of `pad` should be even and less than 2*input.ndim"
+        pad = pad.cast("int32").view([-1, 2])
+    else:
+        raise NotImplementedError(f"pad type {type(pad)} not supported")
+    if value is None:
+        value = 0
+
+    pad = concat([constant(np.zeros((1, 2), dtype=np.int32)),
+                  pad])  # pre-padding the indices
+    padding_index = [0] * input.ndim()
+    padding_index[-(pad.size(0) - 1):] = list(range(pad.size(0) - 1, 0,
+                                                    -1))  # reverse the indices
+    pad = index_select(pad,
+                       dim=0,
+                       index=constant(np.array(padding_index, dtype=np.int32)))
+    pre_padding, post_padding = chunk(pad, chunks=2, dim=1)
+    start = (pre_padding.flatten() * (-1)).cast('int32')
+    extend_size = (pre_padding + post_padding).flatten()
+    size = (extend_size + shape(input)).cast('int32')
+    layer = default_trtnet().add_slice(input.trt_tensor,
+                                       start=[0] * input.ndim(),
+                                       shape=[0] * input.ndim(),
+                                       stride=[1] * input.ndim())
+    layer.mode = trt.SampleMode.FILL
+    layer.set_input(SliceInputType.start, start.trt_tensor)
+    layer.set_input(SliceInputType.size, size.trt_tensor)
+    layer.set_input(SliceInputType.fill_value,
+                    constant_to_tensor_(value, dtype=input.dtype).trt_tensor)
+    output = _create_tensor(layer.get_output(0), layer)
+    return output
+
+
+def rand(shape: Tensor,
+         low: float = 0,
+         high: float = 1,
+         dtype: Union[str, trt.DataType] = 'float32') -> Tensor:
+    '''
+    This operation adds a fill layer that generates a random (uniform) tensor with the specified shape and data type.
+
+    Parameters:
+        shape: Tensor
+            The shape of the tensor needed to be generated.
+        low: float
+            The minimum value (inclusive) of the range used for random.
+        high: float
+            The maximum value (inclusive) of the range used for random.
+        dtype: Union[str, trt.DataType]
+            The desired data type for the output tensor.
+    Returns:
+        The generated random tensor produced by the fill layer.
+    '''
+    # NOTE: DISABLED FOR NOW UNTIL THE FILL LAYER (RANDOM_UNIFORM) in TRT IS FIXED
+    assert False, "The rand() op is temporarily disabled."
+    low = constant(fp32_array(low))
+    high = constant(fp32_array(high))
+    trt_dtype = dtype if isinstance(dtype,
+                                    trt.DataType) else str_dtype_to_trt(dtype)
+
+    layer = default_trtnet().add_fill([0], trt.FillOperation.RANDOM_UNIFORM,
+                                      trt_dtype)
+
+    layer.set_input(0, shape.trt_tensor)
+    layer.set_input(1, low.trt_tensor)
+    layer.set_input(2, high.trt_tensor)
+    return _create_tensor(layer.get_output(0), layer)
+
+
+def categorical_sample(probs: Tensor, rand_data: Tensor = None) -> Tensor:
+    '''
+    This is a sampling operation and an equivalent of torch.distributions.Categorical.sample()
+    i.e. given a probability distribution tensor, it samples an index of that tensor.
+    See: https://pytorch.org/docs/stable/distributions.html#torch.distributions.categorical.Categorical.sample
+    NOTE: This assumes that the given probabilities are **not** normalized.
+
+    Parameters:
+        probs: Tensor
+            A 1-D floating point tensor representing the probability distributions.
+        rand_data: Tensor (optional)
+            A random tensor of same shape as `probs` tensor.
+            If not provided, this function will add a rand() op to generate it and use for sampling.
+    Returns:
+        A tensor containing a single index of the `probs` tensor representing the sample.
+    '''
+    probs = probs / sum(probs, dim=-1, keepdim=True)
+    rand_shape = []
+    assert probs.ndim() > 0
+    for i in range(probs.ndim() - 1):
+        rand_shape.append(shape(probs, i))
+    rand_shape = concat(rand_shape)
+    if rand_data is None:
+        rand_data = rand(rand_shape, low=0, high=1, dtype=probs.dtype)
+    assert rand_shape == shape(rand_data)
+    rand_data = expand(unsqueeze(rand_data, -1), shape(probs))
+    cum_probs = cumsum(probs, dim=-1)
+    cmp = cast(cum_probs >= rand_data, probs.dtype)
+    samples = argmax(cmp, dim=-1)
+    return samples
+
+
+class Conditional:
+    '''
+    Add an operation to conditionally execute two code paths/subgraphs.
+
+    Usage:
+        1. conditional = Conditional(condition)
+        2. input_1_ = conditional.add_input(input_1)
+           ...
+           input_n_ = conditional.add_input(input_n)
+        3. Construct the graph to get true_output_value and false_output_value using input_1_, ..., input_n_
+        4. output = conditional.add_output(true_output_value, false_output_value)
+    '''
+
+    def __init__(self, condition: Tensor):
+        self.layer = default_trtnet().add_if_conditional()
+        if condition.ndim() > 0:
+            condition = view(condition, [])
+        self.layer.set_condition(condition.trt_tensor)
+
+    def add_input(self, input: Tensor) -> Tensor:
+        in_node = self.layer.add_input(input.trt_tensor)
+        return _create_tensor(in_node.get_output(0), in_node)
+
+    def add_output(self, true_value: Tensor, false_value: Tensor) -> Tensor:
+        out_node = self.layer.add_output(true_value.trt_tensor,
+                                         false_value.trt_tensor)
+        return _create_tensor(out_node.get_output(0), out_node)
 
 
 # TODO: support step.
@@ -1127,25 +1528,45 @@ def arange(start: Union[Tensor, int], end: Union[Tensor, int],
         The tensor produced by the fill layer. It is a 1D tensor containing
         `end-start` elements of type `dtype`.
     '''
+    res_dtype = str_dtype_to_trt(dtype)
     if isinstance(start, int):
         assert isinstance(end, int)
-        start = constant(int32_array(start))
-        end = constant(int32_array(end))
+        array_func = int32_array if res_dtype == trt.int32 else int64_array
+        start = constant(array_func(start))
+        end = constant(array_func(end))
     elif isinstance(start, Tensor):
         assert isinstance(end, Tensor)
+        assert start.dtype == trt.int32 or start.dtype == trt.int64
+        assert end.dtype == trt.int32 or end.dtype == trt.int64
+        if start.dtype != end.dtype:
+            if start.dtype == trt.int32:  # end == trt.int64
+                if res_dtype == trt.int32:
+                    end = cast(end, "int32")
+                else:
+                    start = cast(start, "int64")
+            else:  # start == trt.int64 and end == trt.int32
+                if res_dtype == trt.int32:
+                    start = cast(start, "int32")
+                else:
+                    end = cast(end, "int64")
     else:
         raise TypeError("%s is not supported" % type(start))
 
-    step = constant(int32_array([1]))
+    assert start.dtype == end.dtype, f"start type ({start.dtype}) != end type ({end.dtype})"
+    step = constant_to_tensor_(1, dtype=start.dtype, to_array=True)
 
     num = end - start
-    num = num.view([1])
+    num = num.view([1]).cast(trt.int64)
 
-    layer = default_trtnet().add_fill([0], trt.FillOperation.LINSPACE)
+    layer = default_trtnet().add_fill([0], trt.FillOperation.LINSPACE,
+                                      start.dtype)
     layer.set_input(0, num.trt_tensor)  # rank = 1
     layer.set_input(1, start.trt_tensor)  # rank = 0
     layer.set_input(2, step.trt_tensor)  # rank = 1
-    return _create_tensor(layer.get_output(0), layer)
+    tensor = _create_tensor(layer.get_output(0), layer)
+    if tensor.dtype != res_dtype:
+        tensor = tensor.cast(dtype)
+    return tensor
 
 
 def expand(input: Tensor, expand_shape: Tensor) -> Tensor:
@@ -1174,7 +1595,7 @@ def expand(input: Tensor, expand_shape: Tensor) -> Tensor:
 
         expand(input, [3, 2, 2])
 
-    will produce a tensor of shape [3, 2, 2]. That behaviour is subject to
+    will produce a tensor of shape [3, 2, 2]. That behavior is subject to
     change in the future.
 
     Parameters:
@@ -1222,7 +1643,7 @@ def einsum(einsum_eq: str, inputs: Sequence[Tensor]) -> Tensor:
     The equation specifies ASCII lower-case letters for each dimension in the
     inputs in the same order as the dimensions, separated by comma for each
     input. The dimensions labeled with the same subscript must match or be
-    broadcastable. Repeated subscript labels in one input take the diagonal.
+    able to be broadcasted. Repeated subscript labels in one input take the diagonal.
     Repeating a label across multiple inputs means that those axes will be
     multiplied. Omitting a label from the output means values along those axes
     will be summed. In implicit mode, the indices which appear once in the
@@ -1265,7 +1686,7 @@ def permute(input: Tensor, dims: Sequence[int]) -> Tensor:
     '''
     Add an operation to permute the dimensions of a tensor.
 
-    The dimensions of the input tensor are permutted according to the sequence
+    The dimensions of the input tensor are permuted according to the sequence
     of dimensions in 'dims'. That operation maps to tensorrt.IShuffleLayer where
     the second transposition is described by the indices in 'dims'.
 
@@ -1369,7 +1790,47 @@ def view(input: Tensor,
     return _create_tensor(layer.get_output(0), layer)
 
 
-def expand_dims(input: Tensor, dim: Union[int, Sequence[int]]) -> Tensor:
+def flatten(input: Tensor, start_dim: int = 0, end_dim: int = -1):
+    '''
+    Flattens input by reshaping it into a one-dimensional tensor.
+
+    If start_dim or end_dim are passed, only dimensions starting with start_dim and
+    ending with end_dim are flattened. The order of elements in input is unchanged.
+
+    Parameters:
+        input : Tensor
+            The input tensor to flatten.
+
+        start_dim : int
+            The first dim to flatten.
+
+        end_dim : int
+            The last dim to flatten.
+
+    Returns:
+        The tensor produced by the flatten layer.
+
+    '''
+    shape = input.shape
+    ndim = input.ndim()
+    if start_dim < 0: start_dim += ndim
+    if end_dim < 0: end_dim += ndim
+    new_shape = list()
+    for i in range(start_dim):
+        new_shape.append(shape[i])
+    if end_dim - start_dim >= 0:
+        flat_dim = 1
+        for i in range(start_dim, end_dim + 1):
+            flat_dim *= shape[i]
+        new_shape.append(flat_dim)
+    for i in range(end_dim + 1, ndim):
+        new_shape.append(shape[i])
+    return view(input, new_shape)
+
+
+def expand_dims(input: Tensor,
+                dim: Union[int, Sequence[int]],
+                shape_cast_dtype=None) -> Tensor:
     '''
     Add an operation to expand the tensor shape with singleton dimensions.
 
@@ -1406,7 +1867,7 @@ def expand_dims(input: Tensor, dim: Union[int, Sequence[int]]) -> Tensor:
 
     out_ndim = len(dim) + input.ndim()
 
-    input_shape = shape(input)
+    input_shape = shape(input, cast_to_dtype=shape_cast_dtype)
     out_shapes = []
     j = 0
     for i in range(out_ndim):
@@ -1418,7 +1879,52 @@ def expand_dims(input: Tensor, dim: Union[int, Sequence[int]]) -> Tensor:
 
     out_shape = concat(out_shapes)
 
-    return view(input, out_shape)
+    return view(input, out_shape, zero_is_placeholder=False)
+
+
+# NOTE: Jointly added with Apple
+def squeeze(input: Tensor,
+            dim: Optional[Union[int, Sequence[int]]] = None,
+            zero_is_placeholder: bool = False):
+    '''
+    Add an operation to remove singleton dimensions of a tensor.
+
+    This functions creates an operation that removes singleton dimension
+    (dimension of size 1) at positions 'dim' in the input tensor. It works with
+    negative values for the 'dim'.
+
+    For example, for a tensor 'input' of shape [1, 4, 1, 4]:
+
+        squeeze(input,  0) will produce an output of shape [4, 1, 4],
+        squeeze(input,  2) will produce an output of shape [1, 4, 4],
+        squeeze(input, [0, 2]) will produce an output of shape [4, 4],
+        squeeze(input, [-2]) will produce an output of shape [1, 4, 4],
+
+    Parameters:
+        input : Tensor
+            The input tensor for which the singleton dimensions will be removed.
+
+        dim : Union[int, Sequence[int]]
+            The index of the singleton dimensions in the input tensor.
+
+    Returns:
+        The tensor produced by the layer.
+    '''
+    if dim is None:
+        dim = list(range(input.ndim()))
+    if isinstance(dim, int):
+        dim = (dim, )
+    dim = dim_resolve_negative(dim, input.ndim())
+
+    new_shape = []
+    for i, s in enumerate(input.shape):
+        if s == 1 and i in dim:
+            continue
+        new_shape.append(shape(input, i))
+
+    new_shape = concat(new_shape) if len(new_shape) > 0 else []
+    input = input.view(new_shape, zero_is_placeholder=zero_is_placeholder)
+    return input
 
 
 def unsqueeze(input: Tensor, axis: int):
@@ -1426,7 +1932,7 @@ def unsqueeze(input: Tensor, axis: int):
     Add an operation to insert a singleton dimension to a tensor.
 
     That functions creates an operation that insert a singleton dimension
-    (dimension of size 1) at position 'dim' in the output tensor. It works with
+    (dimension of size 1) at position 'axis' in the output tensor. It works with
     negative values for the 'axis'.
 
     For example, for a tensor 'input' of shape [4, 4]:
@@ -1450,6 +1956,55 @@ def unsqueeze(input: Tensor, axis: int):
         axis = axis + input.ndim() + 1
 
     return expand_dims(input, axis)
+
+
+def stack(inputs: Sequence[Tensor], dim: int = 0) -> Tensor:
+    '''
+    Add an operation to contact input tensors along a new dimension.
+
+    The function creates an operation that creates a new dim for all the
+    input tensors and then concatenates them along that new dim.
+.
+
+    All the tensors in 'inputs' must have the same shape.
+
+        for ii in range(inputs[0].rank()):
+            assert all(inp.shape[ii] == inputs[0].shape[ii] for inp in inputs)
+
+    The shape of the output tensor is defined as:
+
+        output.rank() = inputs[0].rank() + 1
+
+        output.shape[dim] = len(inputs)
+
+        for ii in range(inputs[0].rank()):
+            if ii < dim:
+                output.shape[ii] = inputs[0].shape[ii]
+            else:
+                output.shape[ii+1] = inputs[0].shape[ii]
+
+    For example, given a sequence of two 2D tensors [[0, 1], [2, 3]] and
+    [[4, 5], [6, 7]] both of shape [2, 2],
+
+        stack(inputs, 0)
+
+    will produce [[[0, 1], [2, 3]], [[4, 5], [6, 7]]] of shape [2, 2, 2] and
+
+        stack(inputs, 1)
+
+    will produce [[[0, 1], [4, 5]], [[2, 3], [6, 7]]] of shape [2, 2, 2].
+
+    Parameters:
+        inputs : Sequence[Tensor]
+            The sequence of tensors to stack.
+
+        dim : int
+            The dimension in which the stack is performed.
+
+    Returns:
+        A tensor that contains the input tensors stacked along a new dimension.
+    '''
+    return concat([unsqueeze(inp, axis=dim) for inp in inputs], dim=dim)
 
 
 def expand_dims_like(left: Union[Tensor, int, float], right: Tensor) -> Tensor:
@@ -1482,13 +2037,10 @@ def expand_dims_like(left: Union[Tensor, int, float], right: Tensor) -> Tensor:
         The tensor produced by the shuffle layer.
     '''
     if isinstance(left, int):
-        left = constant(int32_array([left]))
+        left = constant(dims_array([left]))
     elif isinstance(left, float):
-        if default_net().strongly_typed:
-            if isinstance(right, Tensor) and right.dtype == trt.DataType.HALF:
-                left = constant(fp16_array([left]))
-            else:
-                left = constant(fp32_array([left]))
+        if isinstance(right, Tensor) and right.dtype == trt.DataType.HALF:
+            left = constant(fp16_array([left]))
         else:
             left = constant(fp32_array([left]))
     left_ndim = left.ndim()
@@ -1499,9 +2051,12 @@ def expand_dims_like(left: Union[Tensor, int, float], right: Tensor) -> Tensor:
     return left
 
 
-# If dim is None, return a 1-D TensorRT-LLM tensor of the size
-# If dim is not None, return a 0-D TensorRT-LLM tensor of the dimension size
-def shape(input: Tensor, dim: Optional[int] = None) -> Tensor:
+# If dim is None, return a 1-D TensorRT LLM tensor of the size
+# If dim is not None, return a 0-D TensorRT LLM tensor of the dimension size
+def shape(input: Tensor,
+          dim: Optional[int] = None,
+          cast_to_dtype: Optional[Union[str, trt.DataType]] = None,
+          clip_before_cast: Sequence[int] = None) -> Tensor:
     '''
     Add an operation to create a shape tensor.
 
@@ -1526,6 +2081,14 @@ def shape(input: Tensor, dim: Optional[int] = None) -> Tensor:
     '''
     layer = default_trtnet().add_shape(input.trt_tensor)
     res = _create_tensor(layer.get_output(0), layer)
+    if cast_to_dtype is not None:
+        if clip_before_cast is not None and (cast_to_dtype == 'int32'
+                                             or cast_to_dtype == trt.int32):
+            assert len(
+                clip_before_cast
+            ) == 2, f"This parameter only expects a tuple of 2 integers (lower, upper) but got {clip_before_cast}"
+            res = int_clip(res, clip_before_cast[0], clip_before_cast[1])
+        res = cast(res, cast_to_dtype)
 
     if dim is None:
         return res
@@ -1712,6 +2275,305 @@ def index_select(input: Tensor, dim: int, index: Tensor) -> Tensor:
     return _create_tensor(layer.get_output(0), layer).view(concat(new_shape))
 
 
+# NOTE: Jointly added with Apple
+def scatter(input: Tensor, dim: int, indices: Tensor,
+            updates: Tensor) -> Tensor:
+    '''
+    This operation adds a layer that creates an output tensor by element-wise
+    copying values from the input tensor and then updating values by the given
+     `indices` and `updates` tensors.
+     For a 2D input tensor, it first copies the input to output,
+     then updates the output tensor like the following for each entry in `updates`:
+        output[indices[i][j]][j] = updates[i][j] if dim=0
+        output[i][indices[i][j]] = updates[i][j] if dim=1
+     If the `input` tensor is [[1, 2, 3], [4, 5, 6]],
+     the indices tensor is [[1, 2], [0, 1]],
+     the updates tensor is [[-1, -2], [-3, -4]], and dim=1
+     the output tensor will be [[1, -1, -2], [-3, -4, 6]].
+     Parameters:
+        input: Tensor
+            The input data that needs to be updated.
+        dim: int
+            The axis on which the scatter is to be performed.
+        indices: Tensor
+            An integer tensor of the same rank as input that indicates the positions to be updated.
+        updates: Tensor
+            A data tensor of same shape as the `indices` tensor that contains the update values.
+     Returns:
+        A tensor created by the element-wise scatter layer.
+    '''
+    layer = default_trtnet().add_scatter(input.trt_tensor,
+                                         indices.trt_tensor,
+                                         updates.trt_tensor,
+                                         mode=trt.ScatterMode.ELEMENT)
+    layer.axis = dim
+    return _create_tensor(layer.get_output(0), layer)
+
+
+def gather_nd(input: Tensor, indices: Tensor, batch_dims: int = 1) -> Tensor:
+    '''
+    Adds a layer that performs a gather with some element-wise dimensions.
+    See: https://onnx.ai/onnx/operators/onnx__GatherND.html
+    The gather is performed on dim=batch_dims.
+
+    Parameters:
+        input: Tensor
+            The tensor on which the gather operation is performed.
+        indices: Tensor
+            The tensor that indicates which entries to be gathered.
+        batch_dims: int
+            The number of first dimensions that should be skipped before gather starts.
+    Returns:
+        A tensor created by the gather layer with GatherMode.ND.
+    '''
+    gather_layer = default_trtnet().add_gather_v2(input.trt_tensor,
+                                                  indices.trt_tensor,
+                                                  mode=trt.GatherMode.ND)
+    gather_layer.num_elementwise_dims = batch_dims
+    return _create_tensor(gather_layer.get_output(0), gather_layer)
+
+
+def nonzero(input: Tensor) -> Tensor:
+    '''
+    Adds a layer that finds the indices of non-zero values of the input tensor.
+
+    Parameters:
+        input: Tensor
+            The input tensor for which we need to find the indices of non-zero values.
+    Returns:
+        A tensor of shape [D, C] where D is the number of dimensions of `input` and
+        C is the number of non-zero values in it.
+        Each column of this 2D tensor represents the index tuple for each non-zero value.
+    '''
+    non_zero_layer = default_trtnet().add_non_zero(input.trt_tensor)
+    return _create_tensor(non_zero_layer.get_output(0), non_zero_layer)
+
+
+def masked_select(input: Tensor, mask: Tensor) -> Tensor:
+    '''
+    Add an operation to select elements from a tensor according to a boolean
+    mask tensor.
+
+    Given an input tensor, that function creates an operation that selects
+    elements at the indices indicated by the boolean mask tensor to create
+    a new tensor. The output tensor is a 1-D tensor.
+
+    The input tensor must have rank >= 1. The shapes of the input tensor and
+    the mask tensor don’t need to match, but they must be able to be broadcasted.
+
+    For example, on input=[[4, 2, 5], [2, 1, 2], [4, 7, 1]], which has a shape
+    [3, 3],
+
+        masked_select(input, [[True, False, True], [False, True, False], [True, False, True]])
+
+    will create a tensor of shape [5] that contains the [4, 5, 1, 4, 1].
+
+        masked_select(input, [[True], [False], [True]])
+
+    will create a tensor of shape [6] that contains the [4, 2, 5, 4, 7, 1].
+
+        masked_select(input, [[False, False, True]])
+
+    will create a tensor of shape [3] that contains the [5, 2, 1].
+
+        masked_select(input, [False])
+
+    will create a tensor of shape [0] which is empty.
+
+    That operation is implemented by NonZero, Shuffle and GatherV2 layers
+    in TensorRT.
+
+    Parameters:
+        input : Tensor
+            The input tensor to select from.
+
+        mask : Tensor
+            The boolean mask tensor that indicates elements to select.
+
+    Returns:
+        The 1-D tensor containing the selected elements.
+    '''
+    assert input.rank() >= 1, "input should have rank >= 1"
+    input, mask = broadcast_helper(input, mask)
+    expanded_mask = expand(mask, shape(input))
+
+    non_zero_layer = default_trtnet().add_non_zero(expanded_mask.trt_tensor)
+
+    shuffle_layer = default_trtnet().add_shuffle(non_zero_layer.get_output(0))
+    shuffle_layer.second_transpose = (1, 0)
+
+    gather_layer = default_trtnet().add_gather_v2(input.trt_tensor,
+                                                  shuffle_layer.get_output(0),
+                                                  mode=trt.GatherMode.ND)
+    return _create_tensor(gather_layer.get_output(0), gather_layer)
+
+
+def cumsum(input: Tensor, dim: int, prefer_plugin: bool = True) -> Tensor:
+    '''
+    Add an operation to calculate inclusive cumulative sum of elements of
+    a tensor in a given dimension.
+
+    Given an input tensor, that function creates an operation that calculates
+    inclusive cumulative sum of elements in the dimension 'dim' to create
+    a new tensor. The output tensor has the same shape as the input tensor.
+
+    The input tensor must have rank >= 1. The 'dim' must be valid, and negative
+    value is supported.
+
+    For example, on input=[[4, 2, 5], [2, 1, 2], [4, 7, 1]], which has a shape
+    [3, 3],
+
+        cumsum(input, 0)
+
+    will produce [[4, 2, 5], [6, 3, 7], [10, 10, 8]].
+
+        cumsum(input, 1)
+
+    will produce [[4, 6, 11], [2, 3, 5], [4, 11, 12]].
+
+    That operation is implemented by TensorRT ILoopLayer.
+
+    Parameters:
+        input : Tensor
+            The input tensor to calculate the inclusive cumulative sum.
+
+        dim : int
+            The dimension to calculate the inclusive cumulative sum. Negative
+            value is supported.
+
+        prefer_plugin : bool
+            Whether to use the cumsumLastDim plugin if dim is last dim.
+
+    Returns:
+        The tensor containing the inclusive cumulative sum of input.
+    '''
+    assert input.rank() >= 1, "input should have rank >= 1"
+    assert dim < input.rank() and dim >= -input.rank(
+    ), f"dim should be in [{-input.rank()}, {input.rank()}) when input have rank {input.rank()}"
+
+    dim = dim_resolve_negative(dim, input.ndim())[0]
+
+    if dim == input.ndim() - 1:
+        if prefer_plugin:
+            last_dim = input.size(-1)
+            if last_dim == -1:  # dynamic?
+                last_dim = shape(input, -1)
+            old_shape = shape(input)
+            if input.ndim() == 1:
+                input_2d = unsqueeze(
+                    input, 0)  # special handling of rank-1 dynamic tensor
+            elif input.ndim() != 2:
+                input_2d = input.view(concat([-1, last_dim]),
+                                      zero_is_placeholder=False)
+            else:
+                input_2d = input
+            cumsum_last_dim_plg_creator = trt.get_plugin_registry(
+            ).get_plugin_creator('CumsumLastDim', '1', TRT_LLM_PLUGIN_NAMESPACE)
+            assert cumsum_last_dim_plg_creator is not None
+            input_length = trt.PluginField(
+                "input_length", np.array(input_2d.size(-1), dtype=np.int32),
+                trt.PluginFieldType.INT32)
+            pf_type = trt.PluginField("type_id",
+                                      np.array([int(input_2d.dtype)], np.int32),
+                                      trt.PluginFieldType.INT32)
+            pfc = trt.PluginFieldCollection([input_length, pf_type])
+            cumsum_last_dim_plug = cumsum_last_dim_plg_creator.create_plugin(
+                "cumsum_last_dim", pfc)
+            plug_inputs = [input_2d]
+            plug_inputs = [i.trt_tensor for i in plug_inputs]
+            layer = default_trtnet().add_plugin_v2(plug_inputs,
+                                                   cumsum_last_dim_plug)
+            _add_plugin_info(layer, cumsum_last_dim_plg_creator,
+                             "cumsum_last_dim", pfc)
+            output = _create_tensor(layer.get_output(0), layer)
+            output = output.view(old_shape, zero_is_placeholder=False)
+            return output
+        else:
+            # credit to Apple
+            reduction_length = shape(input, -1)
+            reduction_range = arange(constant_to_tensor_(0,
+                                                         dtype='int64',
+                                                         to_array=False),
+                                     reduction_length,
+                                     dtype='int64')
+            lower_triangle = cast(unsqueeze(reduction_range, 0)
+                                  <= unsqueeze(reduction_range, 1),
+                                  dtype=input.dtype)
+            output = sum(unsqueeze(input, -2) * lower_triangle, dim=-1)
+            return output
+    else:
+        slice_shape = []
+        for i in range(input.ndim()):
+            if i != dim:
+                slice_shape.append(shape(input, i))
+
+        zero_tensor = constant_to_tensor_(0, input.dtype, False)
+        if len(slice_shape) > 0:
+            zero_tensor = expand_dims(zero_tensor,
+                                      [i for i in range(len(slice_shape))])
+            slice_shape = concat(slice_shape)
+            zero_tensor = expand(zero_tensor, slice_shape)
+
+        loop_layer = default_trtnet().add_loop()
+        trip_limit = shape(input, dim).trt_tensor
+        loop_layer.add_trip_limit(trip_limit, trt.TripLimit.COUNT)
+
+        iterator_layer = loop_layer.add_iterator(input.trt_tensor, dim)
+        cur_slice = iterator_layer.get_output(0)
+
+        running_sum_layer = loop_layer.add_recurrence(zero_tensor.trt_tensor)
+        running_sum = running_sum_layer.get_output(0)
+
+        cur_sum_layer = default_trtnet().add_elementwise(
+            cur_slice, running_sum, trt.ElementWiseOperation.SUM)
+        cur_sum = cur_sum_layer.get_output(0)
+        running_sum_layer.set_input(1, cur_sum)
+
+        loop_output_layer = loop_layer.add_loop_output(
+            cur_sum, trt.LoopOutput.CONCATENATE, dim)
+        loop_output_layer.set_input(1, trip_limit)
+        return _create_tensor(loop_output_layer.get_output(0),
+                              loop_output_layer)
+
+
+def masked_scatter(input: Tensor, mask: Tensor, source: Tensor) -> Tensor:
+    '''
+    Add the masked_scatter base on PyTorch definition.
+
+    See https://pytorch.org/docs/stable/generated/torch.Tensor.masked_scatter_.html#torch-tensor-masked-scatter for a
+    description of that function.
+
+    Parameters:
+        input : Tensor
+            The input tensor.
+
+        mask : Tensor
+            The boolean mask tensor that indicates elements to select.
+
+        source: Tensor
+            The tensor to copy from
+    Returns:
+        The tensor containing the source tensor selected by mask.
+
+    '''
+    assert input.rank() >= 1, "input should have rank >= 1"
+    input, mask = broadcast_helper(input, mask)
+    expanded_mask = expand(mask, shape(input))
+
+    non_zero_layer = default_trtnet().add_non_zero(expanded_mask.trt_tensor)
+
+    shuffle_layer = default_trtnet().add_shuffle(non_zero_layer.get_output(0))
+    shuffle_layer.second_transpose = (1, 0)
+    source = source.view([-1])
+
+    scatter_layer = default_trtnet().add_scatter(input.trt_tensor,
+                                                 shuffle_layer.get_output(0),
+                                                 source.trt_tensor,
+                                                 mode=trt.ScatterMode.ND)
+
+    return _create_tensor(scatter_layer.get_output(0), scatter_layer)
+
+
 def concat(inputs: Sequence[Union[Tensor, int]], dim: int = 0) -> Tensor:
     '''
     Add an operation to concatenate tensors.
@@ -1741,7 +2603,7 @@ def concat(inputs: Sequence[Union[Tensor, int]], dim: int = 0) -> Tensor:
 
         concat(inputs, 0)
 
-    will produce [[[0, 1], [2, 3]], [[4, 5], [6, 7]]] of shape [4, 2] and
+    will produce [[0, 1], [2, 3], [4, 5], [6, 7]] of shape [4, 2] and
 
         concat(inputs, 1)
 
@@ -1758,17 +2620,19 @@ def concat(inputs: Sequence[Union[Tensor, int]], dim: int = 0) -> Tensor:
     Returns:
         A tensor that contains the concatenation of the tensors.
     '''
+    assert len(
+        inputs
+    ) > 0, f"Number of inputs ({len(inputs)}) to the concatenation layer must be > 0."
     tmp = []
+    inputs = constants_to_tensors_(*inputs)
     for i in inputs:
-        if isinstance(i, int):
-            tmp.append(constant(int32_array([i])))
-        elif i.rank() == 0:
+        if i.rank() == 0:
             tmp.append(i.view([1]))
         else:
             tmp.append(i)
 
     layer = default_trtnet().add_concatenation([i.trt_tensor for i in tmp])
-    layer.axis = dim
+    layer.axis = dim_resolve_negative(dim, tmp[0].ndim())[0]
     return _create_tensor(layer.get_output(0), layer)
 
 
@@ -1803,7 +2667,8 @@ def softmax(input: Tensor, dim: Optional[int] = None) -> Tensor:
     return _create_tensor(layer.get_output(0), layer)
 
 
-def _lookup_plugin(input: Tensor, weight: Tensor, rank: int) -> Tensor:
+def _lookup_plugin(input: Tensor, weight: Tensor, rank: int,
+                   per_token_scale: Tensor) -> Tensor:
     '''
     Add an operation to perform lookup in a tensor.
 
@@ -1831,10 +2696,9 @@ def _lookup_plugin(input: Tensor, weight: Tensor, rank: int) -> Tensor:
         'Lookup', '1', TRT_LLM_PLUGIN_NAMESPACE)
     assert plg_creator is not None
 
-    p_dtype = default_net().plugin_config.lookup_plugin
-    pf_type = trt.PluginField(
-        "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
-        trt.PluginFieldType.INT32)
+    p_dtype = per_token_scale.dtype
+    pf_type = trt.PluginField("type_id", np.array([int(p_dtype)], np.int32),
+                              trt.PluginFieldType.INT32)
 
     rank = trt.PluginField("rank", np.array([int(rank)], np.int32),
                            trt.PluginFieldType.INT32)
@@ -1842,7 +2706,11 @@ def _lookup_plugin(input: Tensor, weight: Tensor, rank: int) -> Tensor:
     pfc = trt.PluginFieldCollection([pf_type, rank])
     lookup_plug = plg_creator.create_plugin("lookup", pfc)
     plug_inputs = [input.trt_tensor, weight.trt_tensor]
+    if per_token_scale is not None:
+        plug_inputs.append(per_token_scale.trt_tensor)
+        weight.trt_tensor.set_dynamic_range(-127, 127)
     layer = default_trtnet().add_plugin_v2(plug_inputs, lookup_plug)
+    _add_plugin_info(layer, plg_creator, "lookup", pfc)
     return _create_tensor(layer.get_output(0), layer)
 
 
@@ -1852,8 +2720,8 @@ def embedding(input: Tensor,
               tp_group=None,
               sharding_dim=0,
               tp_rank=None,
-              workspace: Optional[Tensor] = None,
-              instance_id: int = 0) -> Tensor:
+              per_token_scale=None,
+              padding=None) -> Tensor:
     '''
     Add an operation to perform embedding lookup.
 
@@ -1904,26 +2772,32 @@ def embedding(input: Tensor,
         tp_rank : int
             The tensor parallelism rank. Used to calculate offset in TP on vocab dim.
 
-        workspace: Optional[Tensor]
-            See allreduce's documentation for workspace.
-
-        instance_id: int
-            See allreduce's documentation for instance_id.
+        padding: Tensor
+            Additional padding added to the end of the embedding table before feeding into gather op.
 
     Returns:
         The tensor produced by the embedding lookup layer.
     '''
 
+    # Per token scale is only supported by lookup plugin so if per_token_scale is not None, we must use lookup plugin
+    # Otherwise, we prefer to use ootb
+    use_lookup_plugin = per_token_scale is not None
+
+    if padding is not None:
+        padded_weight = concat([weight, padding], dim=0)
+    else:
+        padded_weight = weight
+
     # Distribute embedding lookup table across multiple GPU
     if tp_size > 1 and tp_group is not None:
         if sharding_dim == 0:  # TP on vocab_size dimension
-            if tp_rank == None:
+            if tp_rank is None:
                 raise ValueError(
                     "Rank cannot be none for tensor parallelism on vocab dim")
 
-            if default_net().plugin_config.lookup_plugin:
-                x = _lookup_plugin(input, weight, tp_rank)
-                x = allreduce(x, tp_group, workspace, instance_id)
+            if use_lookup_plugin:
+                x = _lookup_plugin(input, weight, tp_rank, per_token_scale)
+                x = allreduce(x, tp_group)
             else:
                 shape_weight = shape(weight)
                 vocab_size = slice(shape_weight, starts=[0], sizes=[1])
@@ -1939,7 +2813,7 @@ def embedding(input: Tensor,
 
                 # Get the temporal results
                 layer = default_trtnet().add_gather(
-                    weight.trt_tensor, placeholder_input.trt_tensor, 0)
+                    padded_weight.trt_tensor, placeholder_input.trt_tensor, 0)
                 tmp_output = _create_tensor(layer.get_output(0), layer)
 
                 # Set zero for invalid results
@@ -1948,10 +2822,10 @@ def embedding(input: Tensor,
                 x = where(is_qualified_expand, tmp_output, placeholder)
 
                 # Use all reduce to collect the results
-                x = allreduce(x, tp_group, workspace, instance_id)
+                x = allreduce(x, tp_group)
 
         elif sharding_dim == 1:  # TP on hidden dimension
-            layer = default_trtnet().add_gather(weight.trt_tensor,
+            layer = default_trtnet().add_gather(padded_weight.trt_tensor,
                                                 input.trt_tensor, 0)
             x = _create_tensor(layer.get_output(0), layer)
 
@@ -1965,27 +2839,82 @@ def embedding(input: Tensor,
 
     # Store embedding lookup table as a whole
     else:
-        if default_net().plugin_config.lookup_plugin:
-            x = _lookup_plugin(input, weight, rank=0)
+        if use_lookup_plugin:
+            x = _lookup_plugin(input,
+                               padded_weight,
+                               rank=0,
+                               per_token_scale=per_token_scale)
         else:
-            layer = default_trtnet().add_gather(weight.trt_tensor,
+            layer = default_trtnet().add_gather(padded_weight.trt_tensor,
                                                 input.trt_tensor, 0)
             x = _create_tensor(layer.get_output(0), layer)
     return x
 
 
-def constant_to_tensor_(input: Union[Tensor, int, float],
-                        dtype: trt.DataType = trt.float32) -> Tensor:
-    if isinstance(input, int):
-        return constant(int32_array([input]))
-    elif isinstance(input, float):
-        assert dtype == trt.float32 or dtype == trt.float16
-        if dtype == trt.float32:
-            return constant(fp32_array([input]))
+def constant_to_tensor_(input: Union[Tensor, int, float, bool],
+                        dtype: Union[trt.DataType, str] = None,
+                        to_array=True) -> Tensor:
+    if dtype is None:
+        # deduce the type from the given value
+        # NOTE: bool is a subtype of int, so bool needs to be checked first
+        if isinstance(input, bool):
+            dtype = trt.bool
+        elif isinstance(input, int):
+            dtype = trt.int32
         else:
-            return constant(fp16_array([input]))
+            dtype = trt.float32
+
+    if not isinstance(input, Tensor):
+        if isinstance(dtype, str):
+            dtype = str_dtype_to_trt(dtype)
+        array_fn_dict = {
+            trt.int64: int64_array,
+            trt.int32: int32_array,
+            trt.float32: fp32_array,
+            trt.float16: fp16_array,
+            trt.bfloat16: bf16_array,
+            trt.bool: bool_array,
+        }
+        assert dtype in array_fn_dict
+        return constant(array_fn_dict[dtype]([input] if to_array else input))
 
     return input
+
+
+def constants_to_tensors_(
+        *inputs: Union[Tensor, int, float]) -> Tuple[Tensor, ...]:
+    '''
+    Helper function to create tensors from multiple inputs.
+
+    For each inputs, that function first creates a constant tensor if the input
+    is an integer or a float. Then, if any input is int64, it upcasts other
+    integer inputs to int64.
+
+    Parameters:
+        inputs : Tuple[Union[Tensor, int, float], ...]
+            The inputs to create tensors from.
+
+    Returns:
+        A tuple of tensors.
+    '''
+    has_int64: bool = False
+    for i in inputs:
+        if isinstance(i, int) and (i >= 2**31 or i < -2**31)\
+                or isinstance(i, Tensor) and i.dtype == trt.int64:
+            has_int64 = True
+            break
+
+    if not has_int64:
+        return tuple(constant_to_tensor_(i) for i in inputs)
+
+    result = []
+    for i in inputs:
+        if isinstance(i, int) or isinstance(i, Tensor) and i.dtype == trt.int32:
+            result.append(
+                constant_to_tensor_(i, trt.int64 if has_int64 else trt.int32))
+        else:
+            result.append(constant_to_tensor_(i))
+    return tuple(result)
 
 
 def broadcast_helper(left: Union[Tensor, int, float],
@@ -2014,7 +2943,7 @@ def broadcast_helper(left: Union[Tensor, int, float],
         right = constant_to_tensor_(right)
     else:
         left = constant_to_tensor_(
-            left, right.dtype if isinstance(right, Tensor) else trt.float32)
+            left, right.dtype if isinstance(right, Tensor) else None)
         right = constant_to_tensor_(right, left.dtype)
 
     if left.rank() == right.rank():
@@ -2042,18 +2971,19 @@ def elementwise_binary(left: Union[Tensor, int,
 
     The following closures are defined in functional.*:
 
-        add     for op=trt.ElementWiseOperation.SUM
-        sub     for op=trt.ElementWiseOperation.SUB
-        mul     for op=trt.ElementWiseOperation.PROD
-        div     for op=trt.ElementWiseOperation.DIV
-        gt      for op=trt.ElementWiseOperation.GREATER
-        lt      for op=trt.ElementWiseOperation.LESS
-        op_and  for op=trt.ElementWiseOperation.AND
-        op_or   for op=trt.ElementWiseOperation.OR
-        eq      for op=trt.ElementWiseOperation.EQUAL
-        minimum for op=trt.ElementWiseOperation.MIN
-        maximum for op=trt.ElementWiseOperation.MAX
-        pow     for op=trt.ElementWiseOperation.POW
+        add      for op=trt.ElementWiseOperation.SUM
+        sub      for op=trt.ElementWiseOperation.SUB
+        mul      for op=trt.ElementWiseOperation.PROD
+        div      for op=trt.ElementWiseOperation.DIV
+        floordiv for op=trt.ElementWiseOperation.FLOOR_DIV
+        gt       for op=trt.ElementWiseOperation.GREATER
+        lt       for op=trt.ElementWiseOperation.LESS
+        op_and   for op=trt.ElementWiseOperation.AND
+        op_or    for op=trt.ElementWiseOperation.OR
+        eq       for op=trt.ElementWiseOperation.EQUAL
+        minimum  for op=trt.ElementWiseOperation.MIN
+        maximum  for op=trt.ElementWiseOperation.MAX
+        pow      for op=trt.ElementWiseOperation.POW
 
     It is implemented using the IElementWiseLayer from TensorRT.
 
@@ -2073,6 +3003,10 @@ def elementwise_binary(left: Union[Tensor, int,
         The tensor produced by this elementwise operation.
     '''
     left, right = broadcast_helper(left, right)
+    if left.dtype == trt.int32 and right.dtype == trt.int64:
+        left = cast(left, trt.int64)
+    if left.dtype == trt.int64 and right.dtype == trt.int32:
+        right = cast(right, trt.int64)
     layer = default_trtnet().add_elementwise(left.trt_tensor, right.trt_tensor,
                                              op)
     return _create_tensor(layer.get_output(0), layer)
@@ -2082,6 +3016,7 @@ add = partial(elementwise_binary, op=trt.ElementWiseOperation.SUM)
 sub = partial(elementwise_binary, op=trt.ElementWiseOperation.SUB)
 mul = partial(elementwise_binary, op=trt.ElementWiseOperation.PROD)
 div = partial(elementwise_binary, op=trt.ElementWiseOperation.DIV)
+floordiv = partial(elementwise_binary, op=trt.ElementWiseOperation.FLOOR_DIV)
 gt = partial(elementwise_binary, op=trt.ElementWiseOperation.GREATER)
 lt = partial(elementwise_binary, op=trt.ElementWiseOperation.LESS)
 op_and = partial(elementwise_binary, op=trt.ElementWiseOperation.AND)
@@ -2090,9 +3025,22 @@ eq = partial(elementwise_binary, op=trt.ElementWiseOperation.EQUAL)
 minimum = partial(elementwise_binary, op=trt.ElementWiseOperation.MIN)
 maximum = partial(elementwise_binary, op=trt.ElementWiseOperation.MAX)
 pow = partial(elementwise_binary, op=trt.ElementWiseOperation.POW)
+op_xor = partial(elementwise_binary, op=trt.ElementWiseOperation.XOR)
 
 
-def where(condition: Union[Tensor, int, float], left: Union[Tensor, int, float],
+def modulo(x: Tensor, y: Union[Tensor, int]) -> Tensor:
+    '''
+    This function adds an element-wise modulo (x % y) operation for a given tensor.
+    Since there is no TensorRT layer that can directly perform this,
+    this function implements it using some of the basic operations.
+
+    Returns:
+        A tensor that represents (x % y) modulo operation.
+    '''
+    return x - (x // y) * y
+
+
+def where(condition: Union[Tensor, bool], left: Union[Tensor, int, float],
           right: Union[Tensor, int, float]) -> Tensor:
     '''
     Add a where (aka select or if-then-else) operation.
@@ -2103,16 +3051,16 @@ def where(condition: Union[Tensor, int, float], left: Union[Tensor, int, float],
         for ii in range(mul(condition.shape)):
             output[ii] = left[ii] if condition[ii] else right[ii]
 
-    For each input, that function first creates a constant tensor if the input
-    is an integer or a float. Then, if needed, it expands the smaller tensor to
-    make sure its rank is the same as the larger one. Then, it performs the
-    selection.
+    For each input, that function first creates a constant tensor if the
+    condition is boolean or the left/right input is an integer or a float.
+    Then, if needed, it expands the smaller tensor to make sure its
+    rank is the same as the larger one. Then, it performs the selection.
 
     It is implemented using the ISelectLayer from TensorRT.
 
     Parameters:
-        left : Union[Tensor, int, float]
-            The condition. If that input is an integer or a float, the function
+        condition : Union[Tensor, bool]
+            The condition. If that input is a boolean, the function
             creates a constant tensor.
 
         left : Union[Tensor, int, float]
@@ -2123,16 +3071,12 @@ def where(condition: Union[Tensor, int, float], left: Union[Tensor, int, float],
             The second input. If that input is an integer or a float, the
             function creates a constant tensor.
 
-        op : trt.ElementWiseOperation
-            The binary operation to perform.
-
     Returns:
-        The tensor produced by this select operation.
+        The tensor produced by this where operation.
     '''
     # Convert to tensors.
     condition = constant_to_tensor_(condition)
-    left = constant_to_tensor_(left)
-    right = constant_to_tensor_(right)
+    left, right = constants_to_tensors_(left, right)
 
     # Find the tensor with the largest rank of the three.
     largest = condition
@@ -2167,6 +3111,7 @@ def unary(input: Tensor, op: trt.UnaryOperation) -> Tensor:
         sin     for op=trt.UnaryOperation.SIN
         cos     for op=trt.UnaryOperation.COS
         abs     for op=trt.UnaryOperation.ABS
+        log     for op=trt.UnaryOperation.LOG
 
     It is implemented using the IUnaryLayer from TensorRT.
 
@@ -2190,9 +3135,72 @@ exp = partial(unary, op=trt.UnaryOperation.EXP)
 sin = partial(unary, op=trt.UnaryOperation.SIN)
 cos = partial(unary, op=trt.UnaryOperation.COS)
 abs = partial(unary, op=trt.UnaryOperation.ABS)
+log = partial(unary, op=trt.UnaryOperation.LOG)
+not_op = partial(unary, op=trt.UnaryOperation.NOT)
 
 
-def mean(input: Tensor, dim: int, keepdim: bool = False) -> Tensor:
+def log_softmax(input: Tensor, dim: int) -> Tensor:
+    '''
+    This function is equivalent of torch.nn.functional.log_softmax() i.e.
+    it performs log(softmax(input)) in a safer and faster way.
+
+    Parameters:
+        input: Tensor
+            The data tensor on which log_softmax to be computed.
+        dim: int
+            The dimension of the input tensor along which log_softmax will be computed.
+    Returns:
+        A tensor of same shape as input with log_softmax computed on the specified dim.
+    '''
+    x_max = max(input, dim=dim, keepdim=True)
+    x = input - x_max
+    return x - log(sum(exp(x), dim=dim, keepdim=True))
+
+
+def reduce(input: Tensor,
+           op: trt.ReduceOperation,
+           dim: Union[int, Tuple[int]],
+           keepdim: bool = False) -> Tensor:
+    '''
+    Add an reduction operation to do along a dimension.
+
+    It is implemented using the IReduceLayer from TensorRT.
+
+    Parameters:
+        input : Tensor
+            The input tensor.
+
+        op : trt.ReduceOperation
+            The reduction operation to perform.
+            Options: SUM, PROD, MAX, MIN, AVG
+
+        dim : int
+            The dimension along which the reduction is performed.
+
+        keepdim : bool
+            Is the dimension kept in the reduced tensor? When True the
+            dimension is kept, it is removed from the shape otherwise.
+
+    Returns:
+        The tensor produced by this reduction operation.
+    '''
+    dim = dim_resolve_negative(dim, input.ndim())
+    axes = dim_to_trt_axes(dim)
+
+    layer = default_trtnet().add_reduce(input.trt_tensor,
+                                        op,
+                                        axes,
+                                        keep_dims=keepdim)
+    return _create_tensor(layer.get_output(0), layer)
+
+
+prod = partial(reduce, op=trt.ReduceOperation.PROD)
+min = partial(reduce, op=trt.ReduceOperation.MIN)
+
+
+def mean(input: Tensor,
+         dim: Union[int, Tuple[int]],
+         keepdim: bool = False) -> Tensor:
     '''
     Add an operation to compute the mean along a dimension.
 
@@ -2214,14 +3222,7 @@ def mean(input: Tensor, dim: int, keepdim: bool = False) -> Tensor:
     Returns:
         The tensor produced by this reduction operation.
     '''
-    dim = dim_resolve_negative(dim, input.ndim())
-    axes = dim_to_trt_axes(dim)
-
-    layer = default_trtnet().add_reduce(input.trt_tensor,
-                                        trt.ReduceOperation.AVG,
-                                        axes,
-                                        keep_dims=keepdim)
-    return _create_tensor(layer.get_output(0), layer)
+    return reduce(input, op=trt.ReduceOperation.AVG, dim=dim, keepdim=keepdim)
 
 
 def max(input: Tensor, dim: int, keepdim: bool = False) -> Tensor:
@@ -2246,21 +3247,37 @@ def max(input: Tensor, dim: int, keepdim: bool = False) -> Tensor:
     Returns:
         The tensor produced by this reduction operation.
     '''
-    dim = dim_resolve_negative(dim, input.ndim())
-    axes = dim_to_trt_axes(dim)
+    return reduce(input, op=trt.ReduceOperation.MAX, dim=dim, keepdim=keepdim)
 
-    layer = default_trtnet().add_reduce(input.trt_tensor,
-                                        trt.ReduceOperation.MAX,
-                                        axes,
-                                        keep_dims=keepdim)
-    return _create_tensor(layer.get_output(0), layer)
+
+def sum(input: Tensor, dim: int, keepdim: bool = False) -> Tensor:
+    '''
+    Add an operation to compute the sum along a dimension.
+
+    Computes the sum along the dimension 'dim' of the input tensor.
+
+    It is implemented using the IReduceLayer from TensorRT.
+
+    Parameters:
+        input : Tensor
+            The input tensor.
+
+        dim : int
+            The dimension along which the mean is computed.
+
+        keepdim : bool
+            Is the dimension kept in the reduced tensor? When True the
+            dimension is kept, it is removed from the shape otherwise.
+
+    Returns:
+        The tensor produced by this reduction operation.
+    '''
+    return reduce(input, op=trt.ReduceOperation.SUM, dim=dim, keepdim=keepdim)
 
 
 def identity(input: Tensor) -> Tensor:
     '''
     Add an identity operation.
-
-    TODO: Document why it can be done using a plugin!!!
 
     Parameters:
         input : Tensor
@@ -2279,6 +3296,7 @@ def identity(input: Tensor) -> Tensor:
         id_plug = plg_creator.create_plugin("identity", pfc)
         plug_inputs = [input.trt_tensor]
         layer = default_trtnet().add_plugin_v2(plug_inputs, id_plug)
+        _add_plugin_info(layer, plg_creator, "identity", pfc)
     return _create_tensor(layer.get_output(0), layer)
 
 
@@ -2319,13 +3337,14 @@ def argmax(input: Tensor, dim: int, keepdim: bool = False) -> Tensor:
     if keepdim:
         return _create_tensor(output, layer)
 
-    a = list(range(len(input.ndim())))
-    a.pop(dim)
-    indices = constant(int32_array([a]))
+    output = _create_tensor(output, layer)
+    a = list(range(input.ndim()))
+    for d in dim:
+        a.pop(d)
+    indices = constant(int32_array(a))
     output_shape = shape(output)
     new_shape = gather(output_shape, 0, indices)
-    layer = view(output, new_shape)
-    return _create_tensor(layer.get_output(0), layer)
+    return view(output, new_shape)
 
 
 def gelu(x: Tensor) -> Tensor:
@@ -2339,22 +3358,8 @@ def gelu(x: Tensor) -> Tensor:
     Returns:
         The tensor produced by the activation layer.
     '''
-    if not default_net().strongly_typed:
-        return 0.5 * x * (
-            tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * pow(x, 3.0))) + 1.0)
-
-    array_fn = {
-        trt.float32: fp32_array,
-        trt.float16: fp16_array,
-        trt.bfloat16: bf16_array,
-    }[x.dtype]
-
-    v1 = constant(array_fn([0.5]))
-    v2 = constant(array_fn([math.sqrt(2.0 / math.pi)]))
-    v3 = constant(array_fn([0.044715]))
-    v4 = constant(array_fn([3.0]))
-    v5 = constant(array_fn([1.0]))
-    return v1 * x * (tanh(v2 * (x + v3 * pow(x, v4))) + v5)
+    return 0.5 * x * (
+        tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * pow(x, 3.0))) + 1.0)
 
 
 def geglu(x: Tensor) -> Tensor:
@@ -2363,7 +3368,7 @@ def geglu(x: Tensor) -> Tensor:
 
     That function takes a tensor, splits it into two halves along the last
     dimension, applies GELU to the second half and multiply the results. The
-    behaviour is undefined if the last dimension is not even.
+    behavior is undefined if the last dimension is not even.
 
     Parameters:
         input : Tensor
@@ -2374,6 +3379,39 @@ def geglu(x: Tensor) -> Tensor:
     '''
     a, b = chunk(x, 2, dim=-1)
     return a * gelu(b)
+
+
+def quick_gelu(x: Tensor) -> Tensor:
+    return x * sigmoid(1.702 * x)
+
+
+def gegelu(x: Tensor, limit: Optional[float] = None) -> Tensor:
+    # a, b = x[..., ::2], x[..., 1::2]
+    ndim = x.ndim()
+    a_starts = [0 for i in range(ndim)]
+    b_starts = [1 if i == (ndim - 1) else 0 for i in range(ndim)]
+    shapes = concat([
+        shape(x, i) / 2 if i == (ndim - 1) else shape(x, i) for i in range(ndim)
+    ])
+    strides = [2 if i == (ndim - 1) else 1 for i in range(ndim)]
+
+    a = slice(x, a_starts, shapes, strides)
+    b = slice(x, b_starts, shapes, strides)
+
+    if limit is not None:
+        a = clip(a, alpha=float(-1e20), beta=limit)
+        b = clip(b, alpha=-limit, beta=limit)
+
+    # C = B + 1
+    const1 = arange(constant(int32_array(1)), constant(int32_array(2)),
+                    trt_dtype_to_str(b.dtype))
+    for _ in range(ndim - 1):
+        const1 = expand_dims(const1, 0)
+
+    b_shape = concat([shape(b, i) for i in range(ndim)])
+    const1_arr = expand(const1, b_shape)
+
+    return quick_gelu(a) * (b + const1_arr)
 
 
 def group_norm(input: Tensor,
@@ -2398,15 +3436,19 @@ def group_norm(input: Tensor,
     ] + [input.size(i) for i in range(2, ndim)])
     x = input.view(new_shape)
 
-    reduce_dim = tuple(range(2, ndim + 1))
-    ux = x.mean(reduce_dim, keepdim=True)
-    numerator = x - ux
-    varx = numerator * numerator
-    varx = varx.mean(reduce_dim, keepdim=True)
-
-    denom = varx + eps
-    denom = denom.sqrt()
-    y = numerator / denom
+    # instance norm
+    w_shape = [1, num_groups] + [1 for i in range(ndim - 1)]
+    instance_weight = constant(np.ones(w_shape, dtype=trt_dtype_to_np(x.dtype)))
+    instance_bias = constant(np.zeros(w_shape, dtype=trt_dtype_to_np(x.dtype)))
+    axes_mask = 0
+    for i in range(2, x.ndim()):
+        axes_mask |= 1 << i
+    layer = default_trtnet().add_normalization(x.trt_tensor,
+                                               instance_weight.trt_tensor,
+                                               instance_bias.trt_tensor,
+                                               axes_mask)
+    layer.epsilon = eps
+    y = _create_tensor(layer.get_output(0), layer)
     y = y.view(old_shape)
 
     new_shape = concat([num_channels] + [1 for _ in range(2, ndim)])
@@ -2422,12 +3464,12 @@ def softplus(input: Tensor, beta: float, threshold: float) -> Tensor:
     '''
     Add the softplus activation base on PyTorch definition.
 
-    See https://pytorch.org/docs/stable/generated/torch.nn.functional.softplus.html for a
+    See https://pytorch.org/docs/stable/generated/torch.nn.functional.softplus.html#torch-nn-functional-softplus for a
     description of that function.
 
     Parameters:
         input : Tensor
-            Input TensorRT-LLM Tensor.
+            Input TensorRT LLM Tensor.
         beta : float
             The parameter for softplus computation.
         threshold : float
@@ -2520,11 +3562,7 @@ def conv1d(input: Tensor,
                             and bias.producer.type == trt.LayerType.CONSTANT)
         bias = bias.producer.weights if is_bias_constant else trt.Weights()
 
-    input_shuffle_layer = default_trtnet().add_shuffle(input.trt_tensor)
-    input_shuffle_layer.reshape_dims = trt.Dims([*(input.size()), 1])
-    input_shuffled = _create_tensor(input_shuffle_layer.get_output(0),
-                                    input_shuffle_layer)
-
+    input_shuffled = stack([input], dim=input.ndim())
     kernel_size = trt.Dims([kernel_size, 1])
 
     layer = default_trtnet().add_convolution_nd(input_shuffled.trt_tensor,
@@ -2532,7 +3570,7 @@ def conv1d(input: Tensor,
                                                 bias)
     layer.stride_nd = (stride, 2)
     layer.padding_nd = (padding, 0)
-    layer.dilation = (dilation, 2)
+    layer.dilation_nd = (dilation, 2)
     layer.num_groups = groups
 
     if not is_weight_constant:
@@ -2541,14 +3579,7 @@ def conv1d(input: Tensor,
         layer.set_input(2, bias.trt_tensor)
 
     output_2d = _create_tensor(layer.get_output(0), layer)
-    output_2d_shuffle_layer = default_trtnet().add_shuffle(output_2d.trt_tensor)
-    output_2d_shuffle_layer.reshape_dims = trt.Dims(
-        [output_2d.size()[0],
-         output_2d.size()[1],
-         output_2d.size()[2]])
-    output_1d = _create_tensor(output_2d_shuffle_layer.get_output(0),
-                               output_2d_shuffle_layer)
-
+    output_1d = squeeze(output_2d, dim=-1)
     return output_1d
 
 
@@ -2558,12 +3589,12 @@ def conv2d(input: Tensor,
            stride: Tuple[int, int] = (1, 1),
            padding: Tuple[int, int] = (0, 0),
            dilation: Tuple[int, int] = (1, 1),
-           groups: int = 1) -> Tensor:
+           groups: int = 1,
+           pre_padding: Optional[Tuple[int, int]] = None,
+           post_padding: Optional[Tuple[int, int]] = None) -> Tensor:
     ##
     ## TODO: Document that function!
     ##
-
-    assert not input.is_dynamic()
 
     ndim = input.ndim()
     if ndim == 3:
@@ -2588,6 +3619,10 @@ def conv2d(input: Tensor,
     layer.dilation_nd = dilation
     layer.num_groups = groups
     layer.dilation_nd = dilation
+    if pre_padding:
+        layer.pre_padding = pre_padding
+    if post_padding:
+        layer.post_padding = post_padding
 
     if not is_weight_constant:
         layer.set_input(1, weight.trt_tensor)
@@ -2602,6 +3637,59 @@ def conv2d(input: Tensor,
                     output.size(2),
                     output.size(3)]))
 
+    return output
+
+
+def conv3d(input: Tensor,
+           weight: Tensor,
+           bias: Optional[Tensor] = None,
+           stride: Union[int, Tuple[int, int]] = (1, 1, 1),
+           padding: Union[int, Tuple[int, int]] = (0, 0, 0),
+           dilation: Union[int, Tuple[int, int]] = (1, 1, 1),
+           groups: int = 1) -> Tensor:
+    ##
+    ## TODO: Document this function!
+    ##
+
+    ndim = input.ndim()
+    # TRT requires the input of Conv3D layer to be 5-dimentional tensor.
+    if ndim == 4:
+        input = expand_dims(input, 0)
+    assert input.ndim() == 5
+
+    if isinstance(stride, int):
+        stride = tuple([stride] * 3)
+    if isinstance(padding, int):
+        padding = tuple([padding] * 3)
+    if isinstance(dilation, int):
+        dilation = tuple([dilation] * 3)
+
+    noutput = weight.size()[0]
+    kernel_size = (weight.size()[-3], weight.size()[-2], weight.size()[-1])
+
+    is_weight_constant = (weight.producer is not None
+                          and weight.producer.type == trt.LayerType.CONSTANT)
+    weight = weight.producer.weights if is_weight_constant else trt.Weights()
+
+    if bias is not None:
+        is_bias_constant = (bias.producer is not None
+                            and bias.producer.type == trt.LayerType.CONSTANT)
+        bias = bias.producer.weights if is_bias_constant else trt.Weights()
+
+    layer = default_trtnet().add_convolution_nd(input.trt_tensor, noutput,
+                                                kernel_size, weight, bias)
+    layer.stride_nd = stride
+    layer.padding_nd = padding
+    layer.dilation_nd = dilation
+    layer.num_groups = groups
+    layer.dilation_nd = dilation
+
+    if not is_weight_constant:
+        layer.set_input(1, weight.trt_tensor)
+    if bias is not None and not is_bias_constant:
+        layer.set_input(2, bias.trt_tensor)
+
+    output = _create_tensor(layer.get_output(0), layer)
     return output
 
 
@@ -2703,18 +3791,18 @@ def split(tensor: Tensor,
     if dim < 0:
         dim += ndim
     dim_value = tensor.size()[dim]
-    starts = [constant(int32_array([0])) for _ in range(ndim)]
+    starts = [constant(dims_array([0])) for _ in range(ndim)]
     sizes = [shape(tensor, i) for i in range(ndim)]
 
     if isinstance(split_size_or_sections, int):
         # TODO: support non-divisible cases
         assert dim_value % split_size_or_sections == 0
         num_sections = dim_value // split_size_or_sections
-        sizes[dim] = constant(int32_array([split_size_or_sections]))
+        sizes[dim] = constant(dims_array([split_size_or_sections]))
 
         outputs = []
         for i in range(num_sections):
-            starts[dim] = constant(int32_array([split_size_or_sections * i]))
+            starts[dim] = constant(dims_array([split_size_or_sections * i]))
             outputs.append(slice(tensor, concat(starts), concat(sizes)))
         return outputs
     else:
@@ -2728,7 +3816,7 @@ def split(tensor: Tensor,
         for i in range(num_sections):
             if i > 0:
                 starts[dim] = starts[dim] + sizes[dim]
-            sizes[dim] = constant(int32_array([split_size_or_sections[i]]))
+            sizes[dim] = constant(dims_array([split_size_or_sections[i]]))
             outputs.append(slice(tensor, concat(starts), concat(sizes)))
         return outputs
 
@@ -2771,22 +3859,196 @@ def chunk(tensor: Tensor, chunks: int, dim: int = 0) -> Tensor:
     return split(tensor, dim_value // chunks, dim)
 
 
+def unbind(input: Tensor, dim: int = 0):
+    '''
+    Removes a tensor dimension.
+
+    Returns a tuple of all slices along a given dimension, already without it.
+    '''
+    ndim = input.ndim()
+    outputs = split(input, 1, dim)
+    output_shape = [input.shape[i] for i in range(ndim) if i != dim]
+    return [output.view(output_shape) for output in outputs]
+
+
 class AllReduceStrategy(IntEnum):
-    """
-    Warning: actual definition is in cpp/tensorrt_llm/kernels/customAllReduceKernels.h
-             they must be kept in sync
-    """
-    RING = 0
-    ONESHOT = 1
-    TWOSHOT = 2
+    NCCL = 0
+    MIN_LATENCY = 1
+    UB = 2
     AUTO = 3
+    ONESHOT = 4
+    TWOSHOT = 5
+    LOWPRECISION = 6
+    MNNVL = 7
+    NCCL_SYMMETRIC = 8
 
 
-def allreduce(tensor: Tensor,
-              group: List[int],
-              workspace: Optional[Tensor] = None,
-              instance_id: int = 0,
-              strategy: Optional[AllReduceStrategy] = None) -> Tensor:
+class AllReduceFusionOp(IntEnum):
+    NONE = 0
+    RESIDUAL_RMS_NORM = 1
+    LAST_PROCESS_FOR_UB = 2
+    RESIDUAL_RMS_PREPOST_NORM = 3
+    RESIDUAL_RMS_NORM_QUANT_FP8 = 4
+    RESIDUAL_RMS_NORM_QUANT_NVFP4 = 5
+    RESIDUAL_RMS_NORM_OUT_QUANT_FP8 = 6
+    RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 7
+    MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM = 8
+
+
+class AllReduceParams():
+
+    def __init__(self,
+                 strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
+                 fusion_op: AllReduceFusionOp = AllReduceFusionOp.NONE,
+                 bias: Optional[Tensor] = None,
+                 residual: Optional[Tensor] = None,
+                 norm_weight: Optional[Tensor] = None,
+                 scale: Optional[Tensor] = None,
+                 norm_pre_residual_weight: Optional[Tensor] = None,
+                 eps: float = 1e-06,
+                 enable_allreduce: bool = True,
+                 trigger_completion_at_end: bool = True):
+        self.strategy = strategy
+        self.fusion_op = fusion_op
+        self.bias = bias
+        self.residual = residual
+        self.norm_weight = norm_weight
+        self.scale = scale
+        self.norm_pre_residual_weight = norm_pre_residual_weight
+        self.eps = eps
+        # For torch path only, has no effect on TRT path
+        self.enable_allreduce = enable_allreduce
+        self.trigger_completion_at_end = trigger_completion_at_end
+        assert fusion_op == AllReduceFusionOp.NONE.value or (residual
+                                                             is not None)
+
+    def has_affine(self):
+        return 1 if self.norm_weight is not None else 0
+
+    def has_bias(self):
+        return 1 if self.bias is not None else 0
+
+    def has_scale(self):
+        return 1 if self.scale is not None else 0
+
+    def update_strategy(self):
+        if self.strategy == AllReduceStrategy.AUTO and default_net(
+        ).plugin_config.user_buffer:
+            self.strategy = AllReduceStrategy.UB
+
+
+class MoEAllReduceParams(AllReduceParams):
+
+    def __init__(self,
+                 device_num_experts: Optional[Tensor] = None,
+                 expert_scale_factor: Optional[Tensor] = None,
+                 expanded_idx_to_permuted_idx: Optional[Tensor] = None,
+                 shared_expert_output: Optional[Tensor] = None,
+                 bias: Optional[Tensor] = None,
+                 residual: Optional[Tensor] = None,
+                 norm_weight: Optional[Tensor] = None,
+                 scale: Optional[Tensor] = None,
+                 norm_pre_residual_weight: Optional[Tensor] = None,
+                 eps: float = 1e-06,
+                 enable_allreduce: bool = True,
+                 is_cutlass_min_latency: bool = False):
+        super().__init__(
+            bias=bias,
+            residual=residual,
+            norm_weight=norm_weight,
+            scale=scale,
+            norm_pre_residual_weight=norm_pre_residual_weight,
+            eps=eps,
+            enable_allreduce=enable_allreduce,
+        )
+        self.device_num_experts = device_num_experts
+        self.expert_scale_factor = expert_scale_factor
+        self.expanded_idx_to_permuted_idx = expanded_idx_to_permuted_idx
+        self.shared_expert_output = shared_expert_output
+        self.is_cutlass_min_latency = is_cutlass_min_latency
+
+    def is_valid(self):
+        if self.is_cutlass_min_latency:
+            return (self.device_num_experts is not None
+                    and self.expert_scale_factor is not None
+                    and self.shared_expert_output is not None)
+        else:
+            return (self.expanded_idx_to_permuted_idx is not None)
+
+
+def create_allreduce_plugin(
+    network: trt.INetworkDefinition,
+    tensor: trt.ITensor,
+    workspace: Optional[trt.ITensor],
+    group: np.array,
+    dtype: trt.DataType,
+    all_reduce_params: AllReduceParams,
+):
+    allreduce_plg_creator = trt.get_plugin_registry().get_plugin_creator(
+        'AllReduce', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert allreduce_plg_creator is not None
+
+    pf_group = trt.PluginField("group", group, trt.PluginFieldType.INT32)
+    pf_dtype = trt.PluginField("type_id", np.array([int(dtype)], np.int32),
+                               trt.PluginFieldType.INT32)
+    pfc = [pf_group, pf_dtype]
+    p_strategy = trt.PluginField(
+        "strategy", np.array([int(all_reduce_params.strategy)], np.int8),
+        trt.PluginFieldType.INT8)
+    pfc.append(p_strategy)
+    p_fusion_op = trt.PluginField(
+        "fusion_op", np.array([int(all_reduce_params.fusion_op)], np.int8),
+        trt.PluginFieldType.INT8)
+    pfc.append(p_fusion_op)
+    p_eps = trt.PluginField(
+        "eps", np.array([float(all_reduce_params.eps)], np.float32),
+        trt.PluginFieldType.FLOAT32)
+    pfc.append(p_eps)
+    p_affine = trt.PluginField(
+        "affine", np.array([int(all_reduce_params.has_affine())], np.int8),
+        trt.PluginFieldType.INT8)
+    pfc.append(p_affine)
+    p_bias = trt.PluginField(
+        "bias", np.array([int(all_reduce_params.has_bias())], np.int8),
+        trt.PluginFieldType.INT8)
+    pfc.append(p_bias)
+    p_scale = trt.PluginField(
+        "scale", np.array([int(all_reduce_params.has_scale())], np.int8),
+        trt.PluginFieldType.INT8)
+    pfc.append(p_scale)
+
+    pfc = trt.PluginFieldCollection(pfc)
+    ar_plug = allreduce_plg_creator.create_plugin("allreduce", pfc)
+    plug_inputs = [tensor]
+    if all_reduce_params.strategy not in {
+            AllReduceStrategy.NCCL, AllReduceStrategy.UB,
+            AllReduceStrategy.NCCL_SYMMETRIC
+    }:
+        plug_inputs.append(workspace)
+    if all_reduce_params.fusion_op != AllReduceFusionOp.NONE:
+        if all_reduce_params.has_bias() == 1:
+            plug_inputs.append(all_reduce_params.bias.trt_tensor)
+        plug_inputs.append(all_reduce_params.residual.trt_tensor)
+        if all_reduce_params.has_affine() == 1:
+            plug_inputs.append(all_reduce_params.norm_weight.trt_tensor)
+            if all_reduce_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_PREPOST_NORM:
+                plug_inputs.append(
+                    all_reduce_params.norm_pre_residual_weight.trt_tensor)
+        if all_reduce_params.has_scale() == 1:
+            plug_inputs.append(all_reduce_params.scale.trt_tensor)
+
+    layer = network.add_plugin_v2(plug_inputs, ar_plug)
+    return layer, allreduce_plg_creator, pfc
+
+
+allreduce_ub_counter = 0
+
+
+def allreduce(
+    tensor: Tensor,
+    group: List[int],
+    all_reduce_params: Optional[AllReduceParams] = AllReduceParams()
+) -> Tensor:
     '''
     Add an operation that performs a collective all-reduce.
 
@@ -2813,67 +4075,69 @@ def allreduce(tensor: Tensor,
         group : List[int]
             The ranks participating into the all-reduce operation.
 
-        workspace: Optional[Tensor]
-            When using CUSTOM or AUTO mode, a tensor containing pointers to memory
-            visible to all GPUs. It should be 3 poitners per TP rank -
-            ptr to data buffer, ptr to barriers in, ptr to barriers out.
-            It must be initialized using IpcMemory class.
-
-        instance_id: int
-            Used for synchronization with CUSTOM or AUTO. Corresponding plugins MUST have the same
-            instance_id. I.e. GPU#0's allreduce after MLP at layer i must have the same instance_id as
-            GPU#1, GPU#2... Also, instance_id MUST be unique per model. There should not be two allreduce instances
-            in GPU#0 that have the same id.
+        strategy: AllReduceStrategy
+            NCCL delegates all-reduce to NCCL while ONESHOT and TWOSHOT are custom latency-optimal algorithms.
+            AUTO chooses amongst the three based on a message-size heuristic.
 
     Returns:
         The tensor produced by that layer.
     '''
 
-    allreduce_plg_creator = trt.get_plugin_registry().get_plugin_creator(
-        'AllReduce', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    global allreduce_ub_counter
+    allreduce_ub_counter += 1
 
-    if strategy is None:
-        if default_net().plugin_config.use_custom_all_reduce:
-            strategy = AllReduceStrategy.AUTO
+    if all_reduce_params is None:
+        all_reduce_params = AllReduceParams()
+    all_reduce_params.update_strategy()
+
+    # TODO(TRTLLM-996): remove this WAR when custom allreduce is supported
+    # for encoder models in C++ runtime.
+    workspace = None
+    if all_reduce_params.strategy != AllReduceStrategy.NCCL and all_reduce_params.strategy != AllReduceStrategy.UB:
+        if current_all_reduce_helper().workspace is None:
+            all_reduce_params.strategy = AllReduceStrategy.NCCL_SYMMETRIC
         else:
-            strategy = AllReduceStrategy.RING
-
-    if strategy != AllReduceStrategy.RING:
-        if not hasattr(allreduce, "ids"):
-            allreduce.ids = set()
-
-        if instance_id not in allreduce.ids:
-            allreduce.ids.add(instance_id)
+            workspace = current_all_reduce_helper().workspace.trt_tensor
+    if all_reduce_params.strategy == AllReduceStrategy.UB:
+        tensor.mark_output("allreduce_ub_0_" + str(allreduce_ub_counter))
+    dtype = default_net().plugin_config.nccl_plugin
+    layer, allreduce_plg_creator, pfc = create_allreduce_plugin(
+        network=default_trtnet(),
+        tensor=tensor.cast(dtype).trt_tensor,
+        workspace=workspace,
+        group=np.array(group, dtype=np.int32),
+        dtype=str_dtype_to_trt(dtype),
+        all_reduce_params=all_reduce_params,
+    )
+    _add_plugin_info(layer, allreduce_plg_creator, "allreduce", pfc)
+    if all_reduce_params.fusion_op != AllReduceFusionOp.NONE:
+        inter_output = _create_tensor(layer.get_output(1),
+                                      layer).cast(tensor.dtype)
+        if all_reduce_params.strategy == AllReduceStrategy.UB and all_reduce_params.has_scale(
+        ) == 1:
+            final_output = _create_tensor(layer.get_output(0), layer)
+            if all_reduce_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
+                scale_factor = _create_tensor(layer.get_output(2), layer)
         else:
-            logger.warning(
-                f"Custom allreduce has already used id {instance_id}")
-
-    assert allreduce_plg_creator is not None
-
-    group = trt.PluginField("group", np.array(group, dtype=np.int32),
-                            trt.PluginFieldType.INT32)
-
-    p_dtype = default_net().plugin_config.nccl_plugin
-    pf_dtype = trt.PluginField(
-        "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
-        trt.PluginFieldType.INT32)
-    pfc = [group, pf_dtype]
-    p_strategy = trt.PluginField("strategy", np.array([int(strategy)], np.int8),
-                                 trt.PluginFieldType.INT8)
-    pfc.append(p_strategy)
-    p_counter = trt.PluginField("counter", np.array([instance_id + 1],
-                                                    np.int32),
-                                trt.PluginFieldType.INT32)
-    pfc.append(p_counter)
-
-    pfc = trt.PluginFieldCollection(pfc)
-    ar_plug = allreduce_plg_creator.create_plugin("allreduce", pfc)
-    plug_inputs = [tensor.trt_tensor]
-    if strategy != AllReduceStrategy.RING:
-        plug_inputs.append(workspace.trt_tensor)
-
-    layer = default_trtnet().add_plugin_v2(plug_inputs, ar_plug)
-    return _create_tensor(layer.get_output(0), layer)
+            final_output = _create_tensor(layer.get_output(0),
+                                          layer).cast(tensor.dtype)
+        if all_reduce_params.strategy == AllReduceStrategy.UB:
+            if all_reduce_params.has_scale() == 1:
+                final_output.mark_output("allreduce_ub_1_" +
+                                         str(allreduce_ub_counter))
+                if all_reduce_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
+                    scale_factor.mark_output("allreduce_ub_2_" +
+                                             str(allreduce_ub_counter))
+                    return (final_output, scale_factor), inter_output
+            else:
+                assert all_reduce_params.fusion_op == AllReduceFusionOp.LAST_PROCESS_FOR_UB
+                inter_output.mark_output("allreduce_ub_1_" +
+                                         str(allreduce_ub_counter))
+        return final_output, inter_output
+    else:
+        final_output = _create_tensor(layer.get_output(0),
+                                      layer).cast(tensor.dtype)
+        return final_output
 
 
 def allgather(tensor: Tensor, group: List[int], gather_dim: int = 0) -> Tensor:
@@ -2929,11 +4193,12 @@ def allgather(tensor: Tensor, group: List[int], gather_dim: int = 0) -> Tensor:
 
     pfc = trt.PluginFieldCollection([group, pf_type])
     allgather = allgather_plg_creator.create_plugin("allgather", pfc)
-    plug_inputs = [tensor.trt_tensor]
+    plug_inputs = [tensor.cast(p_dtype).trt_tensor]
 
     layer = default_trtnet().add_plugin_v2(plug_inputs, allgather)
+    _add_plugin_info(layer, allgather_plg_creator, "allgather", pfc)
 
-    x = _create_tensor(layer.get_output(0), layer)
+    x = _create_tensor(layer.get_output(0), layer).cast(tensor.dtype)
 
     # gather along a given dimension other than dim0
     if gather_dim != 0:
@@ -2949,7 +4214,7 @@ def allgather(tensor: Tensor, group: List[int], gather_dim: int = 0) -> Tensor:
         # 2.1 split
         split_size = shape(x, dim=0) / group_size
         ndim = x.ndim()
-        starts = [constant(int32_array([0])) for _ in range(ndim)]
+        starts = [constant(dims_array([0])) for _ in range(ndim)]
         sizes = [shape(x, dim=d) for d in range(ndim)]
         sizes[0] = split_size
         sections = []
@@ -2960,6 +4225,29 @@ def allgather(tensor: Tensor, group: List[int], gather_dim: int = 0) -> Tensor:
         x = concat(sections, dim=gather_dim)
 
     return x
+
+
+def reduce_scatter(tensor: Tensor, group: List[int]) -> Tensor:
+
+    plg_creater = trt.get_plugin_registry().get_plugin_creator(
+        'ReduceScatter', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert plg_creater is not None
+
+    p_dtype = default_net().plugin_config.nccl_plugin
+    pf_type = trt.PluginField(
+        "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
+        trt.PluginFieldType.INT32)
+    group = trt.PluginField("group", np.array(group, dtype=np.int32),
+                            trt.PluginFieldType.INT32)
+    pfc = trt.PluginFieldCollection([group, pf_type])
+
+    reduce_scatter_plug = plg_creater.create_plugin("reduce_scatter", pfc)
+    plug_inputs = [tensor.cast(p_dtype).trt_tensor]
+
+    layer = default_trtnet().add_plugin_v2(plug_inputs, reduce_scatter_plug)
+    _add_plugin_info(layer, plg_creater, "reduce_scatter", pfc)
+
+    return _create_tensor(layer.get_output(0), layer).cast(tensor.dtype)
 
 
 def send(tensor: Tensor, tgt: int) -> Tensor:
@@ -2999,10 +4287,11 @@ def send(tensor: Tensor, tgt: int) -> Tensor:
 
     pfc = trt.PluginFieldCollection([tgt, pf_type])
     send_plug = send_plg_creator.create_plugin("send", pfc)
-    plug_inputs = [tensor.trt_tensor]
+    plug_inputs = [tensor.cast(p_dtype).trt_tensor]
 
     layer = default_trtnet().add_plugin_v2(plug_inputs, send_plug)
-    return _create_tensor(layer.get_output(0), layer)
+    _add_plugin_info(layer, send_plg_creator, "send", pfc)
+    return _create_tensor(layer.get_output(0), layer).cast(tensor.dtype)
 
 
 def recv(tensor: Tensor, src: int) -> Tensor:
@@ -3041,10 +4330,157 @@ def recv(tensor: Tensor, src: int) -> Tensor:
 
     pfc = trt.PluginFieldCollection([src, pf_type])
     recv_plug = recv_plg_creator.create_plugin("recv", pfc)
-    plug_inputs = [tensor.trt_tensor]
+    plug_inputs = [tensor.cast(p_dtype).trt_tensor]
 
     layer = default_trtnet().add_plugin_v2(plug_inputs, recv_plug)
-    return _create_tensor(layer.get_output(0), layer)
+    _add_plugin_info(layer, recv_plg_creator, "recv", pfc)
+    return _create_tensor(layer.get_output(0), layer).cast(tensor.dtype)
+
+
+def gemm_allreduce(a: Tensor,
+                   b: Tensor,
+                   group: List[int],
+                   transa: bool = False,
+                   transb: bool = False,
+                   alpha: Optional[Union[np.ndarray, Tensor]] = None,
+                   output_dtype: Optional[trt.DataType] = None,
+                   fp8_inputs_override: bool = False,
+                   a_sf: Optional[Tensor] = None,
+                   b_sf: Optional[Tensor] = None):
+    '''
+    Add an operation that performs fused GEMM+AllReduce.
+
+    Parameters:
+        a: Tensor
+            Input tensor A
+        b: Tensor
+            Input tensor B
+        a_sf: Optional[Tensor]
+            Input tensor for scaling input A
+        b_sf: Optional[Tensor]
+            Input tensor for scaling input B
+        group: List[int]
+            Ranks participating in collective
+        transa: bool
+            Whether or not input tensor A is transposed
+        transb: bool
+            Whether or not input tensor B is transposed
+        alpha: float
+            Alpha for GEMM -> beta * C + (alpha * acc)
+        output_dtype: trt.DataType
+            Output type for plugin. If it is None, we
+            will use type set in plugin_config.
+        fp8_inputs_override: bool
+            TRT graph does not detect FP8 inputs correctly. This
+            flag is used to override the derived input tensor
+            types so that our plugin knows to issue FP8 MMAs.
+
+    Returns:
+        Returns GEMM output tensor which has been reduced across ranks.
+    '''
+
+    # Output tensor needs to be bound to externally managed
+    # memory so keep track of layer index so we can assign
+    # output tensor unique label.
+    if not hasattr(gemm_allreduce, 'layer_idx'):
+        gemm_allreduce.layer_idx = 0
+
+    # Check inputs
+    assert isinstance(a.dtype, trt.DataType)
+    assert isinstance(b.dtype, trt.DataType)
+
+    if fp8_inputs_override:
+        assert (
+            isinstance(alpha, np.ndarray) and alpha.dtype == np.float32
+            and alpha.size == 1
+        ), "`alpha` must be passed as a float32 ndarray if `fp8_inputs_override` is enabled for gemm_allreduce_plugin"
+        assert a.dtype == trt.fp8
+        assert b.dtype == trt.fp8
+
+    if output_dtype is None:
+        output_dtype = str_dtype_to_trt(
+            default_net().plugin_config.gemm_allreduce_plugin)
+    assert output_dtype in [trt.float16, trt.bfloat16]
+
+    alpha_is_tensor = isinstance(alpha, Tensor)
+    if alpha is None or alpha_is_tensor:
+        alpha_value = np.array(1.0, dtype=np.float32)
+    else:
+        alpha_value = alpha
+
+    plugin_creator = trt.get_plugin_registry().get_plugin_creator(
+        'GemmAllReduce', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert plugin_creator is not None
+
+    trt_type_a = trt.fp8 if fp8_inputs_override else a.dtype
+    trt_type_b = trt.fp8 if fp8_inputs_override else b.dtype
+
+    # create plugin fields
+    field_list = []
+    field_list.append(
+        trt.PluginField('type_a', np.array([int(trt_type_a)], np.int32),
+                        trt.PluginFieldType.INT32))
+    field_list.append(
+        trt.PluginField('type_b', np.array([int(trt_type_b)], np.int32),
+                        trt.PluginFieldType.INT32))
+    field_list.append(
+        trt.PluginField('type_d', np.array([int(output_dtype)], np.int32),
+                        trt.PluginFieldType.INT32))
+    field_list.append(
+        trt.PluginField('transa', np.array(transa, dtype=np.int32),
+                        trt.PluginFieldType.INT32))
+    field_list.append(
+        trt.PluginField('transb', np.array(transb, dtype=np.int32),
+                        trt.PluginFieldType.INT32))
+    field_list.append(
+        trt.PluginField('group', np.array(group, dtype=np.int32),
+                        trt.PluginFieldType.INT32))
+    field_list.append(
+        trt.PluginField('has_sfa', np.array([int(a_sf is not None)], np.int8),
+                        trt.PluginFieldType.INT8))
+    field_list.append(
+        trt.PluginField('has_sfb', np.array([int(b_sf is not None)], np.int8),
+                        trt.PluginFieldType.INT8))
+    field_list.append(
+        trt.PluginField('alpha_is_ptr', np.array([int(alpha_is_tensor)],
+                                                 np.int8),
+                        trt.PluginFieldType.INT8))
+    field_list.append(
+        trt.PluginField('alpha', alpha_value.flatten(),
+                        trt.PluginFieldType.FLOAT32))
+
+    # create plugin
+    fields = trt.PluginFieldCollection(field_list)
+    plugin = plugin_creator.create_plugin("gemm_allreduce", fields)
+    # define symbolic input tensors.
+    # note this does NOT allocate memory.
+    inputs = [a.trt_tensor, b.trt_tensor]
+    if a_sf is not None:
+        inputs += [a_sf.trt_tensor]
+    if b_sf is not None:
+        inputs += [b_sf.trt_tensor]
+    if alpha_is_tensor:
+        inputs += [alpha.trt_tensor]
+
+    layer = default_trtnet().add_plugin_v2(inputs, plugin)
+    _add_plugin_info(layer, plugin_creator, "gemm_allreduce", fields)
+    # define symbolic output tensors
+    # both output tensors point to same physical memory but
+    # one has unicast address and other has multicast address
+    uc_output = _create_tensor(layer.get_output(0), layer)
+    mc_output = _create_tensor(layer.get_output(1), layer)
+    ipc_output = _create_tensor(layer.get_output(2), layer)
+    assert uc_output is not None
+    assert mc_output is not None
+    assert ipc_output is not None
+    # mark outputs so that we can bind our own allocated memory in runtime
+    # (see generation.py)
+    uc_output.mark_output(f'gemm_allreduce_uc_out_{gemm_allreduce.layer_idx}')
+    mc_output.mark_output(f'gemm_allreduce_mc_out_{gemm_allreduce.layer_idx}')
+    ipc_output.mark_output(f'gemm_allreduce_ipc_out_{gemm_allreduce.layer_idx}')
+    gemm_allreduce.layer_idx += 1
+
+    return uc_output
 
 
 def bert_attention(tensor: Tensor,
@@ -3055,11 +4491,18 @@ def bert_attention(tensor: Tensor,
                    relative_attention: bool = False,
                    relative_attention_bias: Tensor = None,
                    max_distance: int = 0,
-                   max_input_length: Tensor = None) -> Tuple[Tensor]:
+                   max_input_length: Tensor = None,
+                   sage_attn: bool = False,
+                   sage_attn_q_block_size: int = 0,
+                   sage_attn_k_block_size: int = 0,
+                   sage_attn_v_block_size: int = 0,
+                   cp_group: list[int] = None,
+                   cp_size: int = 1,
+                   cp_rank: int = 0) -> Tuple[Tensor]:
     '''
     Add an operation that performs the multi-head attention in BERT.
 
-    The multihead-attention (MHA) is the sequence of a batched matmul, a
+    The multi-head attention (MHA) is the sequence of a batched matmul, a
     softmax and a batched matmul as described in
     https://arxiv.org/abs/1706.03762. That function adds an operation that
     performs those computations using a single GPU kernel.
@@ -3104,10 +4547,32 @@ def bert_attention(tensor: Tensor,
             The maximum distance of relative position in attention, for implicit mode.
             Default value is 0, meaning to use the regular mode of relative attention bias.
             Implicit mode is only enabled when passing in non-zero positive max_distance value.
-            See relative attention bias in docs/gpt_attention.md
+            See relative attention bias in docs/source/advanced/gpt-attention.md
 
         max_input_length: Tensor = None
             The maximum input sequence length represented by Tensor shape. Requires for remove_input_padding to pre-define plugin workspace size.
+
+        sage_attn: bool = False
+            SageAttention is a 8-bit implementation of attention kernel. It's input q, k, v and output datatypes are 16-bit. It performance dynamic quantization for q, k, v
+            tensor every time before attention. https://github.com/thu-ml/SageAttention
+
+        sage_attn_q_quant_size: int = 0
+            dynamic quant block size along sequence dimension of q tensor. Each quant block will share one scale.
+
+        sage_attn_k_quant_size: int = 0
+            dynamic quant block size along sequence dimension of k tensor. Each quant block will share one scale.
+
+        sage_attn_v_quant_size: int = 0
+            dynamic quant block size along sequence dimension of v tensor. Each quant block will share one scale.
+
+        cp_group: list[int] = None
+            The communication group for context parallel
+
+        cp_size: int = 1
+            The communication size for context parallel
+
+        cp_rank: int = 0
+            The communication rank for context parallel
 
     Returns:
         The tensor produced by that layer.
@@ -3124,11 +4589,6 @@ def bert_attention(tensor: Tensor,
     q_scaling = trt.PluginField("q_scaling",
                                 np.array(q_scaling, dtype=np.float32),
                                 trt.PluginFieldType.FLOAT32)
-    enable_qk_half_accum = trt.PluginField(
-        "enable_qk_half_accum",
-        np.array(np.int8(
-            default_net().plugin_config.attention_qk_half_accumulation),
-                 dtype=np.int8), trt.PluginFieldType.INT8)
     context_fmha_type = trt.PluginField(
         "context_fmha_type",
         np.array(np.int8(default_net().plugin_config.context_fmha_type),
@@ -3148,9 +4608,51 @@ def bert_attention(tensor: Tensor,
         "remove_padding",
         np.array(np.int8(default_net().plugin_config.remove_input_padding),
                  dtype=np.int8), trt.PluginFieldType.INT8)
+
+    sage_attn = trt.PluginField("sage_attn",
+                                np.array(np.int8(sage_attn), dtype=np.int8),
+                                trt.PluginFieldType.INT8)
+
+    sage_attn_q_block_size = trt.PluginField(
+        "sage_attn_q_block_size",
+        np.array(sage_attn_q_block_size, dtype=np.int32),
+        trt.PluginFieldType.INT32)
+
+    sage_attn_k_block_size = trt.PluginField(
+        "sage_attn_k_block_size",
+        np.array(sage_attn_k_block_size, dtype=np.int32),
+        trt.PluginFieldType.INT32)
+
+    sage_attn_v_block_size = trt.PluginField(
+        "sage_attn_v_block_size",
+        np.array(sage_attn_v_block_size, dtype=np.int32),
+        trt.PluginFieldType.INT32)
+
+    if cp_size > 1:
+        # transpose q,k,v inside qkv to make kv contiguous, which is required by ring attention
+        # (b, s, 3d)
+        query, key, value = chunk(tensor, 3, dim=-1)
+        bs = shape(query, 0)
+        seq_len = shape(query, 1)
+        # (b, s, d) -> (b, s, 2d) -> (2b, s, d)
+        kv = concat([key, value],
+                    dim=-1).view(concat((2 * bs, seq_len, query.shape[-1])))
+        tensor = concat((query, kv),
+                        dim=0).view(concat((bs, seq_len, query.shape[-1] * 3)))
+
+    cp_size = trt.PluginField("cp_size", np.array(cp_size, dtype=np.int32),
+                              trt.PluginFieldType.INT32)
+    cp_rank = trt.PluginField("cp_rank", np.array(cp_rank, dtype=np.int32),
+                              trt.PluginFieldType.INT32)
+    cp_group = cp_group or [0]
+    cp_group = np.array(cp_group, dtype=np.int32)
+    cp_group = trt.PluginField("cp_group", cp_group, trt.PluginFieldType.INT32)
+
     pfc = trt.PluginFieldCollection([
-        nheads, head_size, q_scaling, enable_qk_half_accum, context_fmha_type,
-        pf_type, do_relative_attention, max_distance, remove_padding
+        nheads, head_size, q_scaling, context_fmha_type, pf_type,
+        do_relative_attention, max_distance, remove_padding, sage_attn,
+        sage_attn_q_block_size, sage_attn_k_block_size, sage_attn_v_block_size,
+        cp_size, cp_rank, cp_group
     ])
 
     attn_plug = attn_plg_creator.create_plugin("padding_attn", pfc)
@@ -3165,6 +4667,7 @@ def bert_attention(tensor: Tensor,
     plug_inputs = [i.trt_tensor for i in plug_inputs]
 
     layer = default_trtnet().add_plugin_v2(plug_inputs, attn_plug)
+    _add_plugin_info(layer, attn_plg_creator, "padding_attn", pfc)
     assert layer.num_outputs == 1, \
         f"Plugin outputs number mismatch with expected, got {layer.num_outputs}, expected 1"
     output = _create_tensor(layer.get_output(0), layer)
@@ -3172,46 +4675,647 @@ def bert_attention(tensor: Tensor,
     return output
 
 
+class RopeEmbeddingUtils:
+
+    @staticmethod
+    # ref: https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_rope_utils.py#L298
+    def apply_llama3_scaling(inv_freqs: np.ndarray, rope_scaling_config: dict):
+
+        scale_factor = rope_scaling_config.get("factor", 8.0)
+        low_freq_factor = rope_scaling_config.get("low_freq_factor", 1.0)
+        high_freq_factor = rope_scaling_config.get("high_freq_factor", 4.0)
+        old_context_len = rope_scaling_config.get(
+            "original_max_position_embeddings", 8192)
+
+        low_freq_wavelen = old_context_len / low_freq_factor
+        high_freq_wavelen = old_context_len / high_freq_factor
+        new_inv_freqs = []
+        for inv_freq in inv_freqs:
+            wavelen = 2 * math.pi / inv_freq
+            if wavelen < high_freq_wavelen:
+                new_inv_freqs.append(inv_freq)
+            elif wavelen > low_freq_wavelen:
+                new_inv_freqs.append(inv_freq / scale_factor)
+            else:
+                assert low_freq_wavelen != high_freq_wavelen
+                smooth = (old_context_len / wavelen - low_freq_factor) / (
+                    high_freq_factor - low_freq_factor)
+                new_inv_freqs.append((1 - smooth) * inv_freq / scale_factor +
+                                     smooth * inv_freq)
+        return np.array(new_inv_freqs, dtype=inv_freqs.dtype)
+
+    @staticmethod
+    def create_sinusoidal_positions(num_pos: int,
+                                    dim: int,
+                                    theta: float = 10000.0,
+                                    dtype=np.float32):
+        inv_freq = 1.0 / (theta**(np.arange(0, dim, 2) / dim)).astype(dtype)
+        sinusoid_inp = np.einsum("i , j -> i j",
+                                 np.arange(num_pos, dtype=dtype),
+                                 inv_freq,
+                                 dtype=dtype)
+        concat = np.concatenate((np.sin(sinusoid_inp), np.cos(sinusoid_inp)),
+                                axis=1)
+        return np.expand_dims(concat, axis=0).astype(dtype)
+
+    @staticmethod
+    def create_sinusoidal_positions_for_attention_plugin(
+            num_pos: int,
+            dim: int,
+            theta: float = 10000.0,
+            scale: float = 1.0,
+            scale_type: RotaryScalingType = RotaryScalingType.none,
+            # Other scaling configs that only used by certain scaling types.
+            rope_scaling_config: dict = None,
+            dtype=np.float32):
+        if scale_type == RotaryScalingType.linear:
+            scale = 1.0 / scale
+        if scale_type == RotaryScalingType.llama3:
+            assert rope_scaling_config is not None, "rotary_scaling config must be provided."
+            inv_freq = 1.0 / (theta**(np.arange(0, dim, 2) / dim)).astype(dtype)
+            inv_freq = RopeEmbeddingUtils.apply_llama3_scaling(
+                inv_freq, rope_scaling_config)
+        elif scale_type == RotaryScalingType.dynamic:
+            # Make sure scaling_alpha exists in rope_scaling
+            # Ref: https://huggingface.co/tencent/Hunyuan-A13B-Instruct-FP8/blob/main/modeling_hunyuan.py#L346
+            assert rope_scaling_config[
+                "alpha"] is not None, "rope_scaling_config.alpha must be provided."
+            scaling_alpha = rope_scaling_config["alpha"]
+            adjusted_base = theta * (scaling_alpha**(dim / (dim - 2)))
+            inv_freq = 1.0 / (adjusted_base**(
+                np.arange(0, dim, 2, dtype=dtype) / dim)).astype(dtype)
+        else:
+            inv_freq = scale / (theta
+                                **(np.arange(0, dim, 2) / dim)).astype(dtype)
+        sinusoid_inp = np.expand_dims(np.einsum("i , j -> i j",
+                                                np.arange(num_pos, dtype=dtype),
+                                                inv_freq,
+                                                dtype=dtype),
+                                      axis=-1)
+        # fuse cos/sin into float2 (cos, sin).
+        concat = np.concatenate(
+            (np.cos(sinusoid_inp), np.sin(sinusoid_inp)),
+            axis=-1)  #np.cos(sinusoid_inp).shape = (32768, 64, 1)
+
+        return inv_freq, concat.reshape(1, -1).astype(dtype)
+
+    @staticmethod
+    def create_sinusoidal_positions_for_cogvlm_attention_plugin(
+            num_pos: int,
+            dim: int,
+            theta: float = 10000.0,
+            scale: float = 1.0,
+            scale_type: RotaryScalingType = RotaryScalingType.none,
+            vision_start: int = 1,
+            vision_length: int = 1225,
+            dtype=np.float32):
+        if scale_type == RotaryScalingType.linear:
+            scale = 1.0 / scale
+        inv_freq = scale / (theta**(np.arange(0, dim, 2) / dim)).astype(dtype)
+        position_id = np.hstack([
+            np.arange(0, vision_start + 1, dtype=dtype),
+            np.full(vision_length, vision_start + 1, dtype=dtype),
+            np.arange(vision_start + 2,
+                      num_pos - (vision_length - 1),
+                      dtype=dtype)
+        ])
+        sinusoid_inp = np.expand_dims(np.einsum("i , j -> i j",
+                                                position_id,
+                                                inv_freq,
+                                                dtype=dtype),
+                                      axis=-1)
+        # fuse cos/sin into float2 (cos, sin).
+        concat = np.concatenate((np.cos(sinusoid_inp), np.sin(sinusoid_inp)),
+                                axis=-1)
+
+        return inv_freq, concat.reshape(1, -1).astype(dtype)
+
+    def create_sinusoidal_positions_long_rope_for_attention_plugin(
+            num_pos: int,
+            num_orig_pos: int,
+            dim: int,
+            theta: float = 10000.0,
+            scaling_short_factors: Tensor = 1.0,
+            scaling_long_factors: Tensor = 1.0,
+            short_mscale=None,
+            long_mscale=None,
+            dtype=np.float32):
+
+        def _calc_mscale(scale):
+            if scale <= 1.0:
+                return 1.0
+            return math.sqrt(1 + math.log(scale) / math.log(num_orig_pos))
+
+        if short_mscale is None:
+            short_mscale = _calc_mscale(num_pos / num_orig_pos)
+            long_mscale = short_mscale
+
+        def _compute_sinusoidal_positions(scale_factors, is_short,
+                                          for_attention_plugin):
+            inv_freq = 1 / (scale_factors *
+                            (theta**(np.arange(0, dim, 2) / dim)).astype(dtype))
+            sinusoid_inp = np.einsum("i , j -> i j",
+                                     np.arange(num_pos, dtype=dtype),
+                                     inv_freq,
+                                     dtype=dtype)
+
+            if for_attention_plugin:
+                sinusoid_inp = np.expand_dims(sinusoid_inp, axis=-1)
+                concat = np.concatenate(
+                    (np.cos(sinusoid_inp), np.sin(sinusoid_inp)), axis=-1)
+            else:
+                concat = np.concatenate(
+                    (np.sin(sinusoid_inp), np.cos(sinusoid_inp)), axis=1)
+                concat = np.expand_dims(concat, axis=0)
+
+            mscale = short_mscale if is_short else long_mscale
+            concat = concat.astype(dtype) * mscale
+
+            # gpt attention plugins also need inv_freq.
+            if for_attention_plugin:
+                return inv_freq.reshape(1, -1), concat.reshape(1, -1)
+            else:
+                return concat
+
+        return _compute_sinusoidal_positions(
+            scaling_short_factors, True, False), _compute_sinusoidal_positions(
+                scaling_long_factors,
+                False, False), _compute_sinusoidal_positions(
+                    scaling_short_factors, True,
+                    True), _compute_sinusoidal_positions(
+                        scaling_long_factors, False, True), short_mscale
+
+    @staticmethod
+    def create_sinusoidal_positions_long_rope(
+            num_pos: int,
+            dim: int,
+            theta: float,
+            original_max_pos: int,
+            short_factor: List[float],
+            long_factor: List[float],
+            dtype=np.float32,
+            max_seq_len: Optional[int] = None):
+        short_factor = np.array(short_factor, dtype=np.float32)
+        long_factor = np.array(long_factor, dtype=np.float32)
+
+        inv_freq = 1.0 / (theta**(np.arange(0, dim, 2, dtype=np.float32) / dim))
+        t_pos = np.arange(np.max([num_pos, original_max_pos]), dtype=np.float32)
+
+        # Choose proper freqs based on max_seq_len.
+        factor = long_factor if max_seq_len is None or max_seq_len > original_max_pos else short_factor
+        inv_freq = inv_freq / factor
+        freqs = np.einsum("i,j->ij", t_pos, inv_freq)
+        sinusoid_inp = freqs.astype(np.float32)[..., np.newaxis]
+
+        # Apply scaling
+        scale = num_pos / original_max_pos
+        if scale <= 1.0:
+            scaling_factor = 1.0
+        else:
+            scaling_factor = np.sqrt(1.0 +
+                                     np.log(scale) / np.log(original_max_pos))
+
+        # fuse cos/sin into float2 (cos, sin).
+        concat = np.concatenate(
+            (np.cos(sinusoid_inp) * scaling_factor,
+             np.sin(sinusoid_inp) * scaling_factor),
+            axis=-1,
+        )
+
+        return None, concat.reshape(1, -1).astype(dtype)
+
+    @staticmethod
+    def create_fake_weight(dim: int, dtype=np.half):
+        return np.random.rand(dim).astype(dtype)
+
+    # Note: When not using deepseek_yarn, make sure to set mscale_all_dim to 0.0.
+    @staticmethod
+    def create_sinusoidal_positions_yarn(
+            num_pos: int,
+            dim: int,
+            base: int = 10000,
+            scaling_factor: float = 1.0,
+            original_max_position_embeddings: int = 4096,
+            beta_fast: int = 32,
+            beta_slow: int = 1,
+            mscale: float = 1.0,
+            mscale_all_dim: float = 1.0,
+            duplicate_data: bool = True,
+            dtype=torch.float32):
+
+        # Copy from https://huggingface.co/deepseek-ai/DeepSeek-V2/blob/main/modeling_deepseek.py
+        # Inverse dim formula to find dim based on number of rotations
+        def yarn_find_correction_dim(num_rotations, dim, base,
+                                     max_position_embeddings):
+            return (dim * math.log(max_position_embeddings /
+                                   (num_rotations * 2 * math.pi))) / (
+                                       2 * math.log(base))
+
+        # Find dim range bounds based on rotations
+        def yarn_find_correction_range(low_rot, high_rot, dim, base,
+                                       max_position_embeddings):
+            low = math.floor(
+                yarn_find_correction_dim(low_rot, dim, base,
+                                         max_position_embeddings))
+            high = math.ceil(
+                yarn_find_correction_dim(high_rot, dim, base,
+                                         max_position_embeddings))
+            if low < 0:
+                low = 0
+            if high > dim - 1:
+                high = dim - 1
+            return low, high  # Clamp values just in case
+
+        def yarn_get_mscale(scale, mscale):
+            if scale <= 1:
+                return 1.0
+            return 0.1 * mscale * math.log(scale) + 1.0
+
+        def yarn_linear_ramp_mask(min, max, dim):
+            if min == max:
+                max += 0.001  # Prevent singularity
+
+            linear_func = (torch.arange(dim, dtype=dtype) - min) / (max - min)
+            ramp_func = torch.clamp(linear_func, 0, 1)
+            return ramp_func
+
+        pos_freqs = base**(torch.arange(0, dim, 2, dtype=dtype) / dim)
+        freq_extra = 1.0 / pos_freqs
+        freq_inter = 1.0 / (scaling_factor * pos_freqs)
+
+        low, high = yarn_find_correction_range(
+            beta_fast,
+            beta_slow,
+            dim,
+            base,
+            original_max_position_embeddings,
+        )
+        inv_freq_mask = (1 - yarn_linear_ramp_mask(low, high, dim // 2))
+        inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
+        t = torch.arange(num_pos, dtype=dtype)
+        sinusoid_inp = torch.einsum("i,j -> ij", t, inv_freq).unsqueeze(-1)
+
+        _mscale = float(
+            yarn_get_mscale(scaling_factor, mscale) /
+            yarn_get_mscale(scaling_factor, mscale_all_dim))
+
+        if duplicate_data:
+            emb = torch.cat((sinusoid_inp, sinusoid_inp), dim=-2)
+        else:
+            emb = sinusoid_inp
+
+        concat = torch.cat((torch.cos(emb) * _mscale, torch.sin(emb) * _mscale),
+                           dim=-1)
+        return inv_freq.numpy(), concat.reshape((1, -1)).to(dtype).numpy()
+
+    @staticmethod
+    def rotate_every_two(tensor: Tensor) -> Tensor:
+        assert tensor.ndim() == 4
+
+        shape_tensor = concat([
+            shape(tensor, i) / 2 if i == (tensor.ndim() -
+                                          1) else shape(tensor, i)
+            for i in range(tensor.ndim())
+        ])
+        x1 = slice(tensor, [0, 0, 0, 0], shape_tensor, [1, 1, 1, 2])
+        x2 = slice(tensor, [0, 0, 0, 1], shape_tensor, [1, 1, 1, 2])
+        x1 = expand_dims(x1, 4)
+        x2 = expand_dims(x2, 4)
+        zero = constant(
+            np.ascontiguousarray(
+                np.zeros([1], dtype=trt_dtype_to_np(tensor.dtype))))
+        x2 = zero - x2
+        x = concat([x2, x1], 4)
+        return view(
+            x, concat([shape(x, 0),
+                       shape(x, 1),
+                       shape(x, 2),
+                       shape(x, 3) * 2]))
+
+    @staticmethod
+    def rotate_half(tensor: Tensor) -> Tensor:
+        # [bs, num_attention_kv_heads, seqlen, attention_head_size]
+        assert tensor.ndim() == 4
+        shape_tensor = concat([
+            shape(tensor, i) / 2 if i == (tensor.ndim() -
+                                          1) else shape(tensor, i)
+            for i in range(tensor.ndim())
+        ])
+        last_dim = shape(tensor, tensor.ndim() - 1) / 2
+        x1 = slice(tensor, [0, 0, 0, 0], shape_tensor, [1, 1, 1, 1])
+        x2 = slice(tensor, concat([0, 0, 0, last_dim]), shape_tensor,
+                   [1, 1, 1, 1])
+        zero = constant(
+            np.ascontiguousarray(
+                np.zeros([1], dtype=trt_dtype_to_np(tensor.dtype))))
+        x2 = zero - x2
+        x = concat([x2, x1], 3)
+        return x
+
+    @staticmethod
+    def apply_rotary_pos_emb(
+        tensor: Tensor,
+        position_embedding: List[Tensor] = None,
+        pos_emb_type: PositionEmbeddingType = PositionEmbeddingType.rope_gptj
+    ) -> Tensor:
+
+        rotate_func = None
+        if pos_emb_type == PositionEmbeddingType.rope_gpt_neox or pos_emb_type == PositionEmbeddingType.long_rope:
+            assert len(position_embedding) == 2
+            cos, sin = position_embedding
+            sin = expand_dims(sin, 2)
+            cos = expand_dims(cos, 2)
+            sin = concat([sin, sin], 3)
+            cos = concat([cos, cos], 3)
+            rotate_func = RopeEmbeddingUtils.rotate_half
+        elif pos_emb_type == PositionEmbeddingType.rope_gptj:
+            assert len(position_embedding) == 2
+            cos, sin = position_embedding
+            sin = expand_dims(sin, 2)
+            cos = expand_dims(cos, 2)
+            sin = repeat_interleave(sin, 2, 3)
+            cos = repeat_interleave(cos, 2, 3)
+            rotate_func = RopeEmbeddingUtils.rotate_every_two
+        elif pos_emb_type == PositionEmbeddingType.chatglm:
+            assert len(position_embedding) == 4
+            cos0, cos1, sin0, sin1 = position_embedding
+            shape_tensor = concat([
+                shape(tensor, i) / 2 if i == (tensor.ndim() -
+                                              1) else shape(tensor, i)
+                for i in range(tensor.ndim())
+            ])
+            last_dim = shape(tensor, tensor.ndim() - 1) / 2
+            x_part0 = slice(tensor, [0, 0, 0, 0], shape_tensor, [1, 1, 1, 1])
+            x_part1 = slice(tensor, concat([0, 0, 0, last_dim]), shape_tensor,
+                            [1, 1, 1, 1])
+
+            y_part0 = (x_part0 *
+                       cos0) + (RopeEmbeddingUtils.rotate_half(x_part0) * sin0)
+            y_part1 = (x_part1 *
+                       cos1) + (RopeEmbeddingUtils.rotate_half(x_part1) * sin1)
+
+            result = concat([y_part0, y_part1], dim=3)
+            return result.view(shape(tensor))
+
+        else:
+            raise ValueError('The PositionEmbeddingType is not RoPE')
+        return (tensor * cos) + (rotate_func(tensor) * sin)
+
+    @staticmethod
+    def apply_rotary_pos_emb_chatglm(qkv, position_embedding,
+                                     num_attention_heads, attention_head_size,
+                                     max_position_embeddings,
+                                     rotary_embedding_scale,
+                                     remove_input_padding) -> Tensor:
+
+        half_head_size = attention_head_size // 2
+        input = qkv[0] if isinstance(qkv, list) else qkv
+        input_shape = shape(input)
+        batch_size = 1 if remove_input_padding else shape(input, 0)
+        seqlen = shape(input, 0 if remove_input_padding else 1)
+        if isinstance(qkv, list):
+            query, key, value = qkv
+        else:
+            qkv = qkv.view(
+                concat([
+                    batch_size,
+                    seqlen,
+                    num_attention_heads,
+                    3,
+                    attention_head_size,
+                ]))
+            query, key, value = split(qkv, 1, dim=3)
+        q_shape = concat([
+            batch_size,
+            seqlen,
+            num_attention_heads,
+            attention_head_size,
+        ])
+        query = query.view(q_shape)
+        key = key.view(q_shape)
+        value = value.view(q_shape)
+
+        embedding_weight = RopeEmbeddingUtils.create_sinusoidal_positions(
+            max_position_embeddings, half_head_size)
+        embedding_weight /= rotary_embedding_scale
+        embedding_weight = np.split(embedding_weight.squeeze(0), 2, axis=1)
+        embedding_weight = np.concatenate(
+            [
+                embedding_weight[0],
+                embedding_weight[0],
+                embedding_weight[1],
+                embedding_weight[1],
+            ],
+            axis=1,
+        )
+
+        if remove_input_padding:
+            position_embedding = unsqueeze(position_embedding, 0)
+
+        embedding_weight = embedding_weight.astype(trt_dtype_to_np(query.dtype))
+        embedding_weight = constant(embedding_weight)
+        position_embedding = embedding(position_embedding, embedding_weight)
+        position_embedding, block_embedding = split(
+            position_embedding,
+            1,
+            dim=1,
+        )
+        sin0, cos0 = split(position_embedding, half_head_size, dim=3)
+        sin1, cos1 = split(block_embedding, half_head_size, dim=3)
+
+        new_shape = concat([
+            batch_size,
+            seqlen,
+            1,
+            half_head_size,
+        ])
+        position_embedding = [
+            tensor.view(new_shape) for tensor in [cos0, cos1, sin0, sin1]
+        ]
+
+        query = RopeEmbeddingUtils.apply_rotary_pos_emb(
+            tensor=query,
+            position_embedding=position_embedding,
+            pos_emb_type=PositionEmbeddingType.chatglm)
+        key = RopeEmbeddingUtils.apply_rotary_pos_emb(
+            tensor=key,
+            position_embedding=position_embedding,
+            pos_emb_type=PositionEmbeddingType.chatglm)
+
+        if isinstance(qkv, list):
+            qkv = [
+                query.view(input_shape),
+                key.view(input_shape),
+                value.view(input_shape),
+            ]
+        else:
+            qkv = concat([query, key, value], dim=2)
+            qkv = qkv.view(input_shape)
+
+        return qkv
+
+    @staticmethod
+    def apply_rotary_pos_emb_cogvlm(qkv, position_embedding,
+                                    num_attention_heads, attention_head_size,
+                                    max_position_embeddings,
+                                    rotary_embedding_scale,
+                                    remove_input_padding) -> Tensor:
+        input = qkv[0] if isinstance(qkv, list) else qkv
+        input_shape = shape(input)
+        batch_size = 1 if remove_input_padding else shape(input, 0)
+        seqlen = shape(input, 0 if remove_input_padding else 1)
+        if isinstance(qkv, list):
+            query, key, value = qkv
+        else:
+            qkv = qkv.view(
+                concat([
+                    batch_size,
+                    seqlen,
+                    3,
+                    num_attention_heads,
+                    attention_head_size,
+                ]))
+            query, key, value = split(qkv, 1, dim=2)
+        q_shape = concat([
+            batch_size,
+            seqlen,
+            num_attention_heads,
+            attention_head_size,
+        ])
+        query = query.view(q_shape)
+        key = key.view(q_shape)
+        value = value.view(q_shape)
+
+        embedding_weight = RopeEmbeddingUtils.create_sinusoidal_positions(
+            max_position_embeddings, attention_head_size).squeeze(0)
+        embedding_weight /= rotary_embedding_scale  # [max_position_embeddings, attention_head_size]
+
+        if remove_input_padding:
+            position_embedding = unsqueeze(position_embedding, 0)  # [1, seqlen]
+
+        embedding_weight = constant(embedding_weight)  # float32
+        position_embedding = embedding(
+            position_embedding,
+            embedding_weight)  # [1, seqlen, attention_head_size]
+        sin, cos = split(position_embedding, attention_head_size // 2,
+                         dim=-1)  # [1, seqlen, attention_head_size//2]
+
+        input_dtype = query.dtype
+        fp32_query = cast(query, "float32")
+        fp32_key = cast(key, "float32")
+        fp32_query = RopeEmbeddingUtils.apply_rotary_pos_emb(
+            tensor=fp32_query,
+            position_embedding=[cos, sin],
+            pos_emb_type=PositionEmbeddingType.rope_gpt_neox)
+        fp32_key = RopeEmbeddingUtils.apply_rotary_pos_emb(
+            tensor=fp32_key,
+            position_embedding=[cos, sin],
+            pos_emb_type=PositionEmbeddingType.rope_gpt_neox)
+
+        query = cast(fp32_query, input_dtype)
+        key = cast(fp32_key, input_dtype)
+
+        if isinstance(qkv, list):
+            qkv = [
+                query.view(input_shape),
+                key.view(input_shape),
+                value.view(input_shape),
+            ]
+        else:
+            qkv = concat([query, key, value], dim=2)
+            qkv = qkv.view(input_shape)
+
+        return qkv
+
+
 @gw.record_signature
 def gpt_attention(
+    *,
     qkv: Tensor,
     past_key_value: Tensor,
+    attention_mask: Optional[Tensor] = None,
+    attention_packed_mask: Optional[Tensor] = None,
     sequence_length: Tensor,
     host_past_key_value_lengths: Optional[Tensor],
     host_max_attention_window_sizes: Tensor,
+    host_sink_token_length: Tensor,
     context_lengths: Optional[Tensor],
     cache_indirection: Optional[Tensor],
     host_request_types: Tensor,
+    layer_idx: int,
     num_heads: int,
     num_kv_heads: int,
     hidden_size_per_head: int,
     q_scaling: float,
+    attn_logit_softcapping_scale: float = 0.0,
     rotary_embedding_dim: int = 0,
     rotary_embedding_base: float = 10000.0,
     rotary_embedding_scale_type: RotaryScalingType = RotaryScalingType.none,
+    rotary_embedding_short_m_scale: float = 1.0,
+    rotary_embedding_long_m_scale: float = 1.0,
     rotary_embedding_scale: float = 1.0,
     rotary_embedding_max_positions: int = 1024,
+    rotary_embedding_original_max_positions: int = 1024,
     position_embedding_type: PositionEmbeddingType = PositionEmbeddingType.
     learned_absolute,
+    rotary_inv_freq: Optional[Tensor] = None,
+    rotary_cos_sin: Optional[Tensor] = None,
     kv_orig_quant_scale: Optional[Tensor] = None,
     kv_quant_orig_scale: Optional[Tensor] = None,
-    kv_cache_quant_mode: QuantMode = QuantMode(0),
+    attention_output_orig_quant_scale: Optional[Tensor] = None,
+    attention_output_sf_scale: Optional[Tensor] = None,
+    kv_cache_quant_mode: Union[QuantModeWrapper, QuantMode] = QuantMode(0),
     max_context_length: Optional[int] = None,
     mask_type: AttentionMaskType = AttentionMaskType.causal,
+    block_sparse_block_size: int = 64,
+    block_sparse_homo_head_pattern: bool = False,
+    block_sparse_num_local_blocks: int = 16,
+    block_sparse_vertical_stride: int = 8,
     alibi_slopes: Optional[Tensor] = None,
     tp_size: int = 1,
     tp_rank: int = 0,
-    kv_cache_block_pointers: Optional[Tensor] = None,
-    host_kv_cache_block_pointers: Tensor = None,
+    vision_start: int = -1,
+    vision_length: int = -1,
+    kv_cache_block_offsets: Optional[Tensor] = None,
+    host_kv_cache_block_offsets: Tensor = None,
+    host_kv_cache_pool_pointers: Tensor = None,
+    host_kv_cache_pool_mapping: Tensor = None,
     do_cross_attention: bool = False,
-    cross_qkv: Optional[Tensor] = None,  # for cross attention
-    cross_qkv_length: Optional[Tensor] = None,  # for cross attention
+    cross_kv: Optional[Tensor] = None,  # for cross attention
+    cross_kv_length: Optional[Tensor] = None,  # for cross attention
     encoder_input_lengths: Optional[Tensor] = None,  # for cross attention
     relative_attention_bias: Optional[Tensor] = None,  # for relative attention
+    logn_scaling: Optional[Tensor] = None,  # for logn scaling
     max_distance: int = 0,  # for relative attention
     host_context_lengths: Optional[Tensor] = None,  # for pad-free input mode
     qkv_bias: Optional[Tensor] = None,
     use_cache: bool = True,
+    spec_decoding_is_generation_length_variable: bool = False,
+    spec_decoding_max_generation_length: int = 0,
+    spec_decoding_generation_lengths: Tensor = None,
+    spec_decoding_position_offsets: Tensor = None,
+    spec_decoding_packed_mask: Tensor = None,
+    spec_decoding_use: Tensor = None,
+    long_rope_rotary_inv_freq: Optional[Tensor] = None,
+    long_rope_rotary_cos_sin: Optional[Tensor] = None,
+    mrope_rotary_cos_sin: Tensor = None,
+    mrope_position_deltas: Tensor = None,
+    host_runtime_perf_knobs: Optional[Tensor] = None,
+    host_context_progress: Tensor = None,
+    is_mla_enabled_flag: bool = False,
+    q_lora_rank: int = 0,
+    kv_lora_rank: int = 0,
+    qk_nope_head_dim: int = 0,
+    qk_rope_head_dim: int = 0,
+    v_head_dim: int = 0,
+    q_b_proj: Optional[Tensor] = None,
+    kv_b_proj: Optional[Tensor] = None,
+    k_b_proj_trans: Optional[Tensor] = None,
+    skip_attn=None,
+    cp_group: List[int] = [0],
+    cp_size: int = 1,
+    cp_rank: int = 0,
+    num_kv_heads_origin: int = -1,
 ) -> Tuple[Tensor, Optional[Tensor]]:
     '''
     Add an operation that performs the multi-head attention in GPT-like models.
@@ -3222,23 +5326,31 @@ def gpt_attention(
     arguments that are likely to be removed or merged with others in the future
     release.
 
-    See docs/gpt_attention.md for the documentation of that function.
+    See docs/source/advanced/gpt-attention.md for the documentation of that function.
 
     Parameters:
         qkv: Tensor (On GPU)
-            The input QKV tensor. Its shape is [batch_beam_size, max_seqlen, qkv_dim] in padded mode and [1, num_tokens, qkv_dim] in
-            packed mode. Where qkv_dim depends on using MQA, GQA, or MHA. See QKV Input in docs/gpt_attention.md,
+            The input QKV tensor. Its shape is [batch_beam_size, max_seqlen, qkv_dim] in padded mode and [num_tokens, qkv_dim] in
+            packed mode. Where qkv_dim depends on using MQA, GQA, or MHA. See QKV Input in docs/source/advanced/gpt-attention.md,
 
         past_key_value: Tensor (On GPU)
             The tensor that stores KV cache data. Its shape is
             [max_batch_size * max_beam_width, 2, num_kv_heads, max_seqlen, hidden_dim_per_head]
             in contiguous mode and
             [max_blocks, 2, num_kv_heads, num_tokens_per_block, hidden_dim_per_head]
-            in paged mode. See KV Cache in docs/gpt_attention.md,
+            in paged mode. See KV Cache in docs/source/advanced/gpt-attention.md,
+
+        attention_mask: Tensor (On GPU)
+            The tensor that stores the attention mask for unfused MHA or MMHA.
+            Its shape is [num_tokens, max_kv_seqlen].
+
+        attention_packed_mask: Tensor (On GPU)
+            The tensor that stores the packed custom mask for fmha.
+            Its shape is [num_tokens, max_kv_seqlen / 32], where each bit represents one mask position.
 
         sequence_lengths: Tensor (On GPU)
             The tensor that stores the length of each sequence. Its shape is
-            [batch_size]. See QKV Input in docs/gpt_attention.md,
+            [batch_size]. See QKV Input in docs/source/advanced/gpt-attention.md,
 
         host_past_key_value_lengths: Tensor (On CPU)
             An INT32 tensor of shape [batch_size],
@@ -3247,7 +5359,7 @@ def gpt_attention(
             An INT32 tensor of shape [1].
             by default, the max_attention_window_size is determined by the shape of cache_indir_table.
             And we support independent max_attention_window_size for each layer.
-            This controls the sliding-window-attention/cyclic-kv-cache features.
+            This controls the sliding-window-attention kv-cache features.
 
         context_lengths: Tensor (On GPU)
             The tensor that stores the context-phase sequence length of each request. Its shape
@@ -3256,12 +5368,15 @@ def gpt_attention(
         cache_indirection: Tensor (On GPU)
             The tensor to reconstruct the paths when using beam-search. Its
             shape is [batch_size, beam_width, max_seqlen]. See Beam-Search in
-            docs/gpt_attention.md,
+            docs/source/advanced/gpt-attention.md,
 
         host_request_types: Tensor = None (On CPU)
             The tensor on the host that indicates if a request is in context or
             generation phase. Its shape is [batch_size]. See Inflight Batching
-            in docs/gpt_attention.md,
+            in docs/source/advanced/gpt-attention.md,
+
+        layer_idx: int
+            The index of this attention layer, used to access kv_cache_block_offsets,
 
         num_heads: int
             The number of heads,
@@ -3274,7 +5389,11 @@ def gpt_attention(
 
         q_scaling: float
             The value used to compute the scaling factor applied to the output
-            of the Q*K^T product. See Scaling Factors in docs/gpt_attention.md,
+            of the Q*K^T product. See Scaling Factors in docs/source/advanced/gpt-attention.md,
+
+        attn_logit_softcapping_scale: float
+            The scale * tanh(value / scale) used to compute the scaling factor applied to the output
+            of the Q*K^T product.
 
         rotary_embedding_dim: int
             The dimension to compute RoPE. Use 0 when position_embedding_type is not RoPE.
@@ -3288,11 +5407,20 @@ def gpt_attention(
                 * RotaryScalingType.none
                 * RotaryScalingType.linear
                 * RotaryScalingType.dynamic
+                * RotaryScalingType.longrope
+                * RotaryScalingType.llama3
 
         rotary_embedding_scale: float
             The scale value to use for linear/dynamic scaling in RoPE.
             Ignored when position_embedding_type is not RoPE.
             Must be set to 1 (default) if rotary_embedding_scale_type is `none`.
+
+        rotary_inv_freq: float Tensor
+            The rotary inv freq with shape [head_size / 2].
+
+        rotary_cos_sin: float2(cos/sin) Tensor
+            The rotary cos/sin cache, which will be reused among different requests.
+            It is taken as constant tensor.
 
         rotary_embedding_max_positions: int
             Needed only for `dynamic` RoPE scaling. Ignored otherwise.
@@ -3309,26 +5437,45 @@ def gpt_attention(
         kv_orig_quant_scale: Tensor
             The tensor to store the scaling factor for quantization to INT8/FP8
             in the KV cache. Its shape is [1]. See INT8/FP8 KV Cache in
-            docs/gpt_attention.md,
+            docs/source/advanced/gpt-attention.md,
 
         kv_quant_orig_scale: Tensor
             The tensor to store the scaling factor for dequantization from
             INT8/FP8 in the KV cache. Its shape is [1]. See INT8/FP8 KV Cache
-            in docs/gpt_attention.md,
+            in docs/source/advanced/gpt-attention.md,
+
+        attention_output_orig_quant_scale: Tensor
+            The tensor to store the scaling factor for quantization to FP8
+            in the KV cache. Its shape is [1].
 
         kv_cache_quant_mode: QuantMode (int flags)
             Do we enable the INT8 or FP8 KV cache?
 
         max_context_length: int32_t
             The length of the longest input sequence. See QKV Input in
-            docs/gpt_attention.md,
+            docs/source/advanced/gpt-attention.md,
 
         mask_type: int = 1
             The type of mask:
                 * tensorrt_llm.layers.AttentionMaskType.padding for BERT,
                 * tensorrt_llm.layers.AttentionMaskType.causal for GPT,
+                * tensorrt_llm.layers.AttentionMaskType.sliding_window_causal for GPT,
                 * tensorrt_llm.layers.AttentionMaskType.bidirectional for ChatGLM-6B,
                 * tensorrt_llm.layers.AttentionMaskType.bidirectionalglm for GLM-10B,
+                * tensorrt_llm.layers.AttentionMaskType.blocksparse for Phi-3-small,
+                * tensorrt_llm.layers.AttentionMaskType.custom_mask for any models.
+
+        block_sparse_block_size: int
+            Block size in block sparse attention
+
+        block_sparse_homo_head_pattern: bool
+            Do all attention heads share same vertical stride pattern?
+
+        block_sparse_num_local_blocks: int
+            Number of active blocks near diagonal
+
+        block_sparse_vertical_stride: int
+            Stride of active blocks in vertical dimension
 
         alibi_slopes: Tensor
             The ALiBi slopes. The ALiBi bias is computed on-the-fly in the kernel
@@ -3340,27 +5487,36 @@ def gpt_attention(
         tp_rank: int
             The rank of that process (when running tensor parallelism),
 
-        kv_cache_block_pointers:
-            The tensor of block pointers for the KV cache. Its shape is
-            [max_batch_size, max_beam_width, 2, max_blocks_per_sequence * 2]
-            See KV cache section in docs/gpt_attention.md, on gpu
+        kv_cache_block_offsets:
+            The tensor of block offsets for the KV cache. Its shape is
+            [num_layers, max_batch_size, max_beam_width, 2, max_blocks_per_sequence * 2],
+            See KV cache section in docs/source/advanced/gpt-attention.md, on gpu,
 
-        host_kv_cache_block_pointers:
-            The same as kv_cache_block_pointers, but on cpu,
+        host_kv_cache_block_offsets:
+            The same as kv_cache_block_offsets, but on cpu,
+
+        host_kv_cache_pool_pointers:
+            The tensor of pool pointers for the KV cache. Its shape is [num_layers, 2],
+            See KV cache section in docs/source/advanced/gpt-attention.md, on gpu,
+
+        host_kv_cache_pool_mapping:
+            The tensor of pool mapping for the different memory pools. Its shape is [num_layers,2] - for each layer, the index of the pool, and the index of the layer within the pool,
 
         do_cross_attention: bool = False
             Do we use this as cross attention instead of self attention,
 
-        cross_qkv: Tensor = None
-            The QKV tensor of encoder output hidden states. Its shape is [batch_size, max_seqlen, 3
-            * hidden_dim] in padded mode and [1, num_tokens, 3 * hidden_dim] in
+        cross_kv: Tensor = None
+            The KV tensor of encoder output hidden states. Its shape is [batch_size, max_seqlen, 2 * kvHeadNum * headSize] in padded mode and [1, num_tokens, 2 * kvHeadNum * headSize] in
             packed mode,
 
-        cross_qkv_length: Tensor = None
+        cross_kv_length: Tensor = None
             The length of the longest encoder output sequence,
 
         encoder_input_lengths: Tensor
             The tensor that stores the length of each encoder input sequence. Its shape is [batch_size],
+
+        logn_scaling: Tensor = None
+            The logn scaling tensor [max_position_embedding_len], which is applied to q in order to help extrapolation
 
         relative_attention_bias: Tensor = None
             The relative attention bias [num_heads, max_seq_len, max_seq_len], or The relative attention embedding table for implicit mode, [num_heads, num_buckets].
@@ -3369,18 +5525,69 @@ def gpt_attention(
             The maximum distance of relative position in attention, for implicit mode.
             Default value is 0, meaning to use the regular mode of relative attention bias.
             Implicit mode is only enabled when passing in non-zero positive max_distance value.
-            See relative attention bias in docs/gpt_attention.md
+            See relative attention bias in docs/source/advanced/gpt-attention.md
 
         host_context_lengths: Tensor = None (On CPU)
             A host tensor that contains the lengths of the different inputs,
 
         qkv_bias: Tensor = None,
+            The qkv bias tensor.
+
+        use_cache: bool = False
+            Do we need to store kv cache ? not needed if there is no generation phase.
+
+        spec_decoding_is_generation_length_variable: bool = False,
+            Whether the generation lengths can be different for each sequence in a batch.
+            For Medusa, this should be set False.
+            For Redrafter, this should be set to True.
+
+        spec_decoding_max_generation_length: int = 1,
+            The maximum number of tokens possible in the generation phase per sequence.
+
+        spec_decoding_generation_lengths: Tensor = None,
+            The generation phase tokens' lengths for each sequence.
+            Shape: [batch_size]
+
+        spec_decoding_position_offsets: Tensor = None,
+            The speculative decoding tokens's position offsets (shared by all sequences).
+            Shape: [batch_size, num_draft_tokens + 1].
+
+        spec_decoding_packed_mask: Tensor = None,
+            The speculative decoding tokens's attention mask (packed into uint32_t bits).
+            remove_input_padding is False:
+                Shape: [batch_size, num_draft_tokens + 1, divUp(num_draft_tokens + 1, 32)].
+            remove_input_padding is True:
+                Shape: [sum(spec_decoding_generation_lengths), divUp(num_draft_tokens + 1, 32)].
+
+        long_rope_rotary_inv_freq: float Tensor
+            Additional rotary inv freq used for longer sequence lengths. Shape: [head_size / 2]
+
+        long_rope_rotary_cos_sin: float2(cos/sin) Tensor
+            Additional rotary cos/sin cache used for longer sequence lengths.
+
+        is_mla_enable: bool = False
+            Do we need to enable deepseekv2 mla?
+
+        host_runtime_perf_knobs: Tensor = None,
+            The runtime perf knobs bit mask, controls whether to use certain perf knob in the runtime.
+
+        host_context_progress: Tensor = None,
+            The structure used to track layer-wise progress in context phase.
+
+        skip_attn: Tensor = None,
+            A bool tensor on CPU. If it is true, don't run attention plugin, returning directly.
+
+        num_kv_heads_origin: int
+            The origin number of KV heads, without the process of TP
 
     Returns:
         The tensor produced by that layer.
     '''
+
     assert host_request_types is not None
     assert (alibi_slopes is not None) == (position_embedding_type.is_alibi())
+    assert (mrope_rotary_cos_sin
+            is not None) == (position_embedding_type.is_mrope())
     attn_plg_creator = trt.get_plugin_registry().get_plugin_creator(
         'GPTAttention', '1', TRT_LLM_PLUGIN_NAMESPACE)
     assert attn_plg_creator is not None
@@ -3388,14 +5595,46 @@ def gpt_attention(
     ).plugin_config.remove_input_padding
     assert isinstance(max_context_length, int)
     assert host_max_attention_window_sizes is not None
+    assert host_sink_token_length is not None
 
     paged_kv_cache_flag = default_net().plugin_config.paged_kv_cache
+    if isinstance(qkv, list):
+        is_unfuse_qkv_gemm = 1
+    else:
+        is_unfuse_qkv_gemm = 0
 
+    default_net().plugin_config.context_fmha_type
+    if do_cross_attention and not paged_kv_cache_flag:
+        pass
+    if logn_scaling is not None:
+        use_logn_scaling = 1
+    else:
+        use_logn_scaling = 0
+
+    if num_kv_heads_origin < 1:
+        num_kv_heads_origin = num_kv_heads
+
+    unfuse_qkv_gemm = trt.PluginField(
+        "unfuse_qkv_gemm", np.array(np.int8(is_unfuse_qkv_gemm), dtype=np.int8),
+        trt.PluginFieldType.INT8)
+
+    layer_idx = trt.PluginField("layer_idx", np.array(layer_idx,
+                                                      dtype=np.int32),
+                                trt.PluginFieldType.INT32)
     nheads = trt.PluginField("num_heads", np.array(num_heads, dtype=np.int32),
                              trt.PluginFieldType.INT32)
+    vision_start = trt.PluginField("vision_start",
+                                   np.array(vision_start, dtype=np.int32),
+                                   trt.PluginFieldType.INT32)
+    vision_length = trt.PluginField("vision_length",
+                                    np.array(vision_length, dtype=np.int32),
+                                    trt.PluginFieldType.INT32)
     num_kv_heads = trt.PluginField("num_kv_heads",
                                    np.array(num_kv_heads, dtype=np.int32),
                                    trt.PluginFieldType.INT32)
+    num_kv_heads_origin = trt.PluginField(
+        "num_kv_heads_origin", np.array(num_kv_heads_origin, dtype=np.int32),
+        trt.PluginFieldType.INT32)
     head_size = trt.PluginField("head_size",
                                 np.array(hidden_size_per_head, dtype=np.int32),
                                 trt.PluginFieldType.INT32)
@@ -3405,6 +5644,10 @@ def gpt_attention(
     q_scaling = trt.PluginField("q_scaling",
                                 np.array(q_scaling, dtype=np.float32),
                                 trt.PluginFieldType.FLOAT32)
+    attn_logit_softcapping_scale = trt.PluginField(
+        "attn_logit_softcapping_scale",
+        np.array(attn_logit_softcapping_scale, dtype=np.float32),
+        trt.PluginFieldType.FLOAT32)
     rotary_embedding_dim = trt.PluginField(
         "rotary_embedding_dim", np.array(rotary_embedding_dim, dtype=np.int32),
         trt.PluginFieldType.INT32)
@@ -3420,9 +5663,21 @@ def gpt_attention(
         "rotary_embedding_scale",
         np.array(rotary_embedding_scale, dtype=np.float32),
         trt.PluginFieldType.FLOAT32)
+    rotary_embedding_short_m_scale = trt.PluginField(
+        "rotary_embedding_short_m_scale",
+        np.array(rotary_embedding_short_m_scale, dtype=np.float32),
+        trt.PluginFieldType.FLOAT32)
+    rotary_embedding_long_m_scale = trt.PluginField(
+        "rotary_embedding_long_m_scale",
+        np.array(rotary_embedding_long_m_scale, dtype=np.float32),
+        trt.PluginFieldType.FLOAT32)
     rotary_embedding_max_positions = trt.PluginField(
         "rotary_embedding_max_positions",
         np.array(rotary_embedding_max_positions, dtype=np.int32),
+        trt.PluginFieldType.INT32)
+    rotary_embedding_original_max_positions = trt.PluginField(
+        "rotary_embedding_original_max_positions",
+        np.array(rotary_embedding_original_max_positions, dtype=np.int32),
         trt.PluginFieldType.INT32)
     position_embedding_type = trt.PluginField(
         "position_embedding_type",
@@ -3436,24 +5691,75 @@ def gpt_attention(
         "remove_input_padding",
         np.array(np.int8(default_net().plugin_config.remove_input_padding),
                  dtype=np.int8), trt.PluginFieldType.INT8)
+    is_spec_decoding_enabled = trt.PluginField(
+        "is_spec_decoding_enabled",
+        np.array(np.int8(spec_decoding_packed_mask is not None), dtype=np.int8),
+        trt.PluginFieldType.INT8)
+    spec_decoding_is_generation_length_variable = trt.PluginField(
+        "spec_decoding_is_generation_length_variable",
+        np.array(np.int8(spec_decoding_is_generation_length_variable),
+                 dtype=np.int8), trt.PluginFieldType.INT8)
+    spec_decoding_max_generation_length = trt.PluginField(
+        "spec_decoding_max_generation_length",
+        np.array(spec_decoding_max_generation_length, dtype=np.int32),
+        trt.PluginFieldType.INT32)
+    is_mla_enabled = trt.PluginField(
+        "is_mla_enabled", np.array(is_mla_enabled_flag, dtype=np.int8),
+        trt.PluginFieldType.INT8)
+    q_lora_rank = trt.PluginField("q_lora_rank",
+                                  np.array(q_lora_rank, dtype=np.int32),
+                                  trt.PluginFieldType.INT32)
+    kv_lora_rank = trt.PluginField("kv_lora_rank",
+                                   np.array(kv_lora_rank, dtype=np.int32),
+                                   trt.PluginFieldType.INT32)
+    qk_nope_head_dim = trt.PluginField(
+        "qk_nope_head_dim", np.array(qk_nope_head_dim, dtype=np.int32),
+        trt.PluginFieldType.INT32)
+    qk_rope_head_dim = trt.PluginField(
+        "qk_rope_head_dim", np.array(qk_rope_head_dim, dtype=np.int32),
+        trt.PluginFieldType.INT32)
+    v_head_dim = trt.PluginField("v_head_dim",
+                                 np.array(v_head_dim, dtype=np.int32),
+                                 trt.PluginFieldType.INT32)
     p_dtype = default_net().plugin_config.gpt_attention_plugin
     pf_type = trt.PluginField(
         "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
         trt.PluginFieldType.INT32)
-    mask_type = trt.PluginField("mask_type", np.array([int(mask_type)],
-                                                      np.int32),
-                                trt.PluginFieldType.INT32)
-    multi_block_mode = trt.PluginField(
-        "multi_block_mode",
-        np.array(np.int8(default_net().plugin_config.multi_block_mode),
-                 dtype=np.int8), trt.PluginFieldType.INT8)
+    # reset mask_type to custom_mask.
+    if (attention_mask is not None) or (attention_packed_mask is not None):
+        # context fmha needs packed mask.
+        assert attention_packed_mask is not None
+        if get_sm_version() < 100:
+            mask_type = AttentionMaskType.custom_mask
+
+    mask_type_filed = trt.PluginField("mask_type",
+                                      np.array([int(mask_type)], np.int32),
+                                      trt.PluginFieldType.INT32)
+    block_sparse_block_size = trt.PluginField(
+        "block_sparse_block_size", np.array([block_sparse_block_size],
+                                            np.int32),
+        trt.PluginFieldType.INT32)
+    block_sparse_homo_head_pattern = trt.PluginField(
+        "block_sparse_homo_head_pattern",
+        np.array(np.int8(block_sparse_homo_head_pattern), np.int8),
+        trt.PluginFieldType.INT8)
+    block_sparse_num_local_blocks = trt.PluginField(
+        "block_sparse_num_local_blocks",
+        np.array([block_sparse_num_local_blocks], np.int32),
+        trt.PluginFieldType.INT32)
+    block_sparse_vertical_stride = trt.PluginField(
+        "block_sparse_vertical_stride",
+        np.array([block_sparse_vertical_stride], np.int32),
+        trt.PluginFieldType.INT32)
     tp_size = trt.PluginField("tp_size", np.array(tp_size, dtype=np.int32),
                               trt.PluginFieldType.INT32)
     tp_rank = trt.PluginField("tp_rank", np.array(tp_rank, dtype=np.int32),
                               trt.PluginFieldType.INT32)
+    if isinstance(kv_cache_quant_mode, QuantModeWrapper):
+        # Now in TRT-LLM only use global kv_cache, so it's enough to get the first quant mode from list
+        kv_cache_quant_mode = kv_cache_quant_mode[0]
     kv_cache_quant_mode_field = trt.PluginField(
-        "kv_cache_quant_mode",
-        np.array(np.int8(kv_cache_quant_mode), dtype=np.int32),
+        "kv_cache_quant_mode", np.array(kv_cache_quant_mode, dtype=np.int32),
         trt.PluginFieldType.INT32)
     paged_kv_cache = trt.PluginField(
         "paged_kv_cache", np.array(paged_kv_cache_flag, dtype=np.int32),
@@ -3465,6 +5771,14 @@ def gpt_attention(
     max_context_length = trt.PluginField("max_context_length",
                                          np.array(max_context_length, np.int32),
                                          trt.PluginFieldType.INT32)
+    pos_shift_enabled = trt.PluginField(
+        "pos_shift_enabled",
+        np.array(np.int8(default_net().plugin_config.streamingllm),
+                 dtype=np.int8), trt.PluginFieldType.INT8)
+    dense_context_fmha = trt.PluginField(
+        "dense_context_fmha",
+        np.array(np.int8(default_net().plugin_config.streamingllm),
+                 dtype=np.int8), trt.PluginFieldType.INT8)
     if qkv_bias is None:
         qkv_bias_enabled = trt.PluginField("qkv_bias_enabled",
                                            np.array(0, dtype=np.int8),
@@ -3484,51 +5798,112 @@ def gpt_attention(
         "use_paged_context_fmha",
         np.array(np.int8(default_net().plugin_config.use_paged_context_fmha),
                  dtype=np.int8), trt.PluginFieldType.INT8)
+    use_fp8_context_fmha_field = trt.PluginField(
+        "use_fp8_context_fmha",
+        np.array(np.int8(default_net().plugin_config.use_fp8_context_fmha),
+                 dtype=np.int8), trt.PluginFieldType.INT8)
+    has_full_attention_mask_field = trt.PluginField(
+        "has_full_attention_mask",
+        np.array(np.int8(attention_mask is not None), dtype=np.int8),
+        trt.PluginFieldType.INT8)
     use_cache_pf = trt.PluginField("use_cache",
                                    np.array([use_cache], dtype=np.int32),
                                    trt.PluginFieldType.INT32)
+    fuse_fp4_quant = default_net().plugin_config.fuse_fp4_quant
+    fuse_fp4_quant_pf = trt.PluginField(
+        "fuse_fp4_quant", np.array(np.int8(fuse_fp4_quant), dtype=np.int8),
+        trt.PluginFieldType.INT8)
+    skip_attn_pf = trt.PluginField(
+        "skip_attn", np.array([skip_attn is not None], dtype=np.int8),
+        trt.PluginFieldType.INT8)
+    cp_size = trt.PluginField("cp_size", np.array(cp_size, dtype=np.int32),
+                              trt.PluginFieldType.INT32)
+    cp_rank = trt.PluginField("cp_rank", np.array(cp_rank, dtype=np.int32),
+                              trt.PluginFieldType.INT32)
+    cp_group = np.array(cp_group, dtype=np.int32)
+    cp_group = trt.PluginField("cp_group", cp_group, trt.PluginFieldType.INT32)
+    use_logn_scaling = trt.PluginField(
+        "use_logn_scaling", np.array(np.int8(use_logn_scaling), dtype=np.int8),
+        trt.PluginFieldType.INT8)
 
     pfc = trt.PluginFieldCollection([
-        nheads, num_kv_heads, head_size, unidirectional, q_scaling,
-        position_embedding_type, rotary_embedding_dim, rotary_embedding_base,
+        layer_idx, nheads, vision_start, vision_length, num_kv_heads,
+        num_kv_heads_origin, head_size, unidirectional, q_scaling,
+        attn_logit_softcapping_scale, position_embedding_type,
+        rotary_embedding_dim, rotary_embedding_base,
         rotary_embedding_scale_type, rotary_embedding_scale,
-        rotary_embedding_max_positions, tp_size, tp_rank, context_fmha_type,
-        multi_block_mode, kv_cache_quant_mode_field, remove_input_padding,
-        mask_type, paged_kv_cache, tokens_per_block, pf_type,
-        max_context_length, qkv_bias_enabled, do_cross_attention_field,
-        max_distance, use_paged_context_fmha_field, use_cache_pf
+        rotary_embedding_short_m_scale, rotary_embedding_long_m_scale,
+        rotary_embedding_max_positions, rotary_embedding_original_max_positions,
+        tp_size, tp_rank, unfuse_qkv_gemm, context_fmha_type,
+        kv_cache_quant_mode_field, remove_input_padding, mask_type_filed,
+        block_sparse_block_size, block_sparse_homo_head_pattern,
+        block_sparse_num_local_blocks, block_sparse_vertical_stride,
+        paged_kv_cache, tokens_per_block, pf_type, max_context_length,
+        qkv_bias_enabled, do_cross_attention_field, max_distance,
+        pos_shift_enabled, dense_context_fmha, use_paged_context_fmha_field,
+        use_fp8_context_fmha_field, has_full_attention_mask_field, use_cache_pf,
+        is_spec_decoding_enabled, spec_decoding_is_generation_length_variable,
+        spec_decoding_max_generation_length, is_mla_enabled, q_lora_rank,
+        kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim,
+        fuse_fp4_quant_pf, skip_attn_pf, cp_size, cp_rank, cp_group,
+        use_logn_scaling
     ])
 
     attn_plug = attn_plg_creator.create_plugin("causal_attn", pfc)
-    plug_inputs = []
+    assert attn_plug
+    plug_inputs = [*qkv] if is_unfuse_qkv_gemm else [qkv]
+    if attention_mask is not None and mask_type == AttentionMaskType.custom_mask:
+        # useFullCustomMask
+        plug_inputs += [attention_mask]
+    if attention_packed_mask is not None and get_sm_version() < 100:
+        # usePackedCustomMask
+        plug_inputs += [attention_packed_mask]
     if use_cache:
-        plug_inputs = [
-            qkv,
+        plug_inputs += [
             sequence_length,
             host_past_key_value_lengths,
             host_max_attention_window_sizes,
+            host_sink_token_length,
             context_lengths,
             cache_indirection,
             host_request_types,
         ]
     else:
-        plug_inputs = [
-            qkv,
+        plug_inputs += [
             host_max_attention_window_sizes,
+            host_sink_token_length,
             context_lengths,
             host_request_types,
         ]
-
     if use_cache:
         if paged_kv_cache_flag:
+            assert kv_cache_block_offsets is not None, "Paged kv cache is enabled, the kv_cache_block_offsets tensor shall not be None"
+            assert host_kv_cache_block_offsets is not None, "Paged kv cache is enabled, the host_kv_cache_block_offsets tensor shall not be None"
+            assert host_kv_cache_pool_pointers is not None, "Paged kv cache is enabled, the host_kv_cache_pool_pointers tensor shall not be None"
+            assert host_kv_cache_pool_mapping is not None, "Paged kv cache is enabled, the host_kv_cache_pool_mapping tensor shall not be None"
             plug_inputs += [
-                kv_cache_block_pointers, host_kv_cache_block_pointers
+                kv_cache_block_offsets, host_kv_cache_block_offsets,
+                host_kv_cache_pool_pointers, host_kv_cache_pool_mapping
             ]
         else:
             plug_inputs += [past_key_value]
 
     if use_cache and kv_cache_quant_mode.has_kv_cache_quant():
         plug_inputs += [kv_orig_quant_scale, kv_quant_orig_scale]
+
+    if attention_output_orig_quant_scale is not None:
+        assert default_net(
+        ).plugin_config.use_fp8_context_fmha, "FP8 Context FMHA needs to be enabled"
+        plug_inputs += [attention_output_orig_quant_scale]
+
+    if fuse_fp4_quant:
+        assert attention_output_sf_scale is not None, "attention_output_sf_scale must be provided when fuse_fp4_quant is enabled."
+        plug_inputs += [attention_output_sf_scale]
+
+    if rotary_inv_freq is not None:
+        plug_inputs += [rotary_inv_freq]
+    if rotary_cos_sin is not None:
+        plug_inputs += [rotary_cos_sin]
 
     if alibi_slopes is not None:
         plug_inputs += [alibi_slopes]
@@ -3537,7 +5912,7 @@ def gpt_attention(
         plug_inputs += [relative_attention_bias]
 
     if do_cross_attention:
-        plug_inputs += [cross_qkv, cross_qkv_length, encoder_input_lengths]
+        plug_inputs += [cross_kv, cross_kv_length, encoder_input_lengths]
 
     if default_net().plugin_config.remove_input_padding:
         plug_inputs += [host_context_lengths]
@@ -3545,27 +5920,85 @@ def gpt_attention(
     if qkv_bias is not None:
         plug_inputs += [qkv_bias]
 
+    if spec_decoding_packed_mask is not None:
+        # add position_ids as well only if speculative decoding mode
+        assert spec_decoding_position_offsets is not None
+        assert spec_decoding_generation_lengths is not None
+        assert spec_decoding_use is not None
+        plug_inputs += [
+            spec_decoding_generation_lengths, spec_decoding_packed_mask,
+            spec_decoding_position_offsets, spec_decoding_use
+        ]
+
+    if long_rope_rotary_inv_freq is not None:
+        assert long_rope_rotary_cos_sin is not None
+        plug_inputs += [long_rope_rotary_inv_freq, long_rope_rotary_cos_sin]
+
+    if mrope_rotary_cos_sin is not None:
+        assert mrope_position_deltas is not None
+        plug_inputs += [
+            mrope_rotary_cos_sin,
+            mrope_position_deltas,
+        ]
+    if host_runtime_perf_knobs is not None:
+        plug_inputs += [host_runtime_perf_knobs]
+
+    if host_context_progress is not None:
+        plug_inputs += [host_context_progress]
+
+    if is_mla_enabled_flag:
+        assert q_b_proj is not None
+        assert kv_b_proj is not None
+        assert k_b_proj_trans is not None
+        plug_inputs += [q_b_proj, kv_b_proj, k_b_proj_trans]
+
+    if skip_attn is not None:
+        plug_inputs += [skip_attn]
+
+    if logn_scaling is not None:
+        plug_inputs += [logn_scaling]
+
+    for idx, i in enumerate(plug_inputs):
+        assert i is not None, f"Found None input for {idx} th item in plugin inputs {plug_inputs}"
+
     plug_inputs = [i.trt_tensor for i in plug_inputs]
     layer = default_trtnet().add_plugin_v2(plug_inputs, attn_plug)
+    _add_plugin_info(layer, attn_plg_creator, "causal_attn", pfc)
     output = _create_tensor(layer.get_output(0), layer)
+    expected_outputs = 1
+
+    # The output scaling factor tensor.
+    output_sf = None
+    if fuse_fp4_quant:
+        output_sf = _create_tensor(layer.get_output(expected_outputs), layer)
+        expected_outputs += 1
+
     present_key_value = None
     if use_cache and not paged_kv_cache_flag:
-        present_key_value = _create_tensor(layer.get_output(1), layer)
+        present_key_value = _create_tensor(layer.get_output(expected_outputs),
+                                           layer)
         assert present_key_value is not None
-        expected_outputs = 2
-    else:
-        expected_outputs = 1
+        expected_outputs += 1
 
     assert layer.num_outputs == expected_outputs, \
         f"Plugin outputs number mismatch with expected, got {layer.num_outputs}, expected {expected_outputs}"
 
-    if kv_cache_quant_mode.has_int8_kv_cache() and not paged_kv_cache_flag:
-        # past key value
-        layer.get_input(7).set_dynamic_range(-127, 127)
-        # present key value
-        layer.get_output(1).set_dynamic_range(-127, 127)
+    if kv_cache_quant_mode.has_int8_kv_cache(
+    ) and not default_net().strongly_typed:
+        if not paged_kv_cache_flag:
+            # past key value
+            layer.get_input(8).set_dynamic_range(-127, 127)
+            # present key value
+            layer.get_output(expected_outputs - 1).set_dynamic_range(-127, 127)
+        else:
+            layer.get_input(0).set_dynamic_range(-127, 127)
+            layer.get_input(1).set_dynamic_range(-127, 127)
+            layer.get_output(expected_outputs - 1).set_dynamic_range(-127, 127)
 
     assert output is not None
+    if fuse_fp4_quant:
+        assert output_sf is not None
+        return (output, output_sf), present_key_value
     return output, present_key_value
 
 
@@ -3622,57 +6055,25 @@ def layer_norm(input: Tensor,
     Returns:
         The output tensor of that operation.
     '''
-    if not default_net().plugin_config.layernorm_plugin:
-        input, weight = broadcast_helper(input, weight)
-        input, bias = broadcast_helper(input, bias)
-        if isinstance(normalized_shape, int):  # FIXME: better way?
-            axis = input.ndim() - 1
-        else:
-            axis = input.ndim() - len(normalized_shape)
-        axes_mask = 0
-        for i in range(axis, input.ndim()):
-            axes_mask |= 1 << i
-        layer = default_trtnet().add_normalization(input.trt_tensor,
-                                                   weight.trt_tensor,
-                                                   bias.trt_tensor, axes_mask)
-        layer.epsilon = eps
-        return _create_tensor(layer.get_output(0), layer)
+    input, weight = broadcast_helper(input, weight)
+    input, bias = broadcast_helper(input, bias)
+    if isinstance(normalized_shape, int):  # FIXME: better way?
+        axis = input.ndim() - 1
     else:
-        logger.warning("Layernorm plugin is going to be deprecated, "
-                       "disable it for better performance.")
-        plg_creator = trt.get_plugin_registry().get_plugin_creator(
-            'Layernorm', '1', TRT_LLM_PLUGIN_NAMESPACE)
-        assert plg_creator is not None
-
-        eps = trt.PluginField("eps", np.array(eps, dtype=np.float32),
-                              trt.PluginFieldType.FLOAT32)
-        use_diff_of_squares = trt.PluginField(
-            "use_diff_of_squares",
-            np.array([int(use_diff_of_squares)], dtype=np.int32),
-            trt.PluginFieldType.INT32)
-        p_dtype = default_net().plugin_config.layernorm_plugin
-        pf_type = trt.PluginField(
-            "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
-            trt.PluginFieldType.INT32)
-        pfc = trt.PluginFieldCollection([eps, use_diff_of_squares, pf_type])
-        layernorm_plug = plg_creator.create_plugin("layernorm", pfc)
-
-        normalized_shape = [normalized_shape] if isinstance(
-            normalized_shape, int) else normalized_shape
-        if weight is None:
-            weight = constant(
-                np.ones(normalized_shape, dtype=str_dtype_to_np(p_dtype)))
-        if bias is None:
-            bias = constant(
-                np.zeros(normalized_shape, dtype=str_dtype_to_np(p_dtype)))
-
-        plug_inputs = [input.trt_tensor, weight.trt_tensor, bias.trt_tensor]
-        layer = default_trtnet().add_plugin_v2(plug_inputs, layernorm_plug)
-        return _create_tensor(layer.get_output(0), layer)
+        axis = input.ndim() - len(normalized_shape)
+    axes_mask = 0
+    for i in range(axis, input.ndim()):
+        axes_mask |= 1 << i
+    layer = default_trtnet().add_normalization(input.trt_tensor,
+                                               weight.trt_tensor,
+                                               bias.trt_tensor, axes_mask)
+    layer.epsilon = eps
+    return _create_tensor(layer.get_output(0), layer)
 
 
 def rms_norm(input: Tensor,
              normalized_shape: Union[int, Tuple[int]],
+             num_groups: int = 1,
              weight: Optional[Tensor] = None,
              eps: float = 1e-06) -> Tensor:
     '''
@@ -3695,6 +6096,9 @@ def rms_norm(input: Tensor,
             The shape of the sub-tensor that is normalized. Use 'hidden_dim' to
             normalize the inner-most dimension of an activation tensor in LLMs.
 
+        num_groups: int = 1
+            The group size.
+
         weight : Optional[Tensor] = None
             The 'gamma' term in layer-norm. Its shape must be
             'normalized_shape'.
@@ -3704,59 +6108,206 @@ def rms_norm(input: Tensor,
     Returns:
         The output tensor of that operation.
     '''
-    if not default_net().plugin_config.rmsnorm_plugin:
-        normalized_shape = [normalized_shape] if isinstance(
-            normalized_shape, int) else normalized_shape
+    normalized_shape = [normalized_shape] if isinstance(
+        normalized_shape, int) else normalized_shape
 
-        dim = tuple([-i - 1 for i in range(len(normalized_shape))])
+    dim = tuple([-i - 1 for i in range(len(normalized_shape))])
 
-        if default_net().strongly_typed:
-            input_dtype = input.dtype
-            fp32_input = cast(input, "float32")
-            varx = pow(fp32_input, 2.0)
+    if num_groups > 1:
+        assert len(normalized_shape) == 1
+        num_channels = input.size()[-1]
+        ndim = input.ndim()
+        old_shape = shape(input)
+        new_shape = concat([input.size(i) for i in range(ndim - 1)] +
+                           [num_groups, num_channels // num_groups])
+        input = input.view(new_shape)
 
-            varx = varx.mean(dim, keepdim=True)
-            denom = varx + eps
-            denom = denom.sqrt()
-            fp32_y = fp32_input / denom
-            y = cast(fp32_y, input_dtype)
+    with precision("float32"):
+        input_dtype = input.dtype
+        fp32_input = cast(input, "float32")
+        varx = pow(fp32_input, 2.0)
+
+        varx = varx.mean(dim=dim, keepdim=True)
+        denom = varx + eps
+        denom = denom.sqrt()
+        fp32_y = fp32_input / denom
+        y = cast(fp32_y, input_dtype)
+
+    if num_groups > 1:
+        y = y.view(old_shape)
+
+    if weight is not None:
+        y = y * weight
+
+    return y
+
+
+def rearrange(inputs: Union[Tensor, Sequence[Tensor]], expression: str,
+              **kwargs) -> Tensor:
+    '''
+    Add a rearrange operation on a tensor.
+
+    This operation is a reader-friendly smart element reordering for multidimensional tensors,
+    including functionality of transpose (axes permutation), reshape (view), squeeze, unsqueeze,
+    stack, concatenate and other operations. Please see: https://einops.rocks/api/rearrange/
+
+    For example, if the shape of input tensor is [32, 30, 40, 3], and run:
+        `rearrange(x, 'b (h h1) (w w1) c -> b h w 1 (c h1 w1) 1', h1=2, w1=2)`
+    it would produce a tensor with shape as [32, 15, 20, 1, 12, 1].
+
+    Parameters:
+        input: Union[Tensor, Sequence[Tensor]]
+            If it is a tensor, it will directly operate on it.
+            Otherwise, if it is a sequence, it will concat it to a tensor and then
+            operates on it.
+
+        expression : str
+            The expression about how to reorder the tensor in a reader-friendly way.
+
+        kwargs:
+            Keyword arguments to set some identifiers with specific values.
+
+    Returns:
+        The output tensor of this operation.
+    '''
+    import re
+
+    def _init_expression(expr):
+        expr_items = expr.split(" ")
+        tmp_name_index = 0
+        for idx, item in enumerate(expr_items):
+            values = re.findall(r'\b\d+\b', item)
+            if len(values) > 0:
+                prefix = "(" if "(" in item else ""
+                subfix = ")" if ")" in item else ""
+                expr_items[
+                    idx] = f"{prefix}NumericId{tmp_name_index}Val{values[0]}{subfix}"
+                tmp_name_index += 1
+        return " ".join(expr_items)
+
+    def _get_all_identifier(expr):
+        return re.findall(r'\b[a-zA-Z_]+\d*\b', expr)
+
+    def _get_all_symbols(expr):
+        return re.findall(r'\b\w+\b', expr)
+
+    def _get_dim_expr(expr):
+        return [
+            _get_all_symbols(match.group())
+            for match in re.finditer(r'\b\w+\b|\(.*?\)', expr)
+        ]
+
+    src_shape_expr, _, dst_shape_expr = expression.partition("->")
+    unknown_identifiers = re.findall(r'[^a-zA-Z0-9_\(\)]',
+                                     src_shape_expr + dst_shape_expr)
+    assert len(
+        unknown_identifiers) > 0, f"Unknown identifiers: {unknown_identifiers}"
+    src_identifiers = _get_all_identifier(src_shape_expr)
+    dst_identifiers = _get_all_identifier(dst_shape_expr)
+    assert (len(src_identifiers) == len(set(src_identifiers))
+            and len(dst_identifiers) == len(set(dst_identifiers))
+            ), "Indexing expression contains duplicate dimension."
+    assert (set(src_identifiers) == set(dst_identifiers)
+            ), "Identifiers only on one side of expression (should be on both)."
+
+    new_expression = _init_expression(expression)
+    src_shape_expr, _, dst_shape_expr = new_expression.partition("->")
+
+    # concat if inputs are sequence of tensors
+    if isinstance(inputs, Sequence):
+        inputs = concat([unsqueeze(t, 0) for t in inputs], dim=0)
+    assert (
+        inputs.ndim() == len(_get_dim_expr(src_shape_expr))
+    ), f"inputs.ndim() is {inputs.ndim()} while indexing expression has {len(_get_dim_expr(src_shape_expr))}"
+
+    src_symbols = _get_all_symbols(src_shape_expr)
+    dst_symbols = _get_all_symbols(dst_shape_expr)
+
+    # find all the symbols-values mapping and store them in symbol_map
+    symbol_map = {
+        symbol: {
+            "updated": False,
+            "value": None
+        }
+        for symbol in set(src_symbols + dst_symbols)
+    }
+    for symbol in symbol_map:
+        if "NumericId" in symbol:
+            symbol_map[symbol]["value"] = int(symbol.partition("Val")[-1])
+            symbol_map[symbol]["updated"] = True
+    for symbol, value in kwargs.items():
+        symbol_map[symbol]["value"] = value
+        symbol_map[symbol]["updated"] = True
+
+    for idx, dim_expr in enumerate(_get_dim_expr(src_shape_expr)):
+        if len(dim_expr) == 1:
+            symbol = dim_expr[0]
+            if not symbol_map[symbol]["updated"]:
+                symbol_map[symbol]["value"] = shape(inputs, idx)
+                symbol_map[symbol]["updated"] = True
         else:
-            with precision("float32"):
-                varx = pow(input, 2.0)
-                varx = varx.mean(dim, keepdim=True)
-                denom = varx + eps
-                denom = denom.sqrt()
-                y = input / denom
+            divisors = []
+            unknown_symbol = None
+            for symbol in dim_expr:
+                if not symbol_map[symbol]["updated"]:
+                    unknown_symbol = symbol
+                else:
+                    divisors.append(symbol_map[symbol]["value"])
+            if unknown_symbol is not None:
+                assert len(divisors) > 0
+                divisor = prod(cast(concat(divisors), "int64"), dim=-1)
+                symbol_map[unknown_symbol]["value"] = shape(inputs,
+                                                            idx) / divisor
+                symbol_map[unknown_symbol]["updated"] = True
 
-        if weight is not None:
-            y = y * weight
+    for symbol, item in symbol_map.items():
+        assert (item["updated"]
+                ), f"{symbol} cannot be inferred, please set it manually"
 
-        return y
-    else:
-        logger.warning("RMSnorm plugin is going to be deprecated, "
-                       "disable it for better performance.")
-        plg_creator = trt.get_plugin_registry().get_plugin_creator(
-            'Rmsnorm', '1', TRT_LLM_PLUGIN_NAMESPACE)
-        assert plg_creator is not None
+    dst_dims = []
+    for dim_expr in _get_dim_expr(dst_shape_expr):
+        if len(dim_expr) == 1:
+            dst_dims.append(symbol_map[dim_expr[0]]["value"])
+        else:
+            accumulator = prod(cast(
+                concat([symbol_map[symbol]["value"] for symbol in dim_expr]),
+                "int64"),
+                               dim=-1)
+            dst_dims.append(accumulator)
+    dst_dims = cast(concat(dst_dims, dim=-1), "int64")
 
-        eps = trt.PluginField("eps", np.array(eps, dtype=np.float32),
-                              trt.PluginFieldType.FLOAT32)
-        p_dtype = default_net().plugin_config.rmsnorm_plugin
-        pf_type = trt.PluginField(
-            "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
-            trt.PluginFieldType.INT32)
-        pfc = trt.PluginFieldCollection([eps, pf_type])
-        rmsnorm_plug = plg_creator.create_plugin("rmsnorm", pfc)
+    src_indices = {symbol: idx for idx, symbol in enumerate(src_identifiers)}
+    permute_dims = [src_indices[symbol] for symbol in dst_identifiers]
 
-        normalized_shape = [normalized_shape] if isinstance(
-            normalized_shape, int) else normalized_shape
-        if weight is None:
-            weight = constant(
-                np.zeros(normalized_shape, dtype=str_dtype_to_np(p_dtype)))
+    symbol_shape = cast(
+        concat([symbol_map[symbol]["value"] for symbol in src_identifiers],
+               dim=-1), "int64")
+    tensor = inputs.view(symbol_shape)
+    tensor = permute(tensor, permute_dims)
+    tensor = tensor.view(dst_dims)
+    return tensor
 
-        plug_inputs = [input.trt_tensor, weight.trt_tensor]
-        layer = default_trtnet().add_plugin_v2(plug_inputs, rmsnorm_plug)
-        return _create_tensor(layer.get_output(0), layer)
+
+def repeat(input: Tensor, sizes: Sequence[int]) -> Tensor:
+    '''
+    Repeats the tensor along the specified dimensions.
+
+    Parameters:
+        input : Tensor
+            The tensor to be repeated.
+        sizes : Sequence[int]
+            The number of times to repeat the tensor along each dimension.
+
+    Returns:
+        A tensor except for repeated input tensors along specified dim.
+
+    '''
+    assert input.ndim() <= len(sizes), \
+        "Number of dimensions of repeat dims can not be smaller than number of dimensions of tensor"
+    repeated_tensor = input
+    for k in range(-1, -len(sizes) - 1, -1):
+        repeated_tensor = concat([repeated_tensor] * sizes[k], dim=k)
+    return repeated_tensor
 
 
 def repeat_interleave(tensor: Tensor, repeats: int, dim: int) -> Tensor:
@@ -3786,11 +6337,58 @@ def repeat_interleave(tensor: Tensor, repeats: int, dim: int) -> Tensor:
     return tensor
 
 
+def meshgrid2d(x: Tensor, y: Tensor) -> Tuple[Tensor]:
+    '''
+    Creates grids (2D) of coordinates specified by the 1D inputs (only supports `indexing=\'xy\'`).
+
+    Parameters:
+        x : Tensor
+            The first input (1D) tensor.
+        y : Tensor
+            The second input (1D) tensor.
+
+    Returns:
+        The tuple of two tensors produced.
+
+    TODO: Add full support for torch.meshgrid.
+          See https://pytorch.org/docs/stable/generated/torch.meshgrid.html#torch-meshgrid
+    '''
+    if x.ndim() == 1:
+        x = expand_dims(x, 0)
+    if y.ndim() == 1:
+        y = expand_dims(y, 0)
+    grid_x = repeat_interleave(x, shape(y, 1),
+                               1).view([x.shape[-1], y.shape[-1]])
+    grid_y = repeat(y, (x.shape[-1], 1))
+    return (grid_x, grid_y)
+
+
+def generate_logn_scaling(seq_length: int = 8192,
+                          max_position_embeddings: int = 32768) -> np.ndarray:
+    '''
+    Compute the Log-N scaling vector for Qwen inference extrapolation
+
+    Parameters:
+        seq_length : int
+            The max seq length in training (default to 8192 in Qwen-1)
+        max_position_embeddings : int
+            The max position embeddings. (default to 32768 in Qwen-1)
+
+    Returns:
+        A constant np.ndarray that contains logn scaling vector
+    '''
+    logn_list = [
+        math.log(i, seq_length) if i > seq_length else 1
+        for i in range(1, max_position_embeddings + 1)
+    ]
+    return np.asarray(logn_list, dtype=np.float32)
+
+
 def generate_alibi_slopes(num_heads: int,
-                          dtype: trt.DataType = trt.float32,
                           tp_size: int = 1,
                           tp_rank: int = 0,
-                          alibi_scale: float = 1.0) -> Tensor:
+                          alibi_scale: float = 1.0,
+                          alibi_bias_max: int = 8) -> np.ndarray:
     '''
     Compute the ALiBi slopes as described in https://arxiv.org/abs/2211.05100.
 
@@ -3822,24 +6420,19 @@ def generate_alibi_slopes(num_heads: int,
     for h_id in range(start_head_id, end_head_id):
         if h_id < closest_power_of_2:
             slopes_ft.append(
-                np.power(2**(-(2**-(np.log2(closest_power_of_2) - 3))),
-                         h_id + 1))
+                np.power(
+                    2**(-(2**-(np.log2(closest_power_of_2) -
+                               np.log2(alibi_bias_max)))), h_id + 1))
         else:
             slopes_ft.append(
-                np.power(2**(-(2**-(np.log2(closest_power_of_2 * 2) - 3))),
-                         (h_id - closest_power_of_2) * 2 + 1))
+                np.power(
+                    2**(-(2**-(np.log2(closest_power_of_2 * 2) -
+                               np.log2(alibi_bias_max)))),
+                    (h_id - closest_power_of_2) * 2 + 1))
     slopes = np.asarray(slopes_ft, dtype=np.float32)
 
     slopes = alibi_scale * slopes
-    # Note that for bfloat16, we cannot case numpy tensor from float32 to bfloat16
-    # because numpy does not support bfloat16. Even if we use custom type to define
-    # the np_bfloat16, the "astype" here would be undefined.
-    # So, we must use torch to cast tensor from float32 to bfloat16, and then use torch_to_numpy
-    # to cast the tensor back.
-    slopes = torch.from_numpy(slopes)
-    slopes = slopes.to(trt_dtype_to_torch(dtype))
-    slopes = torch_to_numpy(slopes)
-    slopes = constant(slopes.reshape(1, (end_head_id - start_head_id), 1, 1))
+    slopes = slopes.reshape(1, (end_head_id - start_head_id), 1, 1)
     return slopes
 
 
@@ -3848,7 +6441,7 @@ def generate_alibi_biases(slopes: Tensor, key_length: Tensor) -> Tensor:
     Compute the ALiBi biases as described in https://arxiv.org/abs/2211.05100.
 
     The ALiBi biases are added to the result of the Q*K^T product in the
-    multihead-attention block.
+    multi-head attention block.
 
     Parameters:
         slopes : Tensor
@@ -3867,7 +6460,6 @@ def generate_alibi_biases(slopes: Tensor, key_length: Tensor) -> Tensor:
     arange_shape = concat([1, 1, 1, key_length])
 
     arange_tensor = arange(trt_0, key_length, "float32").view(arange_shape)
-    arange_tensor = cast(arange_tensor, "float32")
     return slopes * arange_tensor
 
 
@@ -3879,7 +6471,7 @@ def expand_mask(mask: Tensor, tgt_len: Optional[Tensor] = None) -> Tensor:
     shape '[batch_size, src_seq_len]' to a tensor of shape
     '[batch_size, 1, tgt_seq_len, src_seq_len]'. It can be used to create the
     mask applied to the Q*K^T product before the softmax operation in the
-    multihead-attention block.
+    multi-head attention block.
 
     Parameters:
         mask : Tensor
@@ -3899,7 +6491,7 @@ def expand_mask(mask: Tensor, tgt_len: Optional[Tensor] = None) -> Tensor:
     mask = mask.view(concat([bsz, 1, 1, src_len]))
 
     mask = expand(mask, concat([bsz, 1, tgt_len, src_len]))
-    mask = where(mask == 0, float('-inf'), (1 - mask).cast('float32'))
+    mask = where(mask == 0, float('-inf'), 0.0)
     return mask
 
 
@@ -3950,26 +6542,42 @@ def gather_last_token_logits(hidden_states: Tensor, last_token_ids: Tensor,
         return hidden_states
 
     if remove_input_padding:
-        hidden_states = index_select(hidden_states, 1,
-                                     last_token_ids - 1)  # [1, seq_len, hidden]
+        hidden_states = index_select(hidden_states, 0,
+                                     last_token_ids - 1)  # [seq_len, hidden]
 
         hidden_states = hidden_states.view(
             concat([shape(last_token_ids, 0),
-                    shape(hidden_states, 2)]))
+                    shape(hidden_states, 1)]))
     else:
-        # only calculate logits for the last token
-        # [batch_size, seqlen, hidden_size] -> [batch_size, hidden_size]
-        last_token_ids = last_token_ids.view(
-            concat([shape(last_token_ids, 0), 1, 1]))
-        last_token_ids = expand(
-            last_token_ids,
-            concat([shape(last_token_ids, 0), 1,
-                    shape(hidden_states, 2)]))
-        last_token_ids = last_token_ids - 1
-        hidden_states = gather(
-            hidden_states, dim=1, indices=last_token_ids).view(
-                concat([shape(hidden_states, 0),
+        ndim = last_token_ids.ndim()
+        if ndim == 1:
+            # only calculate logits for the last token
+            # [batch_size, seqlen, hidden_size] -> [batch_size, hidden_size]
+            last_token_ids = last_token_ids.view(
+                concat([shape(last_token_ids, 0), 1, 1]))
+            last_token_ids = expand(
+                last_token_ids,
+                concat([shape(last_token_ids, 0), 1,
                         shape(hidden_states, 2)]))
+            last_token_ids = last_token_ids - 1
+            hidden_states = gather(
+                hidden_states, dim=1, indices=last_token_ids).view(
+                    concat([shape(hidden_states, 0),
+                            shape(hidden_states, 2)]))
+        elif ndim == 2:  # speculative decoding needs last few token's logits
+            # last_token_ids is of shape [batch_size, num_last_tokens]
+            # So [batch_size, seqlen, hidden_size] -> [batch_size, num_last_tokens, hidden_size]
+            last_token_ids = last_token_ids.view(
+                concat([shape(last_token_ids, 0),
+                        shape(last_token_ids, 1), 1]))
+            last_token_ids = expand(
+                last_token_ids,
+                concat([
+                    shape(last_token_ids, 0),
+                    shape(last_token_ids, 1),
+                    shape(hidden_states, 2)
+                ]))
+            hidden_states = gather(hidden_states, dim=1, indices=last_token_ids)
     return hidden_states
 
 
@@ -3979,12 +6587,19 @@ ACT2FN = {
     'gelu': gelu,
     'gelu_new': gelu,
     'gelu_fast': gelu,
+    'gelu_pytorch_tanh': gelu,
+    'openai-gelu': gelu,
     'geglu': geglu,
+    'gegelu': gegelu,
+    'identity': identity,
     'silu': silu,
     'softplus': softplus,
+    'relu2': squared_relu,
     'squared-relu': squared_relu,
     'swiglu': swiglu,
     'fast-swiglu': swiglu,
+    'sigmoid': sigmoid,
+    'quick_gelu': quick_gelu,
 }
 
 GATED_ACT_2_ACT = {
@@ -4034,20 +6649,20 @@ def non_gated_version(activation):
 def lora_plugin(
     input: Tensor = None,
     in_hidden_size: int = 0,
-    out_hidden_size: int = 0,
+    out_hidden_sizes: List[int] = [0],
     host_request_types: Tensor = None,
     transa: bool = False,
     transb: bool = False,
     host_context_lengths: Tensor = None,  # for pad-free input mode
-    max_context_length: int = 0,
     max_low_rank: int = 0,
-    lora_ranks: Tensor = None,
-    lora_weights_pointers: Tensor = None,
+    lora_ranks: List[Tensor] = None,
+    lora_weights_pointers: List[Tensor] = None,
+    weight_index: int = 0,
 ):
     '''
     Parameters:
-        lora_ids : cpu Tensor = None
-            A tensor that contains the lora ids of different inputs.
+        input : Tensor (On GPU)
+            The input tensor. Its shape is [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
 
         in_hidden_size/out_hidden_size : int
             the lora computation workflow is
@@ -4056,7 +6671,7 @@ def lora_plugin(
         host_request_types : Tensor = None
             The tensor on the host that indicates if a request is in context or
             generation phase. Its shape is [batch_size]. See Inflight Batching
-            in docs/gpt_attention.md,
+            in docs/source/advanced/gpt-attention.md,
 
         transa : bool
             Is the first input transposed? Set to 'True' if you want the first
@@ -4069,17 +6684,17 @@ def lora_plugin(
         host_context_lengths: cpu Tensor = None
             A host tensor that contains the lengths of the different inputs,
 
-        max_context_length : int
-            Maximum length during context phase, used to determine the workspace size.
-
         max_low_rank : int
             Maximum low_rank, used to determine the workspace size.
 
         lora_ranks : cpu Tensor with shape [batch_size]
             The low_rank of each request
 
-        lora_weights_pointers : cpu int64 Tensor with shape [batch_size, 2]
-            The weights pointers of each request. Consist of in_pointer and out_pointer.
+        lora_weights_pointers : cpu int64 Tensor with shape [batch_size, 3]
+            The weights pointers of each request. Consist of in_pointer, out_pointer and possibly a scales vector pointer.
+
+        weight_index : int
+            The index of weight if the weight pointer pointing to multiple weights.
 
     Return:
         The tensor produced by that layer.
@@ -4089,12 +6704,14 @@ def lora_plugin(
     ).plugin_config.remove_input_padding
 
     trt.get_plugin_registry().plugin_creator_list
-    in_hidden_size = trt.PluginField("in_hidden_size",
-                                     np.array(in_hidden_size, dtype=np.int32),
-                                     trt.PluginFieldType.INT32)
-    out_hidden_size = trt.PluginField("out_hidden_size",
-                                      np.array(out_hidden_size, dtype=np.int32),
-                                      trt.PluginFieldType.INT32)
+    in_hidden_size_field = trt.PluginField(
+        "in_hidden_size", np.array(in_hidden_size, dtype=np.int32),
+        trt.PluginFieldType.INT32)
+    out_hidden_size_field_list = [
+        trt.PluginField(f"out_hidden_size_{i}", np.array(o, dtype=np.int32),
+                        trt.PluginFieldType.INT32)
+        for i, o in enumerate(out_hidden_sizes)
+    ]
     transa = 1 if transa else 0
     transa = trt.PluginField("transa", np.array(transa, dtype=np.int32),
                              trt.PluginFieldType.INT32)
@@ -4114,24 +6731,911 @@ def lora_plugin(
         "remove_input_padding",
         np.array(np.int8(default_net().plugin_config.remove_input_padding),
                  dtype=np.int8), trt.PluginFieldType.INT8)
-    max_context_length_filed = trt.PluginField(
-        "max_context_length", np.array(max_context_length, dtype=np.int32),
-        trt.PluginFieldType.INT32)
-    max_low_rank_filed = trt.PluginField("max_low_rank",
+    max_low_rank_field = trt.PluginField("max_low_rank",
                                          np.array(max_low_rank, dtype=np.int32),
                                          trt.PluginFieldType.INT32)
+    weight_index_field = trt.PluginField("weight_index",
+                                         np.array(weight_index, dtype=np.int32),
+                                         trt.PluginFieldType.INT32)
+    num_lora_modules = len(out_hidden_sizes)
+    num_lora_modules_field = trt.PluginField(
+        "num_lora_modules", np.array(num_lora_modules, dtype=np.int32),
+        trt.PluginFieldType.INT32)
 
     pfc = trt.PluginFieldCollection([
-        in_hidden_size, out_hidden_size, transa, transb, pf_type,
-        remove_input_padding, max_context_length_filed, max_low_rank_filed
-    ])
+        in_hidden_size_field, transa, transb, num_lora_modules_field, pf_type,
+        remove_input_padding, max_low_rank_field, weight_index_field
+    ] + out_hidden_size_field_list)
     lora_plug = plg_creator.create_plugin("lora", pfc)
 
-    plug_inputs = [input, host_request_types, lora_ranks, lora_weights_pointers]
+    plug_inputs = [input.cast(p_dtype), host_request_types
+                   ] + lora_ranks + lora_weights_pointers
+
     if default_net().plugin_config.remove_input_padding:
         plug_inputs += [host_context_lengths]
 
     plug_inputs = [i.trt_tensor for i in plug_inputs]
     layer = default_trtnet().add_plugin_v2(plug_inputs, lora_plug)
 
+    if num_lora_modules == 1:
+        return _create_tensor(layer.get_output(0), layer).cast(input.dtype)
+    else:
+        return [
+            _create_tensor(layer.get_output(i), layer).cast(input.dtype)
+            for i in range(num_lora_modules)
+        ]
+
+
+def dora_plugin(activations: Tensor,
+                out_hidden_sizes: list[int],
+                lora_weights_pointers: list[Tensor],
+                host_request_types: Tensor,
+                host_context_lengths: Tensor | None = None) -> Tensor:
+    '''
+    The DoRA plugin applies column-wise scaling to the output of a LoRA layer.
+
+    Parameters:
+        input : Tensor (On GPU)
+            The input tensor. Its shape is [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
+
+        out_hidden_sizes : list[int]
+            The output hidden size of each adapter in the related LoRA module.
+            For example, for a qkv projection out_hidden_sizes should be [q_dim, k_dim, v_dim].
+
+        host_request_types : Tensor = None
+            The tensor on the host that indicates if a request is in context or
+            generation phase. Its shape is [batch_size]. See Inflight Batching
+            in docs/source/advanced/gpt-attention.md,
+
+        host_context_lengths: cpu Tensor = None
+            A host tensor that contains the lengths of the different inputs,
+
+    Return:
+        The tensor produced by that layer.
+
+    '''
+    assert host_context_lengths is not None or not default_net(
+    ).plugin_config.remove_input_padding
+
+    dora_plg_creator = trt.get_plugin_registry().get_creator(
+        'Dora', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert dora_plg_creator is not None
+
+    out_hidden_sizes = trt.PluginField(
+        f"out_hidden_sizes", np.array(out_hidden_sizes, dtype=np.int32),
+        trt.PluginFieldType.INT32)
+
+    remove_input_padding = trt.PluginField(
+        "remove_input_padding",
+        np.array(np.int8(default_net().plugin_config.remove_input_padding),
+                 dtype=np.int8), trt.PluginFieldType.INT8)
+
+    lora_dtype = default_net().plugin_config.lora_plugin
+    type_id = trt.PluginField(
+        "type", np.array(int(str_dtype_to_trt(lora_dtype)), np.int32),
+        trt.PluginFieldType.INT32)
+
+    pfc = trt.PluginFieldCollection(
+        [type_id, remove_input_padding, out_hidden_sizes])
+
+    dora_plug = dora_plg_creator.create_plugin("dora", pfc,
+                                               trt.TensorRTPhase.BUILD)
+
+    plug_inputs = [activations.cast(lora_dtype), host_request_types
+                   ] + lora_weights_pointers
+
+    if default_net().plugin_config.remove_input_padding:
+        plug_inputs += [host_context_lengths]
+
+    plug_inputs = [i.trt_tensor for i in plug_inputs]
+
+    layer = default_trtnet().add_plugin_v3(plug_inputs, [], dora_plug)
+    _add_plugin_info(layer, dora_plg_creator, "dora", pfc)
+    output = _create_tensor(layer.get_output(0), layer).cast(activations.dtype)
+    return output
+
+
+def mamba_conv1d(input: Tensor,
+                 conv_state_or_ptr: Tensor,
+                 conv_weight: Tensor,
+                 conv_bias: Tensor,
+                 host_request_types: Tensor,
+                 last_token_ids: Tensor,
+                 dim: int,
+                 dconv: int,
+                 dtype: str,
+                 pre_stride: int = 0,
+                 post_stride: int = 0,
+                 host_context_lengths: Optional[Tensor] = None,
+                 slot_mapping: Optional[Tensor] = None,
+                 apply_silu: bool = True):
+    '''
+    Parameters:
+        input : Tensor (On GPU)
+            The input tensor. Its shape is [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
+
+        conv_state_or_ptr : Tensor (On GPU or CPU)
+            The conv state tensor. Its shape is [batch_size, dconv - 1, dim]
+            Or the CPU tensor of shape [1] for the pointer of paged states.
+
+        conv_weight : Tensor (On GPU)
+            The weight tensor. Its shape is [1, dconv, dim]
+
+        conv_bias : Tensor (On GPU)
+            The bias tensor. Its shape is [dim]
+
+        host_request_types : Tensor (On CPU)
+            The tensor on the host that indicates if a request is in context or
+            generation phase. Its shape is [batch_size]. See Inflight Batching
+            in docs/source/advanced/gpt-attention.md,
+
+        last_token_ids : Tensor (On GPU)
+            The inclusive prefix-sum of the lengths or the lengths of the
+            sequences in the batch.
+
+        dim : int
+            The hidden dimension of conv1d
+
+        dconv : int
+            The window size of conv1d
+
+        dtype: str
+            data type
+
+        pre_stride : int = 0
+            The (pre) stride size of the input tensor.
+            The valid values of the input tensor are input[..., pre_stride: dim-post_stride]
+
+        post_stride : int = 0
+            The (post) stride size of the input tensor.
+            The valid values of the input tensor are input[..., pre_stride: dim-post_stride]
+
+        host_context_lengths: Tensor (On CPU) (Optional)
+            A host tensor that contains the lengths of the different inputs,
+
+        slot_mapping: Tensor (On GPU) (Optional)
+            Real page index in state. Its shape is [dim], used for paged state, each page shape is [dconv, dim]
+
+        apply_silu: bool
+            Is there a SiLU operation after the conv1d? When True apply
+            SiLU activation function after the conv1d.
+    '''
+    assert host_request_types is not None
+    mamba_conv1d_plg_creator = trt.get_plugin_registry().get_plugin_creator(
+        'MambaConv1d', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert mamba_conv1d_plg_creator is not None
+
+    dim = trt.PluginField("dim", np.array(dim, dtype=np.int32),
+                          trt.PluginFieldType.INT32)
+    dconv = trt.PluginField("dconv", np.array(dconv, dtype=np.int32),
+                            trt.PluginFieldType.INT32)
+    pre_stride = trt.PluginField("pre_stride",
+                                 np.array(pre_stride, dtype=np.int32),
+                                 trt.PluginFieldType.INT32)
+    post_stride = trt.PluginField("post_stride",
+                                  np.array(post_stride, dtype=np.int32),
+                                  trt.PluginFieldType.INT32)
+    pf_type = trt.PluginField(
+        "type_id", np.array([int(str_dtype_to_trt(dtype))], np.int32),
+        trt.PluginFieldType.INT32)
+    remove_input_padding = trt.PluginField(
+        "remove_input_padding",
+        np.array(np.int8(default_net().plugin_config.remove_input_padding),
+                 dtype=np.int8), trt.PluginFieldType.INT8)
+    paged_state = trt.PluginField(
+        "paged_state",
+        np.array(np.int8(default_net().plugin_config.paged_state),
+                 dtype=np.int8), trt.PluginFieldType.INT8)
+    apply_silu = trt.PluginField("apply_silu",
+                                 np.array(np.int8(apply_silu), dtype=np.int8),
+                                 trt.PluginFieldType.INT8)
+
+    pfc = trt.PluginFieldCollection([
+        dim, dconv, pre_stride, post_stride, pf_type, remove_input_padding,
+        paged_state, apply_silu
+    ])
+    mamba_conv1d_plug = mamba_conv1d_plg_creator.create_plugin(
+        "mamba_conv1d", pfc)
+    plug_inputs = [
+        input, conv_state_or_ptr, conv_weight, conv_bias, host_request_types,
+        last_token_ids
+    ]
+    if default_net().plugin_config.remove_input_padding:
+        plug_inputs += [host_context_lengths]
+    if default_net().plugin_config.paged_state:
+        plug_inputs += [slot_mapping]
+    plug_inputs = [i.trt_tensor for i in plug_inputs]
+
+    layer = default_trtnet().add_plugin_v2(plug_inputs, mamba_conv1d_plug)
+    _add_plugin_info(layer, mamba_conv1d_plg_creator, "mamba_conv1d", pfc)
+    output = _create_tensor(layer.get_output(0), layer)
+    if default_net().plugin_config.paged_state:
+        return output, None
+    else:
+        present_state = _create_tensor(layer.get_output(1), layer)
+        return output, present_state
+
+
+def selective_scan(input: Tensor,
+                   state_or_ptr: Tensor,
+                   delta: Tensor,
+                   delta_bias: Tensor,
+                   A: Tensor,
+                   BC: Tensor,
+                   D: Tensor,
+                   host_request_types: Tensor,
+                   last_token_ids: Tensor,
+                   dim: int,
+                   dstate: int,
+                   dt_rank: int,
+                   delta_softplus: bool,
+                   dtype: str,
+                   z: Optional[Tensor] = None,
+                   host_context_lengths: Optional[Tensor] = None,
+                   slot_mapping: Optional[Tensor] = None,
+                   nheads: int = 1,
+                   ngroups: int = 1,
+                   chunk_size: int = 256,
+                   mamba_version: str = 'Mamba1'):
+    '''
+    Parameters:
+        input : Tensor (On GPU)
+            The input tensor. Its shape is [batch_size, seq_len, dim]
+
+        state_or_ptr : Tensor (On GPU or CPU)
+            The ssm state tensor. Its shape is [batch_size, dstate, dim]
+            Or the CPU tensor of shape [1] for the pointer of paged states.
+
+        delta : Tensor (On GPU)
+            The delta tensor.
+            mamba: Its shape is [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
+            mamba2: Its shape is [batch_size, seq_len, nheads] or [num_tokens, nheads] for remove_input_padding
+
+        delta_bias : Tensor (On GPU)
+            The delta bias tensor.
+            mamba: Its shape is [dim]
+            mamba2: Its shape is [nheads]
+
+        A : Tensor (On GPU)
+            A matrix.
+            mamba: Its shape is [dstate, dim]
+            mamba2: Its shape is [nheads]
+
+        BC : Tensor (On GPU)
+            B and C matrix.
+            mamba: Its shape is [batch_size, seq_len, dstate * 2] or [num_tokens, dstate * 2] for remove_input_padding
+            mamba2: Its shape is [batch_size, seq_len, ngroups * dstate * 2] or [num_tokens, ngroups * dstate * 2] for remove_input_padding
+
+        D : Tensor (On GPU)
+            D matrix.
+            mamba: Its shape is [dim]
+            mamba2: Its shape is [nheads]
+
+        host_request_types : Tensor (On CPU)
+            The tensor on the host that indicates if a request is in context or
+            generation phase. Its shape is [batch_size]. See Inflight Batching
+            in docs/source/advanced/gpt-attention.md
+
+        last_token_ids : Tensor (On GPU)
+            The inclusive prefix-sum of the lengths or the lengths of the
+            sequences in the batch.
+
+        dim : int
+            The inner dimension of SSM block
+
+        dstate : int
+            The state dimension of SSM block
+
+        dt_rank: int
+            The rank dimension of dt_proj
+
+        delta_softplus : bool
+            Do we apply softplus to the delta.
+
+        dtype: str
+            data type
+
+        z : Tensor (On GPU) (Optional)
+            The z tensor. Its shape is [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
+
+        host_context_lengths: Tensor (On CPU) (Optional)
+            A host tensor that contains the lengths of the different inputs,
+
+        slot_mapping: Tensor (On GPU) (Optional)
+            Real page index in state. Its shape is [dim], used for paged state, each page shape is [dstate, dim]
+
+        nheads: int (Optional)
+            The number of heads.
+
+        ngroups: int (Optional)
+            The number of groups.
+
+        chunk_size: int (Optional)
+            The chunk_size is used for the chunk_scan kernel.
+
+        mamba_version: int (Optional)
+            Mamba version, support Mamba1 as default.
+    '''
+    assert host_request_types is not None
+    selective_scan_plg_creator = trt.get_plugin_registry().get_plugin_creator(
+        'SelectiveScan', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert selective_scan_plg_creator is not None
+
+    dim = trt.PluginField("dim", np.array(dim, dtype=np.int32),
+                          trt.PluginFieldType.INT32)
+    dstate = trt.PluginField("dstate", np.array(dstate, dtype=np.int32),
+                             trt.PluginFieldType.INT32)
+    dt_rank = trt.PluginField("dt_rank", np.array(dt_rank, dtype=np.int32),
+                              trt.PluginFieldType.INT32)
+    nheads = trt.PluginField("nheads", np.array(nheads, dtype=np.int32),
+                             trt.PluginFieldType.INT32)
+    ngroups = trt.PluginField("ngroups", np.array(ngroups, dtype=np.int32),
+                              trt.PluginFieldType.INT32)
+    chunk_size = trt.PluginField("chunk_size",
+                                 np.array(chunk_size, dtype=np.int32),
+                                 trt.PluginFieldType.INT32)
+    delta_softplus = trt.PluginField(
+        "delta_softplus", np.array(np.int8(delta_softplus), dtype=np.int8),
+        trt.PluginFieldType.INT8)
+    pf_type = trt.PluginField(
+        "type_id", np.array([int(str_dtype_to_trt(dtype))], np.int32),
+        trt.PluginFieldType.INT32)
+    remove_input_padding = trt.PluginField(
+        "remove_input_padding",
+        np.array(np.int8(default_net().plugin_config.remove_input_padding),
+                 dtype=np.int8), trt.PluginFieldType.INT8)
+    paged_state = trt.PluginField(
+        "paged_state",
+        np.array(np.int8(default_net().plugin_config.paged_state),
+                 dtype=np.int8), trt.PluginFieldType.INT8)
+    if z is None:
+        z_enabled = trt.PluginField("z_enabled", np.array(0, dtype=np.int8),
+                                    trt.PluginFieldType.INT8)
+    else:
+        z_enabled = trt.PluginField("z_enabled", np.array(1, dtype=np.int8),
+                                    trt.PluginFieldType.INT8)
+    is_mamba2 = trt.PluginField(
+        "is_mamba2",
+        np.array(1 if mamba_version == 'Mamba2' else 0, dtype=np.int8),
+        trt.PluginFieldType.INT8)
+
+    pfc = trt.PluginFieldCollection([
+        dim, dstate, dt_rank, nheads, ngroups, chunk_size, delta_softplus,
+        pf_type, remove_input_padding, paged_state, z_enabled, is_mamba2
+    ])
+    selective_scan_plug = selective_scan_plg_creator.create_plugin(
+        "selective_scan", pfc)
+
+    plug_inputs = [
+        input, state_or_ptr, delta, delta_bias, A, BC, D, host_request_types,
+        last_token_ids
+    ]
+    if default_net().plugin_config.remove_input_padding:
+        plug_inputs += [host_context_lengths]
+    if default_net().plugin_config.paged_state:
+        plug_inputs += [slot_mapping]
+    if z is not None:
+        plug_inputs += [z]
+    plug_inputs = [i.trt_tensor for i in plug_inputs]
+
+    layer = default_trtnet().add_plugin_v2(plug_inputs, selective_scan_plug)
+    _add_plugin_info(layer, selective_scan_plg_creator, "selective_scan", pfc)
+    output = _create_tensor(layer.get_output(0), layer)
+    if default_net().plugin_config.paged_state:
+        return output, None
+    else:
+        present_state = _create_tensor(layer.get_output(1), layer)
+        return output, present_state
+
+
+def rg_lru(input: Tensor,
+           A: Tensor,
+           state_or_ptr: Tensor,
+           host_request_types: Tensor,
+           last_token_ids: Tensor,
+           dim: int,
+           dtype: str,
+           block_size: int = 0,
+           y: Optional[Tensor] = None,
+           y_bias: Optional[Tensor] = None,
+           gate: Optional[Tensor] = None,
+           gate_bias: Optional[Tensor] = None,
+           gate_x: Optional[Tensor] = None,
+           gate_x_bias: Optional[Tensor] = None,
+           gate_a: Optional[Tensor] = None,
+           gate_a_bias: Optional[Tensor] = None,
+           slot_mapping: Optional[Tensor] = None):
+    '''
+    Parameters:
+        input : Tensor (On GPU)
+            The input tensor. Its shape is [batch_size, seq_len, dim]
+
+        A : Tensor (On GPU)
+            A matrix. Its shape is [dim]
+
+        state_or_ptr : Tensor (On GPU or CPU)
+            The lru state tensor. Its shape is [batch_size, dstate, dim]
+            Or the CPU tensor of shape [1] for the pointer of paged states.
+
+        host_request_types : Tensor (On CPU)
+            The tensor on the host that indicates if a request is in context or
+            generation phase. Its shape is [batch_size]. See Inflight Batching
+            in docs/source/advanced/gpt-attention.md,
+
+        last_token_ids : Tensor (On GPU)
+            The inclusive prefix-sum of the lengths or the lengths of the
+            sequences in the batch.
+
+        dim : int
+            The inner dimension of RG_LRU block
+
+        block_size : int
+            The block size of the block diagonal linear layer. It is used to
+            support the cases that enable fused gate.
+
+        dtype: str
+            data type
+
+        y : Tensor (On GPU) (Optional)
+            The y tensor. Its shape is [batch_size, seq_len, dim]
+
+        y_bias : Tensor (On GPU) (Optional)
+            The y_bias tensor. Its shape is [dim]. If y_bias is not None, we
+            will fuse GELU(y + y_bias) in this function.
+
+        gate : Tensor (On GPU) (Optional)
+            The gate tensor. Its shape is [batch_size, seq_len, 2 * dim].
+            If gate is not None, we will fuse the gate_x and gate_a, otherwise
+            use those two tensors.
+
+        gate_bias : Tensor (On GPU) (Optional)
+            The gate_bias tensor. Its shape is [2 * block_num, dim // block_num].
+            If gate_bias is not None, we will fuse the bias add in this function.
+
+        gate_x : Tensor (On GPU) (Optional)
+            The gate_x tensor. Its shape is [batch_size, seq_len, dim]
+
+        gate_x_bias : Tensor (On GPU) (Optional)
+            The gate_x_bias tensor. Its shape is [block_num, dim // block_num].
+            If gate_x_bias is not None, we will fuse the bias add in this function.
+
+        gate_a : Tensor (On GPU) (Optional)
+            The gate_a tensor. Its shape is [batch_size, seq_len, dim]
+
+        gate_a_bias : Tensor (On GPU) (Optional)
+            The gate_a_bias tensor. Its shape is [block_num, dim // block_num].
+            If gate_a_bias is not None, we will fuse the bias add in this function.
+
+        slot_mapping: Tensor (On GPU) (Optional)
+            Real page index in state. Its shape is [dim], used for paged state, each page shape is [dstate, dim]
+    '''
+    assert host_request_types is not None
+    lru_plg_creator = trt.get_plugin_registry().get_plugin_creator(
+        'LRU', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert lru_plg_creator is not None
+    assert (gate_x_bias is None) == (gate_a_bias is None)
+    enable_fuse_gate = gate is not None
+    has_gate_bias = (gate_bias is not None) or (gate_x_bias is not None)
+    if enable_fuse_gate:
+        assert gate is not None
+        assert block_size > 0
+        if has_gate_bias:
+            assert gate_bias is not None
+    else:
+        assert gate_x is not None and gate_a is not None
+        if has_gate_bias:
+            assert gate_x_bias is not None and gate_a_bias is not None
+
+    dim = trt.PluginField("dim", np.array(dim, dtype=np.int32),
+                          trt.PluginFieldType.INT32)
+    block_size = trt.PluginField("block_size",
+                                 np.array(block_size, dtype=np.int32),
+                                 trt.PluginFieldType.INT32)
+    pf_type = trt.PluginField(
+        "type_id", np.array([int(str_dtype_to_trt(dtype))], np.int32),
+        trt.PluginFieldType.INT32)
+    remove_input_padding = trt.PluginField(
+        "remove_input_padding",
+        np.array(np.int8(default_net().plugin_config.remove_input_padding),
+                 dtype=np.int8), trt.PluginFieldType.INT8)
+    paged_state = trt.PluginField(
+        "paged_state",
+        np.array(np.int8(default_net().plugin_config.paged_state),
+                 dtype=np.int8), trt.PluginFieldType.INT8)
+
+    if y is None:
+        y_enabled = trt.PluginField("y_enabled", np.array(0, dtype=np.int8),
+                                    trt.PluginFieldType.INT8)
+    else:
+        y_enabled = trt.PluginField("y_enabled", np.array(1, dtype=np.int8),
+                                    trt.PluginFieldType.INT8)
+
+    if y_bias is None:
+        y_bias_enabled = trt.PluginField("y_bias_enabled",
+                                         np.array(0, dtype=np.int8),
+                                         trt.PluginFieldType.INT8)
+    else:
+        y_bias_enabled = trt.PluginField("y_bias_enabled",
+                                         np.array(1, dtype=np.int8),
+                                         trt.PluginFieldType.INT8)
+
+    if enable_fuse_gate:
+        fuse_gate_enabled = trt.PluginField("fuse_gate_enabled",
+                                            np.array(1, dtype=np.int8),
+                                            trt.PluginFieldType.INT8)
+    else:
+        fuse_gate_enabled = trt.PluginField("fuse_gate_enabled",
+                                            np.array(0, dtype=np.int8),
+                                            trt.PluginFieldType.INT8)
+
+    if has_gate_bias:
+        gate_bias_enabled = trt.PluginField("gate_bias_enabled",
+                                            np.array(1, dtype=np.int8),
+                                            trt.PluginFieldType.INT8)
+    else:
+        gate_bias_enabled = trt.PluginField("gate_bias_enabled",
+                                            np.array(0, dtype=np.int8),
+                                            trt.PluginFieldType.INT8)
+
+    pfc = trt.PluginFieldCollection([
+        dim, block_size, pf_type, remove_input_padding, paged_state, y_enabled,
+        y_bias_enabled, fuse_gate_enabled, gate_bias_enabled
+    ])
+    lru_plug = lru_plg_creator.create_plugin("rg_lru", pfc)
+
+    plug_inputs = [
+        input,
+        A,
+        state_or_ptr,
+        host_request_types,
+        last_token_ids,
+    ]
+    if default_net().plugin_config.paged_state:
+        plug_inputs += [slot_mapping]
+    if y is not None:
+        plug_inputs += [y]
+        if y_bias is not None:
+            plug_inputs += [y_bias]
+    if enable_fuse_gate:
+        plug_inputs += [gate]
+        if has_gate_bias:
+            plug_inputs += [gate_bias]
+    else:
+        plug_inputs += [gate_x, gate_a]
+        if has_gate_bias:
+            plug_inputs += [gate_x_bias, gate_a_bias]
+    plug_inputs = [i.trt_tensor for i in plug_inputs]
+
+    layer = default_trtnet().add_plugin_v2(plug_inputs, lru_plug)
+    _add_plugin_info(layer, lru_plg_creator, "rg_lru", pfc)
+    output = _create_tensor(layer.get_output(0), layer)
+    if default_net().plugin_config.paged_state:
+        return output, None
+    else:
+        present_state = _create_tensor(layer.get_output(1), layer)
+        return output, present_state
+
+
+def topk(input: Tensor,
+         k: Union[Tensor, int],
+         dim: int,
+         largest: bool = True,
+         prefer_plugin: bool = True) -> Tuple[Tensor, Tensor]:
+    '''
+    Add an topk operation.
+
+    As explained in the ONNX documentation,
+
+        https://github.com/onnx/onnx/blob/main/docs/Operators.md#topk
+
+    NOTE: One distinction from the ONNX topk op, the output is always sorted
+    with TensorRT layer.
+
+    Retrieve the top-K largest elements along a specified axis.
+    Given an input tensor of shape [a_1, a_2, ..., a_n, r]
+    and integer argument k, return two outputs:
+    Value tensor of shape [a_1, a_2, ..., a_{axis-1}, k, a_{axis+1}, ... a_n] which contains the values of the top k elements along the specified axis
+    Index tensor of shape [a_1, a_2, ..., a_{axis-1}, k, a_{axis+1}, ... a_n] which contains the indices of the top k elements (original indices from the input tensor).
+
+    Parameters:
+        input : Tensor
+            The input tensor.
+
+        k : int
+            A single positive value corresponding to the number of top elements to retrieve
+
+        dim: int
+            The dimension in which to compute the topk indices.
+
+        largest: bool
+            Controls whether to return largest or smallest elements
+
+        prefer_plugin : bool
+            Whether to use the topkLastDim plugin if dim is last dim and k is static.
+
+
+    Returns:
+        The tensors (values, indices) produced by this topk operation.
+    '''
+    dim = dim_resolve_negative(dim, input.ndim())[0]
+    if prefer_plugin and dim == input.ndim() - 1 and not isinstance(k, Tensor):
+        last_dim = input.size(-1)
+        if last_dim == -1:  # dynamic?
+            last_dim = shape(input, -1)
+        # since we might need to flatten the input to 2d tensor,
+        # we need to prepare the output shape
+        out_shape = []
+        for i in range(input.ndim() - 1):
+            out_shape.append(shape(input, i))
+        out_shape = concat(out_shape + [k])
+        if input.ndim() == 1:
+            input_2d = unsqueeze(input,
+                                 0)  # special handling of rank-1 dynamic tensor
+        elif input.ndim() != 2:
+            input_2d = input.view(concat([-1, last_dim]),
+                                  zero_is_placeholder=False)
+        else:
+            input_2d = input
+        plg_creator = trt.get_plugin_registry().get_plugin_creator(
+            "TopkLastDim", "1", TRT_LLM_PLUGIN_NAMESPACE)
+        assert plg_creator is not None
+        is_largest = trt.PluginField(
+            "is_largest", np.array(1 if largest else 0, dtype=np.int32),
+            trt.PluginFieldType.INT32)
+        k = trt.PluginField("k", np.array(k, dtype=np.int32),
+                            trt.PluginFieldType.INT32)
+        pf_type = trt.PluginField("type_id",
+                                  np.array([int(input_2d.dtype)], np.int32),
+                                  trt.PluginFieldType.INT32)
+        pfc = trt.PluginFieldCollection([pf_type, k, is_largest])
+        topk_last_dim_plug = plg_creator.create_plugin("topk_last_dim", pfc)
+        plug_inputs = [input_2d]
+        plug_inputs = [i.trt_tensor for i in plug_inputs]
+        layer = default_trtnet().add_plugin_v2(plug_inputs, topk_last_dim_plug)
+        _add_plugin_info(layer, plg_creator, "topk_last_dim", pfc)
+        values = _create_tensor(layer.get_output(0), layer)
+        indices = _create_tensor(layer.get_output(1), layer)
+        values = values.view(out_shape, zero_is_placeholder=False)
+        indices = indices.view(out_shape, zero_is_placeholder=False)
+    else:
+        # non-plugin path
+        axes = dim_to_trt_axes(dim)
+        layer = default_trtnet().add_topk(
+            input.trt_tensor,
+            trt.TopKOperation.MAX if largest else trt.TopKOperation.MIN,
+            k=k if not isinstance(k, Tensor) else 1,
+            axes=axes)
+        if isinstance(k, Tensor):
+            if k.ndim() == 1:
+                k = squeeze(k, 0)
+            layer.set_input(1, k.trt_tensor)
+        values = _create_tensor(layer.get_output(0), layer)
+        indices = _create_tensor(layer.get_output(1), layer)
+
+    return values, indices
+
+
+def scatter_nd(input: Tensor, mask: Tensor, source: Tensor) -> Tensor:
+    '''
+    Scatter_nd is a tensor operation that writes or updates values in a tensor based on indices.
+
+    Parameters:
+        input: Tensor
+            The input tensor to be updated
+        mask: Tensor
+            A tensor of indices specifying the locations in data to be updated.
+        source: Tensor
+            A tensor of values to be written or scattered into data.
+    Returns:
+        New tensor with the same shape as the input tensor data,
+        where the values from the source tensor are scattered or written into the output tensor
+        at the locations specified by the mask tensor.
+    '''
+    scatter_layer = default_trtnet().add_scatter(input.trt_tensor,
+                                                 mask.trt_tensor,
+                                                 source.trt_tensor,
+                                                 mode=trt.ScatterMode.ND)
+    return _create_tensor(scatter_layer.get_output(0), scatter_layer)
+
+
+def low_latency_gemm(input: Tensor,
+                     mat2: Tensor,
+                     alpha: Optional[np.ndarray] = None,
+                     strict_dtype: Optional[trt.DataType] = None) -> Tensor:
+    if not default_net().plugin_config.low_latency_gemm_plugin:
+        raise RuntimeError("Low Latency GEMM is only support with plugin")
+    elif default_net().plugin_config.low_latency_gemm_plugin != "fp8":
+        raise RuntimeError("Low Latency GEMM plugin only support fp8")
+    else:
+        plg_creator = trt.get_plugin_registry().get_plugin_creator(
+            "LowLatencyGemm", "1", TRT_LLM_PLUGIN_NAMESPACE)
+        assert plg_creator is not None
+        if ((input.dtype != trt.fp8) or ((mat2.dtype) != trt.fp8)):
+            raise TypeError("Low Latency GEMM only support fp8 input")
+        if (alpha):
+            assert (isinstance(alpha, np.ndarray) and alpha.dtype == np.float32
+                    and alpha.size
+                    == 1), "`alpha` must be passed as a float32 ndarray"
+        alpha = alpha if alpha else np.array(1.0, dtype=np.float32)
+        alpha = trt.PluginField("alpha", alpha.flatten(),
+                                trt.PluginFieldType.FLOAT32)
+
+        if strict_dtype is not None:
+            assert isinstance(strict_dtype, trt.DataType)
+            p_dtype = strict_dtype
+            if (p_dtype not in [trt.float32, trt.float16, trt.bfloat16]):
+                raise ValueError(
+                    "strict_dtype must be float32, float16 or bfloat16 in low latency gemm plugin"
+                )
+        else:
+            raise RuntimeError(
+                "need to use strict dtype in  low latency gemm plugin fp8")
+        pf_type = trt.PluginField("type_id", np.array([int(p_dtype)], np.int32),
+                                  trt.PluginFieldType.INT32)
+        pfc = trt.PluginFieldCollection([alpha, pf_type])
+        low_latency_gemm_plug = plg_creator.create_plugin(
+            "low_latency_gemm", pfc)
+        plug_inputs = [input.trt_tensor, mat2.trt_tensor]
+        layer = default_trtnet().add_plugin_v2(plug_inputs,
+                                               low_latency_gemm_plug)
+        _add_plugin_info(layer, plg_creator, "low_latency_gemm", pfc)
+        return _create_tensor(layer.get_output(0), layer)
+
+
+class SideStreamIDType(IntEnum):
+    disable = 0
+    moe = 1
+
+
+def low_latency_gemm_swiglu(input: Tensor,
+                            weight: Tensor,
+                            scale_d0: float = 1.0,
+                            scale_d1: float = 1.0,
+                            scale_output: float = 1.0) -> Tensor:
+    '''
+    Add a matrix multiplication, followed by SwiGLU (`x * SiLU(gate)`) operation.
+
+    The second SwiGLU operation takes the preceding tensor, splits it into two halves
+    along the last dimension, applies SiLU to the second half and multiply the results. The
+    behaviour is undefined if the last dimension is not even.
+
+        Parameters:
+        input : Tensor
+            The first tensor (often called A).
+
+        weight : Tensor
+            The second tensor (often called B).
+
+        scale_d0 : float
+            The scale for dequantizing x, used for fp8
+
+        scale_d1 : float
+            The scale for dequantizing gate, used for fp8
+
+        scale_output : float
+            The scale for quantizing output, used for fp8
+
+                Returns:
+        The tensor produced by the inserted layer.
+    '''
+    plg_creator = trt.get_plugin_registry().get_plugin_creator(
+        'LowLatencyGemmSwiglu', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert plg_creator is not None
+
+    p_dtype = default_net().plugin_config.low_latency_gemm_swiglu_plugin
+    pf_type = trt.PluginField(
+        "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
+        trt.PluginFieldType.INT32)
+    pf_scale_d0 = trt.PluginField("scale_d0",
+                                  np.array(scale_d0, dtype=np.float32),
+                                  trt.PluginFieldType.FLOAT32)
+    pf_scale_d1 = trt.PluginField("scale_d1",
+                                  np.array(scale_d1, dtype=np.float32),
+                                  trt.PluginFieldType.FLOAT32)
+    pf_scale_output = trt.PluginField("scale_output",
+                                      np.array(scale_output, dtype=np.float32),
+                                      trt.PluginFieldType.FLOAT32)
+
+    pfc = trt.PluginFieldCollection(
+        [pf_type, pf_scale_output, pf_scale_d0, pf_scale_d1])
+    low_latency_gemm_swiglu_plug = plg_creator.create_plugin(
+        "low_latency_gemm_swiglu", pfc)
+
+    plug_inputs = [input.trt_tensor, weight.trt_tensor]
+
+    layer = default_trtnet().add_plugin_v2(plug_inputs,
+                                           low_latency_gemm_swiglu_plug)
+
     return _create_tensor(layer.get_output(0), layer)
+
+
+def cuda_stream_sync(input_list: List[Tensor],
+                     side_stream_id: SideStreamIDType) -> Tensor:
+    '''
+    Wait for the side stream on the main stream.
+    output = input_list[0]
+
+    Parameters:
+        input_list : List[Tensor] (On GPU)
+            The list of input tensors.
+        side_stream_id : int (On CPU)
+            The side stream ID.
+    '''
+    plg_creator = trt.get_plugin_registry().get_plugin_creator(
+        "CudaStream", "1", TRT_LLM_PLUGIN_NAMESPACE)
+    assert plg_creator is not None
+
+    p_side_stream_id = trt.PluginField("side_stream_id",
+                                       np.array(side_stream_id, dtype=np.int32),
+                                       trt.PluginFieldType.INT32)
+    p_num_inputs = trt.PluginField("num_inputs",
+                                   np.array(len(input_list), dtype=np.int32),
+                                   trt.PluginFieldType.INT32)
+    pf_type = trt.PluginField(
+        "type_id", np.array([int(input_list[0].dtype)], dtype=np.int32),
+        trt.PluginFieldType.INT32)
+    pfc = trt.PluginFieldCollection([p_side_stream_id, p_num_inputs, pf_type])
+    plug = plg_creator.create_plugin("cuda_stream", pfc)
+    plug_inputs = [input.trt_tensor for input in input_list]
+
+    layer = default_trtnet().add_plugin_v2(plug_inputs, plug)
+    _add_plugin_info(layer, plg_creator, "cuda_stream", pfc)
+    output = _create_tensor(layer.get_output(0), layer)
+    return output
+
+
+def cp_split_plugin(
+    input_ids: Tensor,
+    host_request_types: Tensor,
+    host_context_lengths: Tensor,  # for pad-free input mode
+    cp_size: int = 1,
+    cp_rank: int = 0,
+) -> Tensor:
+    '''
+    Add an operation to perform splitting for context parallelism.
+
+    This operation split the input_ids into cp_size chunks, and return the cp_rank-th
+    chunk.
+    When the seqlen % cp_size != 0, the chunk sizes of each rank would be
+    [seqlen // cp_size, seqlen // cp_size, ..., seqlen - (seqlen // cp_size) * cp_size]
+
+    It inserts a IPluginV3Layer.
+
+    Parameters:
+        input : Tensor
+            The input tensor contains the indices to split.
+
+        host_request_types: Tensor = None (On CPU)
+            The tensor on the host that indicates if a request is in context or
+            generation phase. Its shape is [batch_size]. See Inflight Batching
+            in docs/gpt_attention.md,
+
+        host_context_lengths: Tensor = None (On CPU)
+            A host tensor that contains the lengths of the different inputs
+
+    Returns:
+        The output split tensor.
+        The length of the output split tensor.
+        The index for rebuilding the sequence
+    '''
+    plg_creator = trt.get_plugin_registry().get_creator(
+        'CpSplit', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert plg_creator is not None
+
+    cp_size = trt.PluginField("cp_size", np.array([int(cp_size)], np.int32),
+                              trt.PluginFieldType.INT32)
+    cp_rank = trt.PluginField("cp_rank", np.array([int(cp_rank)], np.int32),
+                              trt.PluginFieldType.INT32)
+
+    pfc = trt.PluginFieldCollection([cp_size, cp_rank])
+    cp_split_plug = plg_creator.create_plugin("cp_split", pfc,
+                                              trt.TensorRTPhase.BUILD)
+    plug_inputs = [
+        input_ids.trt_tensor, host_request_types.trt_tensor,
+        host_context_lengths.trt_tensor
+    ]
+
+    layer = default_trtnet().add_plugin_v3(plug_inputs, [], cp_split_plug)
+    _add_plugin_info(layer, plg_creator, "cp_split", pfc)
+    return _create_tensor(layer.get_output(0),
+                          layer), _create_tensor(layer.get_output(2), layer)

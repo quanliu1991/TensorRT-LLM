@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,9 +18,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
-#include "tensorrt_llm/runtime/tllmBuffers.h"
 
-#include <memory>
 #include <string>
 
 namespace tensorrt_llm::runtime
@@ -41,10 +39,12 @@ public:
 
         if (offset + size > mBuffer->getSize())
         {
-            throw std::out_of_range(std::string("slice ") + std::to_string(offset + size) + " exceeds buffer size "
-                + std::to_string(mBuffer->getSize()));
+            throw std::out_of_range(std::string("offset ") + std::to_string(offset) + std::string(" + size ")
+                + std::to_string(size) + " exceeds buffer size " + std::to_string(mBuffer->getSize()));
         }
     }
+
+    using IBuffer::data;
 
     void* data() override
     {

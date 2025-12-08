@@ -2,6 +2,12 @@
 
 set -ex
 
+GITHUB_URL="https://github.com"
+if [ -n "${GITHUB_MIRROR}" ]; then
+    GITHUB_URL=${GITHUB_MIRROR}
+    export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
+fi
+
 set_bash_env() {
   if [ ! -f ${BASH_ENV} ];then
     touch ${BASH_ENV}
@@ -14,67 +20,129 @@ set_bash_env() {
   fi
 }
 
-init_ubuntu() {
-    apt-get update
-    apt-get install -y --no-install-recommends \
-      ccache \
-      gdb \
-      git-lfs \
-      libffi-dev \
-      python3-dev \
-      python3-pip \
-      python-is-python3 \
-      wget
-    if ! command -v mpirun &> /dev/null; then
-      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openmpi-bin libopenmpi-dev
-    fi
+cleanup() {
+  # Clean up apt/dnf cache
+  if [ -f /etc/debian_version ]; then
     apt-get clean
     rm -rf /var/lib/apt/lists/*
-    echo 'export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda/lib64' >> "${ENV}"
-    # Remove previous TRT installation
-    if [[ $(apt list --installed | grep libnvinfer) ]]; then
-        apt-get remove --purge -y libnvinfer*
-    fi
-    if [[ $(apt list --installed | grep tensorrt) ]]; then
-        apt-get remove --purge -y tensorrt*
-    fi
-    pip uninstall -y tensorrt
+  elif [ -f /etc/redhat-release ]; then
+    dnf clean all
+    rm -rf /var/cache/dnf
+  fi
+
+  # Clean up temporary files
+  rm -rf /tmp/* /var/tmp/*
+
+  # Clean up pip cache
+  pip3 cache purge || true
+
+  # Clean up documentation
+  rm -rf /usr/share/doc/* /usr/share/man/* /usr/share/info/*
+
+  # Clean up locale files
+  find /usr/share/locale -maxdepth 1 -mindepth 1 -type d ! -name 'en*' -exec rm -rf {} +
 }
 
-install_gcc_centos() {
-    yum -y update
-    # Use GCC 9 because its STL officially supports C++ 17.
-    # https://gcc.gnu.org/gcc-9/changes.html
-    GCC_VERSION="9.5.0"
-    yum install -y gcc gcc-c++ file libtool make wget bzip2 bison yacc flex
-    wget https://github.com/gcc-mirror/gcc/archive/refs/tags/releases/gcc-${GCC_VERSION}.tar.gz -O /tmp/gcc-${GCC_VERSION}.tar.gz
-    tar -xf /tmp/gcc-${GCC_VERSION}.tar.gz -C /tmp/ && cd /tmp/gcc-releases-gcc-${GCC_VERSION}
-    ./contrib/download_prerequisites
-    ./configure --disable-multilib --enable-languages=c,c++ --with-pi
-    make -j$(nproc) && make install
-    echo 'export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib64' >> "${ENV}"
-    cd .. && rm -rf /tmp/gcc-*
-    yum clean all
+init_ubuntu() {
+  apt-get update
+  # libibverbs-dev is installed but libmlx5.so is missing, reinstall the package
+  apt remove -y ibverbs-providers libibverbs1
+  apt-get --reinstall install -y libibverbs-dev
+  apt-get install -y --no-install-recommends \
+    ccache \
+    gdb \
+    git-lfs \
+    clang \
+    lld \
+    llvm \
+    libclang-rt-dev \
+    libffi-dev \
+    libstdc++-14-dev \
+    libnuma1 \
+    libnuma-dev \
+    python3-dev \
+    python3-pip \
+    python-is-python3 \
+    wget \
+    pigz \
+    libzmq3-dev
+  if ! command -v mpirun &> /dev/null; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openmpi-bin libopenmpi-dev
+  fi
+  echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH' >> "${ENV}"
+  # Remove previous TRT installation
+  if [[ $(apt list --installed | grep libnvinfer) ]]; then
+    apt-get remove --purge -y libnvinfer*
+  fi
+  if [[ $(apt list --installed | grep tensorrt) ]]; then
+    apt-get remove --purge -y tensorrt*
+  fi
+  pip3 uninstall -y tensorrt
 }
 
-init_centos() {
-    PY_VERSION=38
-    DEVTOOLSET_ENV_FILE="/tmp/devtoolset_env"
-    yum -y update
-    yum -y install centos-release-scl-rh epel-release
-    # https://gitlab.com/nvidia/container-images/cuda
-    echo 'export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda/lib64' >> "${ENV}"
-    CUDA_VERSION=$(nvcc --version | sed -n 's/^.*release \([0-9]\+\.[0-9]\+\).*$/\1/p')
-    YUM_CUDA=${CUDA_VERSION/./-}
-    # Consistent with manylinux2014 centos-7 based version
-    yum -y install wget git-lfs rh-python${PY_VERSION} rh-python${PY_VERSION}-python-devel rh-git227 devtoolset-10 libffi-devel
-    yum -y install openmpi3 openmpi3-devel
-    echo "source scl_source enable rh-git227 rh-python38" >> "${ENV}"
-    echo "source scl_source enable devtoolset-10" >> "${DEVTOOLSET_ENV_FILE}"
-    echo "source ${DEVTOOLSET_ENV_FILE}" >> "${ENV}"
-    echo 'export PATH=$PATH:/usr/lib64/openmpi3/bin' >> "${ENV}"
-    bash -c "pip install 'urllib3<2.0'"
-    yum clean all
+install_python_rockylinux() {
+  PYTHON_VERSION=$1
+  PYTHON_MAJOR="3"
+  PYTHON_URL="https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tgz"
+  if [ -n "${GITHUB_MIRROR}" ]; then
+    PYTHON_URL="https://urm.nvidia.com/artifactory/api/vcs/downloadTag/vcs-remote/python/cpython/v${PYTHON_VERSION}?ext=tar.gz"
+  fi
+  dnf makecache --refresh
+  dnf install \
+    epel-release \
+    compiler-rt \
+    curl \
+    make \
+    gcc \
+    openssl-devel \
+    bzip2-devel \
+    llvm-toolset \
+    lld \
+    libffi-devel \
+    numactl \
+    numactl-devel \
+    zlib-devel \
+    xz-devel \
+    sqlite-devel \
+    -y
+  echo "Installing Python ${PYTHON_VERSION}..."
+  curl -L ${PYTHON_URL} | tar -zx -C /tmp
+  if [ -n "${GITHUB_MIRROR}" ]; then
+    mv /tmp/cpython-${PYTHON_VERSION} /tmp/Python-${PYTHON_VERSION}
+  fi
+  cd /tmp/Python-${PYTHON_VERSION}
+  bash -c "./configure --enable-shared --prefix=/opt/python/${PYTHON_VERSION} --enable-ipv6 \
+    LDFLAGS=-Wl,-rpath=/opt/python/${PYTHON_VERSION}/lib,--disable-new-dtags && make -j$(nproc) && make install"
+  ln -s /opt/python/${PYTHON_VERSION}/bin/python3 /usr/local/bin/python
+  echo "export PATH=/opt/python/${PYTHON_VERSION}/bin:\$PATH" >> "${ENV}"
+  cd .. && rm -rf /tmp/Python-${PYTHON_VERSION}
+}
+
+install_pyp_rockylinux() {
+  bash -c "pip3 install 'urllib3<2.0' pytest"
+}
+
+install_gcctoolset_rockylinux() {
+  dnf install -y gcc gcc-c++ file libtool make wget bzip2 bison flex
+  # https://catalog.ngc.nvidia.com/orgs/nvidia/containers/cuda
+  echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH' >> "${ENV}"
+  dnf install \
+    patch \
+    vim \
+    wget \
+    git-lfs \
+    gcc-toolset-11 \
+    libffi-devel \
+    -y
+  dnf install \
+    openmpi \
+    openmpi-devel \
+    pigz \
+    rdma-core-devel \
+    zeromq-devel \
+    -y
+  echo "source scl_source enable gcc-toolset-11" >> "${ENV}"
+  echo 'export PATH=/usr/lib64/openmpi/bin:$PATH' >> "${ENV}"
 }
 
 # Install base packages depending on the base OS
@@ -84,12 +152,16 @@ case "$ID" in
   ubuntu)
     init_ubuntu
     ;;
-  centos)
-    install_gcc_centos
-    init_centos
+  rocky)
+    install_python_rockylinux $1
+    install_pyp_rockylinux
+    install_gcctoolset_rockylinux
     ;;
   *)
     echo "Unable to determine OS..."
     exit 1
     ;;
 esac
+
+# Final cleanup
+cleanup

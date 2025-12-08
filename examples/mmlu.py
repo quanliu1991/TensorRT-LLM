@@ -44,23 +44,25 @@ Example usage:
 """
 
 import argparse
-import json
 import os
 import random
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 from tqdm import tqdm
-from transformers import (AutoModel, AutoModelForCausalLM,
+from transformers import (AutoConfig, AutoModel, AutoModelForCausalLM,
                           AutoModelForSeq2SeqLM, AutoTokenizer,
                           GenerationConfig)
-from utils import load_tokenizer
+from utils import (add_common_args, load_tokenizer, prepare_enc_dec_inputs,
+                   read_is_enc_dec, read_model_name)
 
 import tensorrt_llm
-from tensorrt_llm.runtime import ModelRunner
+from tensorrt_llm.runtime import PYTHON_BINDINGS, ModelRunner
+
+if PYTHON_BINDINGS:
+    from tensorrt_llm.runtime import ModelRunnerCpp
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -77,12 +79,6 @@ RAND_SEED = 1234
 
 def get_choices():
     return ["A", "B", "C", "D"]
-
-
-def read_model_name_from_config(config_path: Path):
-    with open(config_path, "r") as f:
-        config = json.load(f)
-    return config["builder_config"]["name"]
 
 
 def get_subcategories():
@@ -199,9 +195,12 @@ def gen_prompt(train_df, subject, k=-1):
 
 
 def evaluate(args, subject, pipeline, dev_df, test_df):
+    rank = tensorrt_llm.mpi_rank()
     cors = []
     all_probs = []
     for i in range(test_df.shape[0]):
+        if i >= args.max_ite:
+            break
         # get prompt and make sure it fits
         k = args.ntrain
         prompt_end = format_example(test_df, i, include_answer=False)
@@ -216,18 +215,22 @@ def evaluate(args, subject, pipeline, dev_df, test_df):
         label = test_df.iloc[i, test_df.shape[1] - 1]
         pred = pipeline(prompt)
 
-        probs = [0 for _ in get_choices()]
-        cor = pred.strip().startswith(label)
-        cors.append(cor)
-        all_probs.append(probs)
+        if rank == 0:
+            probs = [0 for _ in get_choices()]
+            cor = pred.strip().startswith(label)
+            cors.append(cor)
+            all_probs.append(probs)
 
-    acc = np.mean(cors)
-    cors = np.array(cors)
+    if rank == 0:
+        acc = np.mean(cors)
+        cors = np.array(cors)
 
-    all_probs = np.array(all_probs)
-    print("Average accuracy {:.3f} - {}".format(acc, subject))
+        all_probs = np.array(all_probs)
+        print("Average accuracy {:.3f} - {}".format(acc, subject))
 
-    return cors, acc, all_probs
+        return cors, acc, all_probs
+    else:
+        return None, 0, None
 
 
 def get_tokenizer(ckpt_path, max_seq_len):
@@ -245,29 +248,35 @@ def get_tokenizer(ckpt_path, max_seq_len):
 
 class Pipeline:
 
-    def __init__(self,
-                 tokenizer,
-                 model,
-                 pad_id,
-                 end_id,
-                 max_attention_window_size=2048):
+    def __init__(self, tokenizer, model, model_name, pad_id, end_id,
+                 max_attention_window_size, is_enc_dec, hf_model_dir,
+                 engine_dir):
         self.tokenizer = tokenizer
         self.model = model
+        self.model_name = model_name
         self.pad_id = pad_id
         self.end_id = end_id
         self.max_attention_window_size = max_attention_window_size
+        self.output_len = 2
+        self.is_enc_dec = is_enc_dec
+        self.decoder_start_token_id = None
+        self.engine_dir = engine_dir
+        if self.is_enc_dec:
+            self.decoder_start_token_id = AutoConfig.from_pretrained(
+                hf_model_dir).decoder_start_token_id
 
     def __call__(self, prompt):
+        rank = tensorrt_llm.mpi_rank()
         # Run the model in batch size 1 and beam size 1
-        inputs = self.tokenizer.encode(prompt, return_tensors="pt")
+        inputs = self.tokenizer.encode(prompt, return_tensors="pt").squeeze(0)
         batch_input_ids = [inputs]
 
         # For multi-choice tasks like MMLU, we don't need to adjust following parameters
-        output_len = 2
+        output_len = self.output_len
         top_k = 1
         top_p = 0.0
 
-        input_lengths = [x.size(1) for x in batch_input_ids]
+        input_lengths = [x.size(0) for x in batch_input_ids]
 
         with torch.no_grad():
             if isinstance(self.model, nn.Module):
@@ -278,21 +287,45 @@ class Pipeline:
                     for l in input_lengths
                 ]
                 batch_input_ids = [
-                    torch.cat([pad, x.squeeze(0)])
+                    torch.cat([pad, x])
                     for x, pad in zip(batch_input_ids, paddings)
                 ]
                 batch_input_ids = torch.stack(batch_input_ids)
                 batch_input_ids = batch_input_ids.cuda()
+                if self.is_enc_dec:
+                    batch_decoder_input_ids = torch.IntTensor(
+                        [[self.decoder_start_token_id]]).to('cuda')
+                    batch_decoder_input_ids = batch_decoder_input_ids.repeat(
+                        (batch_input_ids.shape[0], 1))
+
                 with torch.no_grad():
                     # Use default temperature and top_k
-                    outputs = self.model.generate(batch_input_ids,
-                                                  max_new_tokens=output_len,
-                                                  top_k=top_k)
-                    output_ids = outputs[0, input_lengths[0]:]
+                    outputs = self.model.generate(
+                        batch_input_ids,
+                        max_new_tokens=output_len,
+                        top_k=top_k,
+                        decoder_input_ids=batch_decoder_input_ids
+                        if self.is_enc_dec else None)
+                    if not self.is_enc_dec:
+                        output_ids = outputs[0, input_lengths[0]:]
+                    else:
+                        output_ids = outputs[0]
 
-            elif isinstance(self.model, ModelRunner):
+            elif isinstance(self.model, ModelRunnerCpp) or isinstance(
+                    self.model, ModelRunner):
+                if self.is_enc_dec:
+                    encoder_input_ids, encoder_input_features, encoder_output_lengths, decoder_input_ids = prepare_enc_dec_inputs(
+                        batch_input_ids, self.model_name, self.engine_dir, None)
+
                 outputs = self.model.generate(
-                    batch_input_ids,
+                    batch_input_ids=decoder_input_ids
+                    if self.is_enc_dec else batch_input_ids,
+                    encoder_input_ids=encoder_input_ids
+                    if self.is_enc_dec else None,
+                    encoder_input_features=encoder_input_features
+                    if self.is_enc_dec else None,
+                    encoder_output_lengths=encoder_output_lengths
+                    if self.is_enc_dec else None,
                     max_new_tokens=output_len,
                     max_attention_window_size=self.max_attention_window_size,
                     end_id=self.end_id,
@@ -301,18 +334,25 @@ class Pipeline:
                     top_p=top_p,
                 )
                 torch.cuda.synchronize()
-                output_ids = outputs[0, 0, input_lengths[0]:]
-
-        return self.tokenizer.decode(output_ids, skip_special_tokens=True)
+                if rank == 0:
+                    if not self.is_enc_dec:
+                        output_ids = outputs[0, 0, input_lengths[0]:]
+                    else:
+                        output_ids = outputs[0, 0]
+        if rank == 0:
+            return self.tokenizer.decode(output_ids, skip_special_tokens=True)
+        else:
+            return None
 
     def check_valid_length(self, prompt):
-        return len(self.tokenizer.encode(prompt)) <= self.model.max_input_len
+        if isinstance(self.model, nn.Module):
+            return True
+        input_len = len(self.tokenizer.encode(prompt))
+        return input_len <= self.model.max_input_len and input_len + self.output_len <= self.model.max_seq_len
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--hf_model_dir", type=str, default=None)
-    parser.add_argument("--engine_dir", type=str, default=None)
     parser.add_argument(
         "--data_dir",
         type=str,
@@ -321,42 +361,23 @@ def parse_args():
               "download https://people.eecs.berkeley.edu/~hendrycks/data.tar"),
     )
     parser.add_argument("--ntrain", type=int, default=5)
-    parser.add_argument(
-        "--data_type",
-        type=str,
-        choices=["fp32", "fp16", "bf16", "float32", "float16", "bfloat16"],
-        default="fp16",
-    )
-    parser.add_argument(
-        "--debug_mode",
-        default=False,
-        action="store_true",
-        help="Whether or not to turn on the debug mode",
-    )
-    parser.add_argument(
-        "--hf_device_map_auto",
-        action="store_true",
-        help=("Use device map 'auto' to load a pretrained HF model. This may "
-              "help to test a large model that cannot fit into a singlue GPU."),
-    )
     parser.add_argument("--max_input_length", type=int, default=2048)
-    parser.add_argument(
-        '--max_attention_window_size',
-        type=int,
-        default=None,
-        help=
-        'The attention window size that controls the sliding window attention / cyclic kv cache behaviour'
-    )
-
     parser.add_argument("--test_trt_llm", action="store_true")
     parser.add_argument("--test_hf", action="store_true")
+    parser.add_argument('--check_accuracy', action='store_true')
+    parser.add_argument('--accuracy_threshold', type=float, default=30)
+    parser.add_argument('--max_ite', type=int, default=10000000)
+    parser = add_common_args(parser)
 
     args = parser.parse_args()
+
     return args
 
 
 def main():
     args = parse_args()
+    if args.tokenizer_dir is None:
+        args.tokenizer_dir = args.hf_model_dir
     random.seed(RAND_SEED)
     np.random.seed(RAND_SEED)
     runtime_rank = tensorrt_llm.mpi_rank()
@@ -377,28 +398,56 @@ def main():
     }
     cat_cors = {cat: [] for cat in get_categories()}
 
-    model_ckpt_path = args.hf_model_dir
-    model_name = read_model_name_from_config(
-        Path(args.engine_dir) / "config.json")
-    tokenizer, pad_id, end_id = load_tokenizer(model_ckpt_path,
-                                               model_name=model_name)
+    # different handling if encoder-decoder models
+    is_enc_dec = read_is_enc_dec(
+        args.engine_dir if not args.test_hf else args.hf_model_dir,
+        args.test_hf)
+
+    model_name, model_version = read_model_name(
+        (args.engine_dir if not is_enc_dec else os.path.join(
+            args.engine_dir, 'encoder'))
+        if not args.test_hf else args.hf_model_dir, args.test_hf)
+
+    tokenizer, pad_id, end_id = load_tokenizer(
+        tokenizer_dir=args.tokenizer_dir,
+        vocab_file=args.vocab_file,
+        model_name=model_name,
+        model_version=model_version,
+    )
+
     if args.test_trt_llm:
         assert not args.test_hf, "Cannot test both TRT-LLM and HF"
-        model = ModelRunner.from_dir(args.engine_dir,
-                                     rank=runtime_rank,
-                                     debug_mode=args.debug_mode)
+        runner_cls = ModelRunner if not PYTHON_BINDINGS else ModelRunnerCpp
+        runner_kwargs = {}
+        if PYTHON_BINDINGS:
+            runner_kwargs.update(max_beam_width=1)
+        runner_kwargs.update(
+            is_enc_dec=is_enc_dec,
+            max_tokens_in_paged_kv_cache=args.max_tokens_in_paged_kv_cache,
+            kv_cache_enable_block_reuse=args.kv_cache_enable_block_reuse,
+            kv_cache_free_gpu_memory_fraction=args.
+            kv_cache_free_gpu_memory_fraction,
+            cross_kv_cache_fraction=args.cross_kv_cache_fraction
+            if is_enc_dec else None,
+            enable_chunked_context=args.enable_chunked_context,
+            multi_block_mode=args.multi_block_mode)
+        model = runner_cls.from_dir(engine_dir=args.engine_dir,
+                                    rank=runtime_rank,
+                                    **runner_kwargs)
     else:
         assert args.test_hf, "Must test either TRT-LLM or HF"
-        if model_name.startswith("chatglm"):
+        if 'GLM' in model_name and model_version == 'glm':
+            auto_model_cls = AutoModelForSeq2SeqLM
+        elif 'GLM' in model_name and model_version == 'chatglm':
             auto_model_cls = AutoModel
-        elif model_name.startswith("glm"):
+        elif is_enc_dec:
             auto_model_cls = AutoModelForSeq2SeqLM
         else:
             auto_model_cls = AutoModelForCausalLM
         model = auto_model_cls.from_pretrained(
             args.hf_model_dir,
             trust_remote_code=True,
-            torch_dtype=DTYPE_STR_MAPPING[args.data_type],
+            dtype=DTYPE_STR_MAPPING[args.hf_data_type],
             device_map="auto" if args.hf_device_map_auto else None,
         )
         if not args.hf_device_map_auto:
@@ -407,7 +456,9 @@ def main():
             model.generation_config = GenerationConfig.from_pretrained(
                 args.hf_model_dir, trust_remote_code=True)
 
-    pipeline = Pipeline(tokenizer, model, pad_id, end_id)
+    pipeline = Pipeline(tokenizer, model, model_name, pad_id, end_id,
+                        args.max_attention_window_size, is_enc_dec,
+                        args.hf_model_dir, args.engine_dir)
 
     for subject in tqdm(subjects):
         dev_df = pd.read_csv(os.path.join(args.data_dir, "dev",
@@ -426,17 +477,21 @@ def main():
                     cat_cors[key].append(cors)
         all_cors.append(cors)
 
-    for subcat in subcat_cors:
-        subcat_acc = np.mean(np.concatenate(subcat_cors[subcat]))
-        print("Average accuracy {:.3f} - {}".format(subcat_acc, subcat))
+    if runtime_rank == 0:
+        for subcat in subcat_cors:
+            acc = np.mean(np.concatenate(subcat_cors[subcat])) * 100
+            print(f"Average accuracy {acc:.2f} - {subcat}")
 
-    for cat in cat_cors:
-        cat_acc = np.mean(np.concatenate(cat_cors[cat]))
-        print("Average accuracy {:.3f} - {}".format(cat_acc, cat))
+        for cat in cat_cors:
+            acc = np.mean(np.concatenate(cat_cors[cat])) * 100
+            print(f"Average accuracy {acc:.2f} - {cat}")
 
-    weighted_acc = np.mean(np.concatenate(all_cors))
-    print("Average accuracy: {:.3f}".format(weighted_acc))
-    return weighted_acc
+        weighted_acc = np.mean(np.concatenate(all_cors)) * 100
+        print(f"MMLU weighted average accuracy: {weighted_acc:.2f}")
+
+        if args.check_accuracy:
+            assert weighted_acc >= args.accuracy_threshold, f"Expected accuracy >= {args.accuracy_threshold} while got {weighted_acc}"
+        return weighted_acc
 
 
 if __name__ == "__main__":

@@ -1,33 +1,20 @@
-/***************************************************************************************************
- * Copyright (c) 2017 - 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: BSD-3-Clause
+/*
+ * Copyright (c) 2017-2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * 1. Redistributions of source code must retain the above copyright notice, this
- * list of conditions and the following disclaimer.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- * this list of conditions and the following disclaimer in the documentation
- * and/or other materials provided with the distribution.
- *
- * 3. Neither the name of the copyright holder nor the names of its
- * contributors may be used to endorse or promote products derived from
- * this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
- * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- **************************************************************************************************/
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 /*! \file
     \brief Template for a double-buffered threadblock-scoped GEMM kernel.
 */
@@ -80,19 +67,19 @@ template <
     typename SmemIteratorB_,
     /// Cache operation for operand B
     cutlass::arch::CacheOperation::Kind CacheOpB,
-    /// Data type for the scales
+    /// Iterators over scales in global memory
     typename IteratorScale_,
     /// Iterators over scales in shared memory
     typename SmemIteratorScale_,
     /// Data type of accumulator matrix
     typename ElementC_,
-    /// Data type of accumulator matrix
+    /// Layout of accumulator matrix
     typename LayoutC_,
     /// Policy describing tuning details (concept: MmaPolicy)
     typename Policy_,
     /// Number of stages,
     int Stages,
-    /// Converter for B matrix applited immediately after the LDS
+    /// Converter for B matrix applied immediately after the LDS
     typename TransformBAfterLDS_,
     /// The quantization operator being used
     WeightOnlyQuantOp QuantOp_,
@@ -189,8 +176,9 @@ private:
     using WarpFragmentB = typename Operator::FragmentB;
     Dequantizer warp_dequantizer_;
 
+    using ElementA = typename IteratorA::Element;
     using ElementB = typename IteratorB::Element;
-    using LayoutDetailsForB = kernel::LayoutDetailsB<ElementB, ArchTag>;
+    using LayoutDetailsForB = kernel::LayoutDetailsB<ElementA, ElementB, ArchTag>;
 
     static constexpr bool RequiresTileInterleave
         = layout::IsColumnMajorTileInterleave<typename LayoutDetailsForB::Layout>::value;
@@ -218,7 +206,7 @@ public:
         ///< Shared storage needed for internal use by threadblock-scoped GEMM
         typename Base::SharedStorage& shared_storage,
         /// The group size for quantization
-        int group_size,
+        int const group_size,
         ///< ID within the threadblock
         int thread_idx,
         ///< ID of warp
@@ -279,9 +267,20 @@ public:
         }
         else if (iterator_scale.group_size_ == 128)
         {
-            if (iterator_scale.row_groupsize64_ & 0x1)
+            if constexpr (Shape::kK == 128)
             {
                 iterator_scale.add_tile_offset({1, 0});
+            }
+            else if constexpr (Shape::kK == 64)
+            {
+                if (iterator_scale.row_groupsize64_ & 0x1)
+                {
+                    iterator_scale.add_tile_offset({1, 0});
+                }
+            }
+            else
+            {
+                static_assert(Shape::kK == 0, "Unsupported k tile shape, can only be 64 or 128");
             }
         }
 
@@ -291,8 +290,8 @@ public:
     }
 
     CUTLASS_DEVICE
-    void copy_tiles_and_advance(IteratorA& iterator_A, IteratorB& iterator_B, IteratorScale& iterator_scale,
-        int group_start_A = 0, int group_start_B = 0)
+    void copy_tiles_and_advance(
+        IteratorA& iterator_A, IteratorB& iterator_B, int group_start_A = 0, int group_start_B = 0)
     {
         iterator_A.set_iteration_index(group_start_A * IteratorA::kAccessesPerVector);
         this->smem_iterator_A_.set_iteration_index(group_start_A);
@@ -413,8 +412,6 @@ public:
                 {
                     int const kSrcBytes = sizeof_bits<typename IteratorA::Element>::value
                         * IteratorA::ThreadMap::kElementsPerAccess / IteratorA::kAccessesPerVector / 8;
-
-                    int src_bytes = (iterator_A.valid() ? kSrcBytes : 0);
 
                     cutlass::arch::cp_async_zfill<kSrcBytes, kCacheOpA>(
                         dst_ptr + v, iterator_A.get(), iterator_A.valid());
@@ -572,8 +569,8 @@ public:
                 this->warp_tile_iterator_A_.load(warp_frag_A[(warp_mma_k + 1) % 2]);
                 ++this->warp_tile_iterator_A_;
 
-                const int warp_tileB_k_compute_offset = warp_mma_k % Base::kNumKIterationsPerWarpBLoad;
-                const int warp_tileB_k_load_offset = warp_mma_k / Base::kNumKIterationsPerWarpBLoad;
+                int const warp_tileB_k_compute_offset = warp_mma_k % Base::kNumKIterationsPerWarpBLoad;
+                int const warp_tileB_k_load_offset = warp_mma_k / Base::kNumKIterationsPerWarpBLoad;
                 if (warp_tileB_k_compute_offset == Base::kNumKIterationsPerWarpBLoad - 1)
                 {
                     this->warp_tile_iterator_B_.set_kgroup_index(
@@ -586,8 +583,17 @@ public:
                     = lds_converter(warp_frag_B[warp_tileB_k_load_offset % 2]);
                 warp_dequantizer_.dequantize(converted_frag_B, warp_frag_scales, warp_frag_zeros);
 
-                run_warp_mma(
-                    warp_mma, accum, warp_frag_A[warp_mma_k % 2], converted_frag_B, accum, warp_tileB_k_compute_offset);
+                using FragmentOperandB = cutlass::Array<ElementA, Operator::FragmentB::kElements>;
+                constexpr cutlass::FloatRoundStyle RoundStyle = cutlass::FloatRoundStyle::round_to_nearest;
+                constexpr int ConversionVectorWidth = TransformBAfterLDS::result_type::kElements;
+                static_assert(ConversionVectorWidth == FragmentOperandB::kElements);
+
+                using Converter
+                    = cutlass::NumericArrayConverter<ElementA, ElementScale, ConversionVectorWidth, RoundStyle>;
+
+                FragmentOperandB converted_frag_B_operand = Converter::convert(converted_frag_B);
+                warp_mma(
+                    accum, warp_frag_A[warp_mma_k % 2], converted_frag_B_operand, accum, warp_tileB_k_compute_offset);
 
                 // Issue global->shared copies for the this stage
                 if (warp_mma_k < Base::kWarpGemmIterations - 1)
@@ -597,8 +603,7 @@ public:
                     group_start_iteration_A = warp_mma_k * Detail::kAccessesPerGroupA;
                     group_start_iteration_B = warp_mma_k * Detail::kAccessesPerGroupB;
 
-                    copy_tiles_and_advance(
-                        iterator_A, iterator_B, iterator_scale, group_start_iteration_A, group_start_iteration_B);
+                    copy_tiles_and_advance(iterator_A, iterator_B, group_start_iteration_A, group_start_iteration_B);
 
                     // This is the first group of a given stage, so we issue the loads for the B scales immediately.
                     if (group_start_iteration_B == 0)
@@ -613,8 +618,7 @@ public:
                     group_start_iteration_A = (warp_mma_k + 1) * Detail::kAccessesPerGroupA;
                     group_start_iteration_B = (warp_mma_k + 1) * Detail::kAccessesPerGroupB;
 
-                    copy_tiles_and_advance(
-                        iterator_A, iterator_B, iterator_scale, group_start_iteration_A, group_start_iteration_B);
+                    copy_tiles_and_advance(iterator_A, iterator_B, group_start_iteration_A, group_start_iteration_B);
 
                     // Inserts a memory fence between stages of cp.async instructions.
                     cutlass::arch::cp_async_fence();

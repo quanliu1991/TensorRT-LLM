@@ -16,12 +16,18 @@
  */
 #include "recvPlugin.h"
 
+#include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
+
+#include <nccl.h>
+
 using namespace nvinfer1;
 using tensorrt_llm::plugins::RecvPluginCreator;
 using tensorrt_llm::plugins::RecvPlugin;
+using tensorrt_llm::mpi::MpiTag;
 
-static const char* RECV_PLUGIN_VERSION{"1"};
-static const char* RECV_PLUGIN_NAME{"Recv"};
+static char const* RECV_PLUGIN_VERSION{"1"};
+static char const* RECV_PLUGIN_NAME{"Recv"};
 PluginFieldCollection RecvPluginCreator::mFC{};
 std::vector<nvinfer1::PluginField> RecvPluginCreator::mPluginAttributes;
 
@@ -32,12 +38,16 @@ RecvPlugin::RecvPlugin(int srcRank, nvinfer1::DataType type)
 }
 
 // Parameterized constructor
-RecvPlugin::RecvPlugin(const void* data, size_t length)
+RecvPlugin::RecvPlugin(void const* data, size_t length)
 {
-    const char *d = reinterpret_cast<const char*>(data), *a = d;
+    char const *d = reinterpret_cast<char const*>(data), *a = d;
     read(d, mType);
     read(d, mSrcRank);
-    TLLM_CHECK(d == a + length);
+    TLLM_CHECK_WITH_INFO(d == a + length,
+        "Expected length (%d) != real length (%d). This is often "
+        "caused by using different TensorRT LLM version to build "
+        "engine and run engine.",
+        (int) length, (int) (d - a));
 }
 
 // IPluginV2DynamicExt Methods
@@ -49,48 +59,50 @@ nvinfer1::IPluginV2DynamicExt* RecvPlugin::clone() const noexcept
 }
 
 nvinfer1::DimsExprs RecvPlugin::getOutputDimensions(
-    int outputIndex, const nvinfer1::DimsExprs* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
+    int outputIndex, nvinfer1::DimsExprs const* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
 {
     return inputs[0];
 }
 
 bool RecvPlugin::supportsFormatCombination(
-    int pos, const nvinfer1::PluginTensorDesc* inOut, int nbInputs, int nbOutputs) noexcept
+    int pos, nvinfer1::PluginTensorDesc const* inOut, int nbInputs, int nbOutputs) noexcept
 {
     return (inOut[pos].type == mType) && (inOut[pos].format == TensorFormat::kLINEAR);
 }
 
-void RecvPlugin::configurePlugin(const nvinfer1::DynamicPluginTensorDesc* in, int nbInputs,
-    const nvinfer1::DynamicPluginTensorDesc* out, int nbOutputs) noexcept
+void RecvPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int nbInputs,
+    nvinfer1::DynamicPluginTensorDesc const* out, int nbOutputs) noexcept
 {
 }
 
-size_t RecvPlugin::getWorkspaceSize(const nvinfer1::PluginTensorDesc* inputs, int nbInputs,
-    const nvinfer1::PluginTensorDesc* outputs, int nbOutputs) const noexcept
+size_t RecvPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* inputs, int nbInputs,
+    nvinfer1::PluginTensorDesc const* outputs, int nbOutputs) const noexcept
 {
     return 0;
 }
 
-int RecvPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const nvinfer1::PluginTensorDesc* outputDesc,
-    const void* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
+int RecvPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
+    void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
 {
     if (isBuilding())
     {
         return 0;
     }
-    int size = 1;
+    size_t size = 1;
     for (int i = 0; i < inputDesc[0].dims.nbDims; ++i)
     {
         size *= inputDesc[0].dims.d[i];
     }
+    TLLM_LOG_DEBUG("start ncclRecv with size %d", size);
     NCCLCHECK(ncclRecv(outputs[0], size, (*getDtypeMap())[inputDesc[0].type], 0, mComm, stream));
+    TLLM_LOG_DEBUG("end ncclRecv with size %d", size);
 
     return 0;
 }
 
 // IPluginV2Ext Methods
 nvinfer1::DataType RecvPlugin::getOutputDataType(
-    int index, const nvinfer1::DataType* inputTypes, int nbInputs) const noexcept
+    int index, nvinfer1::DataType const* inputTypes, int nbInputs) const noexcept
 {
     assert(index == 0);
     return inputTypes[0];
@@ -98,12 +110,12 @@ nvinfer1::DataType RecvPlugin::getOutputDataType(
 
 // IPluginV2 Methods
 
-const char* RecvPlugin::getPluginType() const noexcept
+char const* RecvPlugin::getPluginType() const noexcept
 {
     return RECV_PLUGIN_NAME;
 }
 
-const char* RecvPlugin::getPluginVersion() const noexcept
+char const* RecvPlugin::getPluginVersion() const noexcept
 {
     return RECV_PLUGIN_VERSION;
 }
@@ -119,13 +131,15 @@ int RecvPlugin::initialize() noexcept
     {
         return 0;
     }
-    int myRank, nRanks;
-    MPICHECK(MPI_Comm_rank(MPI_COMM_WORLD, &myRank));
-    MPICHECK(MPI_Comm_size(MPI_COMM_WORLD, &nRanks));
-
     ncclUniqueId id;
-    MPI_Status status;
-    MPICHECK(MPI_Recv(&id, sizeof(id), MPI_BYTE, mSrcRank, 0, MPI_COMM_WORLD, &status));
+    COMM_SESSION.recvValue(id, mSrcRank, MpiTag::kDefault);
+// Need static connection initialization for accurate KV cache size estimation
+#if defined(_WIN32)
+    if (getenv("NCCL_RUNTIME_CONNECT") == nullptr)
+        _putenv_s("NCCL_RUNTIME_CONNECT", "0");
+#else
+    setenv("NCCL_RUNTIME_CONNECT", "0", 0);
+#endif // _WIN32
     NCCLCHECK(ncclCommInitRank(&mComm, 2, id, 1));
     return 0;
 }
@@ -149,7 +163,7 @@ void RecvPlugin::serialize(void* buffer) const noexcept
     char *d = static_cast<char*>(buffer), *a = d;
     write(d, mType);
     write(d, mSrcRank);
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 }
 
 void RecvPlugin::destroy() noexcept
@@ -164,46 +178,46 @@ RecvPluginCreator::RecvPluginCreator()
 {
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
-    mPluginAttributes.emplace_back(PluginField("src_rank", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("src_rank", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32));
 
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }
 
-const char* RecvPluginCreator::getPluginName() const noexcept
+char const* RecvPluginCreator::getPluginName() const noexcept
 {
     return RECV_PLUGIN_NAME;
 }
 
-const char* RecvPluginCreator::getPluginVersion() const noexcept
+char const* RecvPluginCreator::getPluginVersion() const noexcept
 {
     return RECV_PLUGIN_VERSION;
 }
 
-const PluginFieldCollection* RecvPluginCreator::getFieldNames() noexcept
+PluginFieldCollection const* RecvPluginCreator::getFieldNames() noexcept
 {
     return &mFC;
 }
 
-IPluginV2* RecvPluginCreator::createPlugin(const char* name, const PluginFieldCollection* fc) noexcept
+IPluginV2* RecvPluginCreator::createPlugin(char const* name, PluginFieldCollection const* fc) noexcept
 {
-    const PluginField* fields = fc->fields;
-    int srcRank;
-    nvinfer1::DataType type;
+    PluginField const* fields = fc->fields;
+    int srcRank{};
+    nvinfer1::DataType type{};
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {
-        const char* attrName = fields[i].name;
+        char const* attrName = fields[i].name;
         if (!strcmp(attrName, "src_rank"))
         {
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
-            srcRank = static_cast<int>(*(static_cast<const int*>(fields[i].data)));
+            srcRank = static_cast<int>(*(static_cast<int const*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "type_id"))
         {
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
-            type = static_cast<nvinfer1::DataType>(*(static_cast<const nvinfer1::DataType*>(fields[i].data)));
+            type = static_cast<nvinfer1::DataType>(*(static_cast<nvinfer1::DataType const*>(fields[i].data)));
         }
     }
 
@@ -213,14 +227,14 @@ IPluginV2* RecvPluginCreator::createPlugin(const char* name, const PluginFieldCo
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }
-    catch (const std::exception& e)
+    catch (std::exception const& e)
     {
         caughtError(e);
     }
     return nullptr;
 }
 
-IPluginV2* RecvPluginCreator::deserializePlugin(const char* name, const void* serialData, size_t serialLength) noexcept
+IPluginV2* RecvPluginCreator::deserializePlugin(char const* name, void const* serialData, size_t serialLength) noexcept
 {
     // This object will be deleted when the network is destroyed, which will
     // call RecvPlugin::destroy()
@@ -230,7 +244,7 @@ IPluginV2* RecvPluginCreator::deserializePlugin(const char* name, const void* se
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }
-    catch (const std::exception& e)
+    catch (std::exception const& e)
     {
         caughtError(e);
     }

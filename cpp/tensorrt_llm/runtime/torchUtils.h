@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -38,22 +38,23 @@ namespace tensorrt_llm::runtime
 class TorchUtils
 {
 public:
-    using SizeType = at::IntArrayRef::value_type;
+    using SizeType32 = at::IntArrayRef::value_type;
 
-    static std::vector<SizeType> shape(ITensor::Shape const& dims)
+    static std::vector<SizeType32> shape(ITensor::Shape const& dims)
     {
         TLLM_CHECK(dims.nbDims >= 0);
-        std::vector<SizeType> shape{};
+        std::vector<SizeType32> shape{};
         shape.reserve(dims.nbDims);
         std::transform(
-            dims.d, dims.d + dims.nbDims, std::back_inserter(shape), [](auto x) { return static_cast<SizeType>(x); });
+            dims.d, dims.d + dims.nbDims, std::back_inserter(shape), [](auto x) { return static_cast<SizeType32>(x); });
         return shape;
     }
 
     static ITensor::Shape shape(at::IntArrayRef const& sizes)
     {
         TLLM_CHECK(sizes.size() <= ITensor::Shape::MAX_DIMS);
-        ITensor::Shape shape{static_cast<runtime::SizeType>(sizes.size())};
+        ITensor::Shape shape;
+        shape.nbDims = static_cast<runtime::SizeType32>(sizes.size());
         using dimType = std::remove_reference_t<decltype(shape.d[0])>;
         for (std::size_t i = 0; i < sizes.size(); ++i)
         {
@@ -63,7 +64,7 @@ public:
         return shape;
     }
 
-    static std::vector<SizeType> makeShape(std::initializer_list<runtime::SizeType> sizes)
+    static std::vector<SizeType32> makeShape(std::initializer_list<runtime::ITensor::DimType64> sizes)
     {
         return shape(ITensor::makeShape(sizes));
     }
@@ -89,7 +90,7 @@ public:
         case IBuffer::DataType::kINT32: return torch::kInt32;
         case IBuffer::DataType::kINT64: return torch::kInt64;
         case IBuffer::DataType::kBOOL: return at::ScalarType::Bool;
-        case IBuffer::DataType::kFP8: return at::ScalarType::Bits8;
+        case IBuffer::DataType::kFP8: return at::ScalarType::Float8_e4m3fn;
         case IBuffer::DataType::kBF16: return at::ScalarType::BFloat16;
         default: TLLM_THROW("unsupported data type");
         }
@@ -106,8 +107,9 @@ public:
         case torch::kInt32: return IBuffer::DataType::kINT32;
         case torch::kInt64: return IBuffer::DataType::kINT64;
         case at::ScalarType::Bool: return IBuffer::DataType::kBOOL;
-        case at::ScalarType::Bits8: return IBuffer::DataType::kFP8;
+        case at::ScalarType::Float8_e4m3fn: return IBuffer::DataType::kFP8;
         case at::ScalarType::BFloat16: return IBuffer::DataType::kBF16;
+        case at::ScalarType::QUInt4x2: return IBuffer::DataType::kINT4;
         default: TLLM_THROW("unsupported data type");
         }
     }
@@ -119,11 +121,12 @@ public:
         case runtime::MemoryType::kGPU: return c10::kCUDA;
         case runtime::MemoryType::kCPU: [[fallthrough]];
         case runtime::MemoryType::kPINNED: [[fallthrough]];
+        case runtime::MemoryType::kPINNEDPOOL: [[fallthrough]];
         default: return c10::kCPU;
         }
     }
 
-    static at::cuda::CUDAStream stream(runtime::CudaStream& cudaStream)
+    static at::cuda::CUDAStream stream(runtime::CudaStream const& cudaStream)
     {
         return at::cuda::getStreamFromExternal(cudaStream.get(), static_cast<at::DeviceIndex>(cudaStream.getDevice()));
     }

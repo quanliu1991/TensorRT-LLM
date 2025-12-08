@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -56,8 +56,13 @@ public:
     explicit CudaStream(cudaStream_t stream, int device, bool ownsStream = true)
         : mDevice{device}
     {
-        TLLM_CHECK_WITH_INFO(stream != nullptr, "stream is nullptr");
         mStream = StreamPtr{stream, Deleter{ownsStream}};
+    }
+
+    //! Construct with an existing cuda stream or the default stream by passing nullptr.
+    explicit CudaStream(cudaStream_t stream)
+        : CudaStream{stream, tensorrt_llm::common::getDevice(), false}
+    {
     }
 
     //! Returns the device on which the stream was created.
